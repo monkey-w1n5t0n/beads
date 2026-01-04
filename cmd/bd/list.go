@@ -308,6 +308,7 @@ func sortIssues(issues []*types.Issue, sortBy string, reverse bool) {
 
 var listCmd = &cobra.Command{
 	Use:     "list",
+	Aliases: []string{"ls"},
 	GroupID: "issues",
 	Short:   "List issues",
 	Run: func(cmd *cobra.Command, args []string) {
