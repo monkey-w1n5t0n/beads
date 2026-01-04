@@ -263,7 +263,7 @@ func TestListQueryCapabilitiesSuite(t *testing.T) {
 	}
 
 	// Close issue3 to set closed_at timestamp
-	if err := s.CloseIssue(ctx, issue3.ID, "test-user", "Testing"); err != nil {
+	if err := s.CloseIssue(ctx, issue3.ID, "test-user", "Testing", ""); err != nil {
 		t.Fatalf("Failed to close issue3: %v", err)
 	}
 
@@ -454,6 +454,146 @@ func TestListQueryCapabilitiesSuite(t *testing.T) {
 				t.Errorf("Expected 2 results matching combined filters, got %d", len(results))
 			}
 		})
+}
+
+func TestFormatIssueLong(t *testing.T) {
+	tests := []struct {
+		name   string
+		issue  *types.Issue
+		labels []string
+		want   string // substring to check for
+	}{
+		{
+			name: "open issue",
+			issue: &types.Issue{
+				ID:        "test-123",
+				Title:     "Test Issue",
+				Priority:  1,
+				IssueType: types.TypeBug,
+				Status:    types.StatusOpen,
+			},
+			labels: nil,
+			want:   "test-123",
+		},
+		{
+			name: "closed issue",
+			issue: &types.Issue{
+				ID:        "test-456",
+				Title:     "Closed Issue",
+				Priority:  0,
+				IssueType: types.TypeTask,
+				Status:    types.StatusClosed,
+			},
+			labels: nil,
+			want:   "test-456",
+		},
+		{
+			name: "issue with assignee",
+			issue: &types.Issue{
+				ID:        "test-789",
+				Title:     "Assigned Issue",
+				Priority:  2,
+				IssueType: types.TypeFeature,
+				Status:    types.StatusInProgress,
+				Assignee:  "alice",
+			},
+			labels: nil,
+			want:   "Assignee: alice",
+		},
+		{
+			name: "issue with labels",
+			issue: &types.Issue{
+				ID:        "test-abc",
+				Title:     "Labeled Issue",
+				Priority:  1,
+				IssueType: types.TypeBug,
+				Status:    types.StatusOpen,
+			},
+			labels: []string{"critical", "security"},
+			want:   "Labels:",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf strings.Builder
+			formatIssueLong(&buf, tt.issue, tt.labels)
+			result := buf.String()
+			if !strings.Contains(result, tt.want) {
+				t.Errorf("formatIssueLong() = %q, want to contain %q", result, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatIssueCompact(t *testing.T) {
+	tests := []struct {
+		name   string
+		issue  *types.Issue
+		labels []string
+		want   string
+	}{
+		{
+			name: "basic issue",
+			issue: &types.Issue{
+				ID:        "test-123",
+				Title:     "Test Issue",
+				Priority:  1,
+				IssueType: types.TypeBug,
+				Status:    types.StatusOpen,
+			},
+			labels: nil,
+			want:   "Test Issue",
+		},
+		{
+			name: "issue with assignee",
+			issue: &types.Issue{
+				ID:        "test-456",
+				Title:     "Assigned Issue",
+				Priority:  2,
+				IssueType: types.TypeTask,
+				Status:    types.StatusInProgress,
+				Assignee:  "bob",
+			},
+			labels: nil,
+			want:   "@bob",
+		},
+		{
+			name: "issue with labels",
+			issue: &types.Issue{
+				ID:        "test-789",
+				Title:     "Labeled Issue",
+				Priority:  0,
+				IssueType: types.TypeFeature,
+				Status:    types.StatusOpen,
+			},
+			labels: []string{"urgent"},
+			want:   "[urgent]",
+		},
+		{
+			name: "closed issue",
+			issue: &types.Issue{
+				ID:        "test-def",
+				Title:     "Closed Issue",
+				Priority:  3,
+				IssueType: types.TypeTask,
+				Status:    types.StatusClosed,
+			},
+			labels: nil,
+			want:   "Closed Issue",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf strings.Builder
+			formatIssueCompact(&buf, tt.issue, tt.labels)
+			result := buf.String()
+			if !strings.Contains(result, tt.want) {
+				t.Errorf("formatIssueCompact() = %q, want to contain %q", result, tt.want)
+			}
+		})
+	}
 }
 
 func TestParseTimeFlag(t *testing.T) {

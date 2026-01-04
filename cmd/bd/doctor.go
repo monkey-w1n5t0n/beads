@@ -47,6 +47,9 @@ var (
 	doctorDryRun         bool   // preview fixes without applying
 	doctorOutput         string // export diagnostics to file
 	doctorFixChildParent bool   // opt-in fix for child→parent deps
+	doctorVerbose        bool   // show detailed output during fixes
+	doctorForce          bool   // force repair mode, bypass validation where safe
+	doctorSource         string // source of truth selection: auto, jsonl, db
 	perfMode             bool
 	checkHealthMode      bool
 	doctorCheckFlag      string // run specific check (e.g., "pollution")
@@ -116,6 +119,8 @@ Examples:
   bd doctor --fix --yes  # Automatically fix issues (no confirmation)
   bd doctor --fix -i     # Confirm each fix individually
   bd doctor --fix --fix-child-parent  # Also fix child→parent deps (opt-in)
+  bd doctor --fix --force # Force repair even when database can't be opened
+  bd doctor --fix --source=jsonl # Rebuild database from JSONL (source of truth)
   bd doctor --dry-run    # Preview what --fix would do without making changes
   bd doctor --perf       # Performance diagnostics
   bd doctor --output diagnostics.json  # Export diagnostics to file
@@ -217,6 +222,9 @@ func init() {
 	doctorCmd.Flags().BoolVarP(&doctorInteractive, "interactive", "i", false, "Confirm each fix individually")
 	doctorCmd.Flags().BoolVar(&doctorDryRun, "dry-run", false, "Preview fixes without making changes")
 	doctorCmd.Flags().BoolVar(&doctorFixChildParent, "fix-child-parent", false, "Remove child→parent dependencies (opt-in)")
+	doctorCmd.Flags().BoolVarP(&doctorVerbose, "verbose", "v", false, "Show detailed output during fixes (e.g., list each removed dependency)")
+	doctorCmd.Flags().BoolVar(&doctorForce, "force", false, "Force repair mode: attempt recovery even when database cannot be opened")
+	doctorCmd.Flags().StringVar(&doctorSource, "source", "auto", "Choose source of truth for recovery: auto (detect), jsonl (prefer JSONL), db (prefer database)")
 }
 
 func runDiagnostics(path string) doctorResult {
@@ -399,6 +407,16 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, gitignoreCheck)
 	// Don't fail overall check for gitignore, just warn
 
+	// Check 14a: issues.jsonl tracking (catches global gitignore conflicts)
+	issuesTrackingCheck := convertWithCategory(doctor.CheckIssuesTracking(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, issuesTrackingCheck)
+	// Don't fail overall check for tracking issues, just warn
+
+	// Check 14b: redirect file tracking (worktree redirect files shouldn't be committed)
+	redirectTrackingCheck := convertWithCategory(doctor.CheckRedirectNotTracked(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, redirectTrackingCheck)
+	// Don't fail overall check for redirect tracking, just warn
+
 	// Check 15: Git merge driver configuration
 	mergeDriverCheck := convertWithCategory(doctor.CheckMergeDriver(path), doctor.CategoryGit)
 	result.Checks = append(result.Checks, mergeDriverCheck)
@@ -511,6 +529,11 @@ func runDiagnostics(path string) doctorResult {
 	sizeCheck := convertDoctorCheck(doctor.CheckDatabaseSize(path))
 	result.Checks = append(result.Checks, sizeCheck)
 	// Don't fail overall check for size warning, just inform
+
+	// Check 30: Pending migrations (summarizes all available migrations)
+	migrationsCheck := convertDoctorCheck(doctor.CheckPendingMigrations(path))
+	result.Checks = append(result.Checks, migrationsCheck)
+	// Status is determined by the check itself based on migration priorities
 
 	return result
 }

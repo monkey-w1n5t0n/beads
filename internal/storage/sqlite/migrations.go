@@ -49,6 +49,8 @@ var migrationsList = []Migration{
 	{"agent_fields", migrations.MigrateAgentFields},
 	{"mol_type_column", migrations.MigrateMolTypeColumn},
 	{"hooked_status_migration", migrations.MigrateHookedStatus},
+	{"event_fields", migrations.MigrateEventFields},
+	{"closed_by_session_column", migrations.MigrateClosedBySessionColumn},
 }
 
 // MigrationInfo contains metadata about a migration for inspection
@@ -104,6 +106,9 @@ func getMigrationDescription(name string) string {
 		"created_by_column":            "Adds created_by column to track issue creator",
 		"agent_fields":                 "Adds agent identity fields (hook_bead, role_bead, agent_state, etc.) for agent-as-bead pattern",
 		"mol_type_column":              "Adds mol_type column for molecule type classification (swarm/patrol/work)",
+		"hooked_status_migration":      "Migrates blocked hooked issues to in_progress status",
+		"event_fields":                 "Adds event fields (event_kind, actor, target, payload) for operational state change beads",
+		"closed_by_session_column":     "Adds closed_by_session column for tracking which Claude Code session closed an issue",
 	}
 
 	if desc, ok := descriptions[name]; ok {
@@ -141,6 +146,13 @@ func RunMigrations(db *sql.DB) error {
 			_, _ = db.Exec("ROLLBACK")
 		}
 	}()
+
+	// Pre-migration cleanup: remove orphaned refs that would fail invariant checks.
+	// This prevents the chicken-and-egg problem where the database can't open
+	// due to orphans left behind by tombstone deletion (see bd-eko4).
+	if _, _, err := CleanOrphanedRefs(db); err != nil {
+		return fmt.Errorf("pre-migration orphan cleanup failed: %w", err)
+	}
 
 	snapshot, err := captureSnapshot(db)
 	if err != nil {

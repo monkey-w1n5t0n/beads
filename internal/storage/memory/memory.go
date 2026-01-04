@@ -443,6 +443,14 @@ func (m *MemoryStorage) UpdateIssue(ctx context.Context, id string, updates map[
 				}
 				issue.ExternalRef = nil
 			}
+		case "close_reason":
+			if v, ok := value.(string); ok {
+				issue.CloseReason = v
+			}
+		case "closed_by_session":
+			if v, ok := value.(string); ok {
+				issue.ClosedBySession = v
+			}
 		}
 	}
 
@@ -467,11 +475,52 @@ func (m *MemoryStorage) UpdateIssue(ctx context.Context, id string, updates map[
 	return nil
 }
 
-// CloseIssue closes an issue with a reason
-func (m *MemoryStorage) CloseIssue(ctx context.Context, id string, reason string, actor string) error {
-	return m.UpdateIssue(ctx, id, map[string]interface{}{
-		"status": string(types.StatusClosed),
-	}, actor)
+// CloseIssue closes an issue with a reason.
+// The session parameter tracks which Claude Code session closed the issue (can be empty).
+func (m *MemoryStorage) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
+	updates := map[string]interface{}{
+		"status":       string(types.StatusClosed),
+		"close_reason": reason,
+	}
+	if session != "" {
+		updates["closed_by_session"] = session
+	}
+	return m.UpdateIssue(ctx, id, updates, actor)
+}
+
+// CreateTombstone converts an existing issue to a tombstone record.
+// This is a soft-delete that preserves the issue with status="tombstone".
+func (m *MemoryStorage) CreateTombstone(ctx context.Context, id string, actor string, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	issue, ok := m.issues[id]
+	if !ok {
+		return fmt.Errorf("issue not found: %s", id)
+	}
+
+	now := time.Now()
+	issue.OriginalType = string(issue.IssueType)
+	issue.Status = types.StatusTombstone
+	issue.DeletedAt = &now
+	issue.DeletedBy = actor
+	issue.DeleteReason = reason
+	issue.UpdatedAt = now
+
+	// Mark as dirty for export
+	m.dirty[id] = true
+
+	// Record tombstone creation event
+	event := &types.Event{
+		IssueID:   id,
+		EventType: "deleted",
+		Actor:     actor,
+		Comment:   &reason,
+		CreatedAt: now,
+	}
+	m.events[id] = append(m.events[id], event)
+
+	return nil
 }
 
 // DeleteIssue permanently deletes an issue and all associated data
@@ -686,6 +735,49 @@ func (m *MemoryStorage) GetDependents(ctx context.Context, issueID string) ([]*t
 			if dep.DependsOnID == issueID {
 				if issue, exists := m.issues[id]; exists {
 					results = append(results, issue)
+				}
+				break
+			}
+		}
+	}
+
+	return results, nil
+}
+
+// GetDependenciesWithMetadata gets issues that this issue depends on, with dependency type
+func (m *MemoryStorage) GetDependenciesWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var results []*types.IssueWithDependencyMetadata
+	for _, dep := range m.dependencies[issueID] {
+		if issue, exists := m.issues[dep.DependsOnID]; exists {
+			issueCopy := *issue
+			results = append(results, &types.IssueWithDependencyMetadata{
+				Issue:          issueCopy,
+				DependencyType: dep.Type,
+			})
+		}
+	}
+
+	return results, nil
+}
+
+// GetDependentsWithMetadata gets issues that depend on this issue, with dependency type
+func (m *MemoryStorage) GetDependentsWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var results []*types.IssueWithDependencyMetadata
+	for id, deps := range m.dependencies {
+		for _, dep := range deps {
+			if dep.DependsOnID == issueID {
+				if issue, exists := m.issues[id]; exists {
+					issueCopy := *issue
+					results = append(results, &types.IssueWithDependencyMetadata{
+						Issue:          issueCopy,
+						DependencyType: dep.Type,
+					})
 				}
 				break
 			}
@@ -1583,6 +1675,55 @@ func (m *MemoryStorage) Close() error {
 
 func (m *MemoryStorage) Path() string {
 	return m.jsonlPath
+}
+
+// GetMoleculeProgress returns progress stats for a molecule.
+// For memory storage, this iterates through dependencies.
+func (m *MemoryStorage) GetMoleculeProgress(ctx context.Context, moleculeID string) (*types.MoleculeProgressStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	issue, exists := m.issues[moleculeID]
+	if !exists {
+		return nil, fmt.Errorf("molecule not found: %s", moleculeID)
+	}
+
+	stats := &types.MoleculeProgressStats{
+		MoleculeID:    moleculeID,
+		MoleculeTitle: issue.Title,
+	}
+
+	// Find all parent-child dependencies where moleculeID is the parent
+	for _, deps := range m.dependencies {
+		for _, dep := range deps {
+			if dep.Type == types.DepParentChild && dep.DependsOnID == moleculeID {
+				child, exists := m.issues[dep.IssueID]
+				if !exists {
+					continue
+				}
+				stats.Total++
+				switch child.Status {
+				case types.StatusClosed:
+					stats.Completed++
+					if child.ClosedAt != nil {
+						if stats.FirstClosed == nil || child.ClosedAt.Before(*stats.FirstClosed) {
+							stats.FirstClosed = child.ClosedAt
+						}
+						if stats.LastClosed == nil || child.ClosedAt.After(*stats.LastClosed) {
+							stats.LastClosed = child.ClosedAt
+						}
+					}
+				case types.StatusInProgress:
+					stats.InProgress++
+					if stats.CurrentStepID == "" {
+						stats.CurrentStepID = child.ID
+					}
+				}
+			}
+		}
+	}
+
+	return stats, nil
 }
 
 // UnderlyingDB returns nil for memory storage (no SQL database)

@@ -82,6 +82,30 @@ var (
 	quietFlag      bool // Suppress non-essential output
 )
 
+// readOnlyCommands lists commands that only read from the database.
+// These commands open SQLite in read-only mode to avoid modifying the
+// database file (which breaks file watchers). See GH#804.
+var readOnlyCommands = map[string]bool{
+	"list":       true,
+	"ready":      true,
+	"show":       true,
+	"stats":      true,
+	"blocked":    true,
+	"count":      true,
+	"search":     true,
+	"graph":      true,
+	"duplicates": true,
+	"comments":   true, // list comments (not add)
+	"export":     true, // export only reads
+}
+
+// isReadOnlyCommand returns true if the command only reads from the database.
+// This is used to open SQLite in read-only mode, preventing file modifications
+// that would trigger file watchers. See GH#804.
+func isReadOnlyCommand(cmdName string) bool {
+	return readOnlyCommands[cmdName]
+}
+
 func init() {
 	// Initialize viper configuration
 	if err := config.Initialize(); err != nil {
@@ -144,11 +168,14 @@ var rootCmd = &cobra.Command{
 		_ = cmd.Help()
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Initialize CommandContext to hold runtime state (replaces scattered globals)
+		initCommandContext()
+
 		// Set up signal-aware context for graceful cancellation
 		rootCtx, rootCancel = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
-		// Signal Gas Town daemon about bd activity (best-effort, for exponential backoff)
-		defer signalGasTownActivity()
+		// Signal orchestrator daemon about bd activity (best-effort, for exponential backoff)
+		defer signalOrchestratorActivity()
 
 		// Apply verbosity flags early (before any output)
 		debug.SetVerbose(verboseFlag)
@@ -275,12 +302,14 @@ var rootCmd = &cobra.Command{
 			"fish",
 			"help",
 			"hooks",
+			"human",
 			"init",
 			"merge",
 			"onboard",
 			"powershell",
 			"prime",
 			"quickstart",
+			"repair",
 			"setup",
 			"version",
 			"zsh",
@@ -388,9 +417,11 @@ var rootCmd = &cobra.Command{
 							fmt.Fprintf(os.Stderr, "Error initializing JSONL-only mode: %v\n", err)
 							os.Exit(1)
 						}
-						// Set actor from flag, viper, or env
+						// Set actor for audit trail
 						if actor == "" {
-							if user := os.Getenv("USER"); user != "" {
+							if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
+								actor = bdActor
+							} else if user := os.Getenv("USER"); user != "" {
 								actor = user
 							} else {
 								actor = "unknown"
@@ -433,13 +464,12 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		// Set actor from flag, viper (env), or default
-		// Priority: --actor flag > viper (config + BD_ACTOR env) > USER env > "unknown"
-		// Note: Viper handles BD_ACTOR automatically via AutomaticEnv()
+		// Set actor for audit trail
+		// Priority: --actor flag > BD_ACTOR env > USER env > "unknown"
 		if actor == "" {
-			// Viper already populated from config file or BD_ACTOR env
-			// Fall back to USER env if still empty
-			if user := os.Getenv("USER"); user != "" {
+			if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
+				actor = bdActor
+			} else if user := os.Getenv("USER"); user != "" {
 				actor = user
 			} else {
 				actor = "unknown"
@@ -520,6 +550,7 @@ var rootCmd = &cobra.Command{
 								}
 								health, healthErr = client.Health()
 								if healthErr == nil && health.Status == statusHealthy {
+									client.SetActor(actor)
 									daemonClient = client
 									daemonStatus.Mode = cmdDaemon
 									daemonStatus.Connected = true
@@ -537,6 +568,7 @@ var rootCmd = &cobra.Command{
 							health.Version, Version)
 					} else {
 						// Daemon is healthy and compatible - use it
+						client.SetActor(actor)
 						daemonClient = client
 						daemonStatus.Mode = cmdDaemon
 						daemonStatus.Connected = true
@@ -587,6 +619,7 @@ var rootCmd = &cobra.Command{
 						// Check health of auto-started daemon
 						health, healthErr := client.Health()
 						if healthErr == nil && health.Status == statusHealthy {
+							client.SetActor(actor)
 							daemonClient = client
 							daemonStatus.Mode = cmdDaemon
 							daemonStatus.Connected = true
@@ -648,14 +681,33 @@ var rootCmd = &cobra.Command{
 			debug.Logf("using direct mode (reason: %s)", daemonStatus.FallbackReason)
 		}
 
+		// Check if this is a read-only command (GH#804)
+		// Read-only commands open SQLite in read-only mode to avoid modifying
+		// the database file (which breaks file watchers).
+		useReadOnly := isReadOnlyCommand(cmd.Name())
+
 		// Auto-migrate database on version bump
+		// Skip for read-only commands - they can't write anyway
 		// Do this AFTER daemon check but BEFORE opening database for main operation
 		// This ensures: 1) no daemon has DB open, 2) we don't open DB twice
-		autoMigrateOnVersionBump(dbPath)
+		if !useReadOnly {
+			autoMigrateOnVersionBump(dbPath)
+		}
 
 		// Fall back to direct storage access
 		var err error
-		store, err = sqlite.NewWithTimeout(rootCtx, dbPath, lockTimeout)
+		if useReadOnly {
+			// Read-only mode: prevents file modifications (GH#804)
+			store, err = sqlite.NewReadOnlyWithTimeout(rootCtx, dbPath, lockTimeout)
+			if err != nil {
+				// If read-only fails (e.g., DB doesn't exist), fall back to read-write
+				// This handles the case where user runs "bd list" before "bd init"
+				debug.Logf("read-only open failed, falling back to read-write: %v", err)
+				store, err = sqlite.NewWithTimeout(rootCtx, dbPath, lockTimeout)
+			}
+		} else {
+			store, err = sqlite.NewWithTimeout(rootCtx, dbPath, lockTimeout)
+		}
 		if err != nil {
 			// Check for fresh clone scenario
 			beadsDir := filepath.Dir(dbPath)
@@ -674,10 +726,11 @@ var rootCmd = &cobra.Command{
 		// Initialize flush manager (fixes race condition in auto-flush)
 		// Skip FlushManager creation in sandbox mode - no background goroutines needed
 		// (improves Windows exit behavior and container scenarios)
+		// Skip for read-only commands - they don't write anything (GH#804)
 		// For in-process test scenarios where commands run multiple times,
 		// we create a new manager each time. Shutdown() is idempotent so
 		// PostRun can safely shutdown whichever manager is active.
-		if !sandboxMode {
+		if !sandboxMode && !useReadOnly {
 			flushManager = NewFlushManager(autoFlushEnabled, getDebounceDuration())
 		}
 
@@ -695,7 +748,8 @@ var rootCmd = &cobra.Command{
 		// Skip for import command itself to avoid recursion
 		// Skip for delete command to prevent resurrection of deleted issues
 		// Skip if sync --dry-run to avoid modifying DB in dry-run mode
-		if cmd.Name() != "import" && cmd.Name() != "delete" && autoImportEnabled {
+		// Skip for read-only commands - they can't write anyway (GH#804)
+		if cmd.Name() != "import" && cmd.Name() != "delete" && autoImportEnabled && !useReadOnly {
 			// Check if this is sync command with --dry-run flag
 			if cmd.Name() == "sync" {
 				if dryRun, _ := cmd.Flags().GetBool("dry-run"); dryRun {
@@ -724,6 +778,9 @@ var rootCmd = &cobra.Command{
 
 		// Tips (including sync conflict proactive checks) are shown via maybeShowTip()
 		// after successful command execution, not in PreRun
+
+		// Sync all state to CommandContext for unified access
+		syncCommandContext()
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
 		// Handle --no-db mode: write memory storage back to JSONL

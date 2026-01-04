@@ -18,14 +18,39 @@ var updateCmd = &cobra.Command{
 	Use:     "update [id...]",
 	GroupID: "issues",
 	Short:   "Update one or more issues",
-	Args:    cobra.MinimumNArgs(1),
+	Long: `Update one or more issues.
+
+If no issue ID is provided, updates the last touched issue (from most recent
+create, update, show, or close operation).`,
+	Args: cobra.MinimumNArgs(0),
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("update")
+
+		// If no IDs provided, use last touched issue
+		if len(args) == 0 {
+			lastTouched := GetLastTouchedID()
+			if lastTouched == "" {
+				FatalErrorRespectJSON("no issue ID provided and no last touched issue")
+			}
+			args = []string{lastTouched}
+		}
+
 		updates := make(map[string]interface{})
 
 		if cmd.Flags().Changed("status") {
 			status, _ := cmd.Flags().GetString("status")
 			updates["status"] = status
+
+			// If status is being set to closed, include session if provided
+			if status == "closed" {
+				session, _ := cmd.Flags().GetString("session")
+				if session == "" {
+					session = os.Getenv("CLAUDE_SESSION_ID")
+				}
+				if session != "" {
+					updates["closed_by_session"] = session
+				}
+			}
 		}
 		if cmd.Flags().Changed("priority") {
 			priorityStr, _ := cmd.Flags().GetString("priority")
@@ -108,7 +133,10 @@ var updateCmd = &cobra.Command{
 			updates["issue_type"] = issueType
 		}
 
-		if len(updates) == 0 {
+		// Get claim flag
+		claimFlag, _ := cmd.Flags().GetBool("claim")
+
+		if len(updates) == 0 && !claimFlag {
 			fmt.Println("No updates specified")
 			return
 		}
@@ -141,6 +169,7 @@ var updateCmd = &cobra.Command{
 		// If daemon is running, use RPC
 		if daemonClient != nil {
 			updatedIssues := []*types.Issue{}
+			var firstUpdatedID string // Track first successful update for last-touched
 			for _, id := range resolvedIDs {
 				updateArgs := &rpc.UpdateArgs{ID: id}
 
@@ -194,6 +223,9 @@ var updateCmd = &cobra.Command{
 					updateArgs.Parent = &parent
 				}
 
+				// Set claim flag for atomic claim operation
+				updateArgs.Claim = claimFlag
+
 				resp, err := daemonClient.Update(updateArgs)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error updating %s: %v\n", id, err)
@@ -213,16 +245,27 @@ var updateCmd = &cobra.Command{
 				if !jsonOutput {
 					fmt.Printf("%s Updated issue: %s\n", ui.RenderPass("✓"), id)
 				}
+
+				// Track first successful update for last-touched
+				if firstUpdatedID == "" {
+					firstUpdatedID = id
+				}
 			}
 
 			if jsonOutput && len(updatedIssues) > 0 {
 				outputJSON(updatedIssues)
+			}
+
+			// Set last touched after all updates complete
+			if firstUpdatedID != "" {
+				SetLastTouchedID(firstUpdatedID)
 			}
 			return
 		}
 
 		// Direct mode
 		updatedIssues := []*types.Issue{}
+		var firstUpdatedID string // Track first successful update for last-touched
 		for _, id := range resolvedIDs {
 			// Check if issue is a template: templates are read-only
 			issue, err := store.GetIssue(ctx, id)
@@ -233,6 +276,24 @@ var updateCmd = &cobra.Command{
 			if err := validateIssueUpdatable(id, issue); err != nil {
 				fmt.Fprintf(os.Stderr, "%s\n", err)
 				continue
+			}
+
+			// Handle claim operation atomically
+			if claimFlag {
+				// Check if already claimed (has non-empty assignee)
+				if issue.Assignee != "" {
+					fmt.Fprintf(os.Stderr, "Error claiming %s: already claimed by %s\n", id, issue.Assignee)
+					continue
+				}
+				// Atomically set assignee and status
+				claimUpdates := map[string]interface{}{
+					"assignee": actor,
+					"status":   "in_progress",
+				}
+				if err := store.UpdateIssue(ctx, id, claimUpdates, actor); err != nil {
+					fmt.Fprintf(os.Stderr, "Error claiming %s: %v\n", id, err)
+					continue
+				}
 			}
 
 			// Apply regular field updates if any
@@ -324,6 +385,16 @@ var updateCmd = &cobra.Command{
 			} else {
 				fmt.Printf("%s Updated issue: %s\n", ui.RenderPass("✓"), id)
 			}
+
+			// Track first successful update for last-touched
+			if firstUpdatedID == "" {
+				firstUpdatedID = id
+			}
+		}
+
+		// Set last touched after all updates complete
+		if firstUpdatedID != "" {
+			SetLastTouchedID(firstUpdatedID)
 		}
 
 		// Schedule auto-flush if any issues were updated
@@ -351,5 +422,7 @@ func init() {
 	updateCmd.Flags().StringSlice("remove-label", nil, "Remove labels (repeatable)")
 	updateCmd.Flags().StringSlice("set-labels", nil, "Set labels, replacing all existing (repeatable)")
 	updateCmd.Flags().String("parent", "", "New parent issue ID (reparents the issue, use empty string to remove parent)")
+	updateCmd.Flags().Bool("claim", false, "Atomically claim the issue (sets assignee to you, status to in_progress; fails if already claimed)")
+	updateCmd.Flags().String("session", "", "Claude Code session ID for status=closed (or set CLAUDE_SESSION_ID env var)")
 	rootCmd.AddCommand(updateCmd)
 }

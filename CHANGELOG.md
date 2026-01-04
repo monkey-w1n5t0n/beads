@@ -5,6 +5,184 @@ All notable changes to the beads project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.0] - 2025-12-30
+
+### Added
+
+- **`llms.txt` standard support** - AI agent discoverability (#784)
+  - Standard endpoint for AI agents to discover project info
+  - Helps LLM-powered tools understand your project
+
+- **`bd preflight` command** - PR readiness checks
+  - Static checklist for pre-commit/pre-push verification
+  - Phase 1 implementation with test, lint, and version checks planned
+
+- **`--claim` flag for `bd update`** - Work queue semantics
+  - Atomic claim-and-assign for multi-agent coordination
+  - Prevents race conditions in work assignment
+
+- **`bd state` and `bd set-state`** - Label-based state management
+  - Helper commands for operational state patterns
+  - Documents labels-as-state pattern
+
+- **`bd activity --town`** - Cross-rig activity feed
+  - Aggregated view across all rigs in town
+  - Better visibility into multi-rig workflows
+
+- **Convoy issue type** - Reactive completion tracking
+  - Issues that complete when all tracked items complete
+  - `tracks` relation type for convoy membership
+
+- **Agent identity trailers** - prepare-commit-msg hook
+  - Automatically adds agent identity to commits
+  - Structured labels for agent beads
+
+- **Daemon RPC endpoints** - Config and mol stale
+  - Remote config queries via daemon
+  - Stale molecule detection endpoint
+
+- **Non-TTY auto-detection** - Cleaner output in pipes
+  - Automatically adjusts output for non-interactive use
+
+### Fixed
+
+- **Git hook chaining** now works correctly (GH#816)
+- **`.beads/redirect` not committed** - Prevents worktree conflicts (GH#814)
+- **`bd sync` with sync-branch** - Fixes worktree copy direction (GH#810, #812)
+- **`sync.branch` validation** - Rejects main/master as sync branch (GH#807)
+- **Read operations read-only** - No more database writes on list/ready/show (GH#804)
+- **`bd list` defaults** - Non-closed issues, 50 limit to protect context (GH#788)
+- **External direct-commit bypass** - When sync.branch configured (bd-n663)
+- **Migration 022 syntax** - SQL error on v0.30.3 upgrade path
+- **MCP redirect support** - Plugin follows .beads/redirect files
+- **Jira sync error** - Better message when Python script not found (GH#803)
+- **Doctor false positives** - For molecule/wisp prefix variants
+- **BD_ACTOR in direct mode** - Consistent actor handling
+- **Label accumulation** - When updating agent role_type/rig
+
+## [0.41.0] - 2025-12-29
+
+### Added
+
+- **`bd swarm` commands** - Multi-agent batch work coordination
+  - `bd swarm create` - Create swarm from epic with children
+  - `bd swarm status` - Show swarm progress and blocked work
+  - `bd swarm validate` - Validate swarm structure and dependencies
+  - N+1 query fix for blocked checks (performance optimization)
+
+- **`bd repair` command** - Orphaned reference repair
+  - Detect and repair orphaned foreign key references
+  - Support for comments/events orphan detection
+  - `--json` flag for machine-readable output
+  - Transaction safety with backup and dirty_issues marking
+
+- **`bd compact --purge-tombstones`** - Dependency-aware cleanup
+  - Remove tombstones while respecting dependency order
+  - Safe cleanup that won't break DAG structure
+
+- **`bd init --from-jsonl`** - Manual cleanup preservation
+  - Initialize database from curated JSONL file
+  - Preserves manual edits made to JSONL
+
+- **`bd human` command** - Focused help menu
+  - Human-friendly command reference
+  - Quick overview without CLI verbosity
+
+- **`bd show --short`** - Compact output mode
+  - Brief issue summary for scripting
+  - Less verbose than default format
+
+- **`bd delete --reason`** - Audit trail for deletions
+  - Optional reason stored in activity log
+  - Better traceability for issue cleanup
+
+- **`hooked` status** - Hook-based work assignment
+  - New status for issues assigned to agent hooks
+  - Enables autonomous agent work pickup
+
+- **`mol_type` schema field** - Molecule classification
+  - Track molecule type (patrol, work, etc.)
+  - New migration (adds schema field)
+
+- **Agent ID canonical naming** - Validation update
+  - Updated validation for orchestrator naming conventions
+  - Supports rig/role/name format
+
+### Fixed
+
+- **`--var` flag allows commas in values** (GH#786)
+  - Variables like `--var files=a.go,b.go` now work correctly
+  - Parser respects quoted values
+
+- **`bd sync` in bare repo worktrees** (GH#785)
+  - Fixed sync failure when working in worktrees of bare repos
+  - Correctly detects git configuration
+
+- **`bd delete --cascade` recursive deletion** (GH#787)
+  - Now properly deletes all transitive dependents
+  - Previously only deleted direct children
+
+- **`bd doctor` pre-push hook detection** (GH#799)
+  - No longer falsely reports hook issues
+  - Correctly identifies bd-managed hooks
+
+- **Gitignore fork protection** (GH#796)
+  - Removed negations that could override protection
+  - Safer fork handling
+
+- **Illumos/Solaris disk space check** (GH#798)
+  - Added platform support for disk space detection
+  - Expands OS compatibility
+
+- **Pre-migration orphan cleanup** - Chicken-and-egg fix
+  - Clean orphans before migration to avoid failures
+  - Smoother upgrade path
+
+- **`hq-` prefix routing** - Town root discovery
+  - Correctly finds routes.jsonl from anywhere in town
+  - Fixes cross-rig routing for HQ beads
+
+- **Config.yaml database override warning**
+  - Shows warning when config overrides db location
+  - Helps debug unexpected behavior
+
+- **`normalizeBeadsRelPath` edge case** - Similar prefix handling
+  - Fixes path normalization for similar prefix names
+  - e.g., `beads` vs `beads-sync`
+
+- **`bd doctor --fix` redirect handling**
+  - Properly follows .beads/redirect files
+  - Limited verbose output for cleaner runs
+
+### Changed
+
+- **CLI command consolidation** - Reduced surface area
+  - Grouped related commands under parent commands
+  - Cleaner `bd --help` output
+
+- **Code organization** - File size limits
+  - Split large cmd/bd files to meet 800-line limit
+  - init.go: 1928 → 705 lines
+  - Improved maintainability
+
+- **Documentation updates**
+  - Replace Epic Planning with Ready Front model
+  - Add components overview (CLI vs Plugin vs MCP)
+  - Add installation method comparison table
+
+### Internal
+
+- Extract IssueDetails to shared type
+- Export FollowRedirect and consolidate implementations
+- Extract shared getEpicChildren helper for swarm commands
+- Extract hashFieldWriter to reduce ComputeContentHash repetition
+- Break up runCook (275 lines) into focused helpers
+- Break up flushToJSONLWithState (280 lines) into focused helpers
+- Extract shared importFromJSONLData function
+- Consolidate duplicated step collection functions
+- Add git helper and guard annotations for tests
+- Fix golangci-lint errors (errcheck, gosec, unparam)
+
 ## [0.40.0] - 2025-12-28
 
 ### Added
@@ -15,7 +193,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`bd slot` commands** - Agent bead slot management
   - Track agent assignments with dedicated slot operations
-  - Supports Gas Town multi-agent workflows
+  - Supports multi-agent orchestration workflows
 
 - **`bd agent state` command** - ZFC-compliant state reporting
   - Report agent state in standardized format
@@ -98,13 +276,13 @@ and muscle memory before v1.0.0 to avoid breakage.
   - Move issues between epics with `bd update <id> --parent=<new-parent>`
   - Supports clearing parent with `--parent=none`
 
-- **Redirect info in `bd prime`** - Gas Town support
+- **Redirect info in `bd prime`** - Multi-clone support
   - Shows when database is redirected to another location
   - Improves visibility into routing behavior
 
 ### Fixed
 
-- **Doctor follows redirects** - Gas Town compatibility
+- **Doctor follows redirects** - Multi-clone compatibility
   - `bd doctor` now correctly follows database redirects
   - Prevents false negatives when running from rig roots
 
@@ -122,7 +300,7 @@ and muscle memory before v1.0.0 to avoid breakage.
 
 - **Database Redirects section** - ADVANCED.md
   - Comprehensive documentation for redirect feature
-  - Explains Gas Town integration patterns
+  - Explains multi-clone integration patterns
 
 - **Community Tools update** (GH#771) - README.md
   - Added opencode-beads to community tools list
@@ -159,8 +337,8 @@ and muscle memory before v1.0.0 to avoid breakage.
 
 - **Removed unused commands**
   - `bd pin`, `bd unpin`, `bd hook` removed
-  - Functionality covered by `gt mol` commands in Gas Town
-  - Cleaner separation between beads (data) and gastown (orchestration)
+  - Functionality covered by orchestrator molecule commands
+  - Cleaner separation between beads (data) and orchestration
 
 - **`bd doctor --check=pollution`** - Integrated test pollution check
   - Detects test artifacts left in production database
@@ -358,10 +536,10 @@ and muscle memory before v1.0.0 to avoid breakage.
   - JSON provides better tooling support and validation
   - Existing YAML formulas need migration
 
-- **Removed `bd mol run`** - Orchestration moved to Gas Town
-  - Molecule execution now handled by `gt` commands
+- **Removed `bd mol run`** - Orchestration delegated to orchestrator
+  - Molecule execution now handled by orchestrator commands
   - `bd` focuses on issue tracking primitives
-  - Use `gt mol run` for molecule orchestration
+  - Use orchestrator's molecule runner for execution
 
 - **Simplified wisp architecture** - Single database model
   - Wisps stored in main database with `Wisp=true` flag

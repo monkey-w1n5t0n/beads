@@ -118,7 +118,7 @@ func parseCookFlags(cmd *cobra.Command, args []string) (*cookFlags, error) {
 	force, _ := cmd.Flags().GetBool("force")
 	searchPaths, _ := cmd.Flags().GetStringSlice("search-path")
 	prefix, _ := cmd.Flags().GetString("prefix")
-	varFlags, _ := cmd.Flags().GetStringSlice("var")
+	varFlags, _ := cmd.Flags().GetStringArray("var")
 	mode, _ := cmd.Flags().GetString("mode")
 
 	// Parse variables
@@ -151,14 +151,20 @@ func parseCookFlags(cmd *cobra.Command, args []string) (*cookFlags, error) {
 	}, nil
 }
 
-// loadAndResolveFormula parses a formula file and applies all transformations
+// loadAndResolveFormula parses a formula file and applies all transformations.
+// It first tries to load by name from the formula registry (.beads/formulas/),
+// and falls back to parsing as a file path if that fails.
 func loadAndResolveFormula(formulaPath string, searchPaths []string) (*formula.Formula, error) {
 	parser := formula.NewParser(searchPaths...)
 
-	// Parse the formula file
-	f, err := parser.ParseFile(formulaPath)
+	// Try to load by name first (from .beads/formulas/ registry)
+	f, err := parser.LoadByName(formulaPath)
 	if err != nil {
-		return nil, fmt.Errorf("parsing formula: %w", err)
+		// Fall back to parsing as a file path
+		f, err = parser.ParseFile(formulaPath)
+		if err != nil {
+			return nil, fmt.Errorf("parsing formula: %w", err)
+		}
 	}
 
 	// Resolve inheritance
@@ -568,6 +574,13 @@ func collectSteps(steps []*formula.Step, parentID string,
 // and returns an in-memory TemplateSubgraph ready for instantiation.
 // This is the main entry point for ephemeral proto cooking.
 func resolveAndCookFormula(formulaName string, searchPaths []string) (*TemplateSubgraph, error) {
+	return resolveAndCookFormulaWithVars(formulaName, searchPaths, nil)
+}
+
+// resolveAndCookFormulaWithVars loads a formula and optionally filters steps by condition.
+// If conditionVars is provided, steps with conditions that evaluate to false are excluded.
+// Pass nil for conditionVars to include all steps (condition filtering skipped).
+func resolveAndCookFormulaWithVars(formulaName string, searchPaths []string, conditionVars map[string]string) (*TemplateSubgraph, error) {
 	// Create parser with search paths
 	parser := formula.NewParser(searchPaths...)
 
@@ -625,6 +638,27 @@ func resolveAndCookFormula(formulaName string, searchPaths []string) (*TemplateS
 				resolved.Steps = formula.ApplyAdvice(resolved.Steps, aspectFormula.Advice)
 			}
 		}
+	}
+
+	// Apply step condition filtering if vars provided (bd-7zka.1)
+	// This filters out steps whose conditions evaluate to false
+	if conditionVars != nil {
+		// Merge with formula defaults for complete evaluation
+		mergedVars := make(map[string]string)
+		for name, def := range resolved.Vars {
+			if def != nil && def.Default != "" {
+				mergedVars[name] = def.Default
+			}
+		}
+		for k, v := range conditionVars {
+			mergedVars[k] = v
+		}
+
+		filteredSteps, err := formula.FilterStepsByCondition(resolved.Steps, mergedVars)
+		if err != nil {
+			return nil, fmt.Errorf("filtering steps by condition: %w", err)
+		}
+		resolved.Steps = filteredSteps
 	}
 
 	// Cook to in-memory subgraph, including variable definitions for default handling
@@ -917,7 +951,7 @@ func init() {
 	cookCmd.Flags().Bool("force", false, "Replace existing proto if it exists (requires --persist)")
 	cookCmd.Flags().StringSlice("search-path", []string{}, "Additional paths to search for formula inheritance")
 	cookCmd.Flags().String("prefix", "", "Prefix to prepend to proto ID (e.g., 'gt-' creates 'gt-mol-feature')")
-	cookCmd.Flags().StringSlice("var", []string{}, "Variable substitution (key=value), enables runtime mode")
+	cookCmd.Flags().StringArray("var", []string{}, "Variable substitution (key=value), enables runtime mode")
 	cookCmd.Flags().String("mode", "", "Cooking mode: compile (keep placeholders) or runtime (substitute vars)")
 
 	rootCmd.AddCommand(cookCmd)

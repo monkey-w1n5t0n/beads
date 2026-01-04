@@ -17,9 +17,22 @@ var closeCmd = &cobra.Command{
 	Use:     "close [id...]",
 	GroupID: "issues",
 	Short:   "Close one or more issues",
-	Args:    cobra.MinimumNArgs(1),
+	Long: `Close one or more issues.
+
+If no issue ID is provided, closes the last touched issue (from most recent
+create, update, show, or close operation).`,
+	Args: cobra.MinimumNArgs(0),
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("close")
+
+		// If no IDs provided, use last touched issue
+		if len(args) == 0 {
+			lastTouched := GetLastTouchedID()
+			if lastTouched == "" {
+				FatalErrorRespectJSON("no issue ID provided and no last touched issue")
+			}
+			args = []string{lastTouched}
+		}
 		reason, _ := cmd.Flags().GetString("reason")
 		if reason == "" {
 			// Check --resolution alias (Jira CLI convention)
@@ -32,6 +45,12 @@ var closeCmd = &cobra.Command{
 		continueFlag, _ := cmd.Flags().GetBool("continue")
 		noAuto, _ := cmd.Flags().GetBool("no-auto")
 		suggestNext, _ := cmd.Flags().GetBool("suggest-next")
+
+		// Get session ID from flag or environment variable
+		session, _ := cmd.Flags().GetString("session")
+		if session == "" {
+			session = os.Getenv("CLAUDE_SESSION_ID")
+		}
 
 		ctx := rootCtx
 
@@ -88,6 +107,7 @@ var closeCmd = &cobra.Command{
 				closeArgs := &rpc.CloseArgs{
 					ID:          id,
 					Reason:      reason,
+					Session:     session,
 					SuggestNext: suggestNext,
 				}
 				resp, err := daemonClient.CloseIssue(closeArgs)
@@ -162,7 +182,7 @@ var closeCmd = &cobra.Command{
 				continue
 			}
 
-			if err := store.CloseIssue(ctx, id, reason, actor); err != nil {
+			if err := store.CloseIssue(ctx, id, reason, actor, session); err != nil {
 				fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", id, err)
 				continue
 			}
@@ -240,5 +260,6 @@ func init() {
 	closeCmd.Flags().Bool("continue", false, "Auto-advance to next step in molecule")
 	closeCmd.Flags().Bool("no-auto", false, "With --continue, show next step but don't claim it")
 	closeCmd.Flags().Bool("suggest-next", false, "Show newly unblocked issues after closing")
+	closeCmd.Flags().String("session", "", "Claude Code session ID (or set CLAUDE_SESSION_ID env var)")
 	rootCmd.AddCommand(closeCmd)
 }

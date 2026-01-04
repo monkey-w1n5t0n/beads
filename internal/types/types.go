@@ -36,8 +36,9 @@ type Issue struct {
 	CreatedAt   time.Time  `json:"created_at"`
 	CreatedBy   string     `json:"created_by,omitempty"` // Who created this issue (GH#748)
 	UpdatedAt   time.Time  `json:"updated_at"`
-	ClosedAt    *time.Time `json:"closed_at,omitempty"`
-	CloseReason string     `json:"close_reason,omitempty"` // Reason provided when closing
+	ClosedAt        *time.Time `json:"closed_at,omitempty"`
+	CloseReason     string     `json:"close_reason,omitempty"`      // Reason provided when closing
+	ClosedBySession string     `json:"closed_by_session,omitempty"` // Claude Code session that closed this issue
 
 	// ===== External Integration =====
 	ExternalRef *string `json:"external_ref,omitempty"` // e.g., "gh-9", "jira-ABC"
@@ -100,6 +101,12 @@ type Issue struct {
 
 	// ===== Molecule Type Fields (swarm coordination) =====
 	MolType MolType `json:"mol_type,omitempty"` // Molecule type: swarm|patrol|work (empty = work)
+
+	// ===== Event Fields (operational state changes) =====
+	EventKind string `json:"event_kind,omitempty"` // Namespaced event type: patrol.muted, agent.started
+	Actor     string `json:"actor,omitempty"`      // Entity URI who caused this event
+	Target    string `json:"target,omitempty"`     // Entity URI or bead ID affected
+	Payload   string `json:"payload,omitempty"`    // Event-specific JSON data
 }
 
 // ComputeContentHash creates a deterministic hash of the issue's content.
@@ -128,7 +135,7 @@ func (i *Issue) ComputeContentHash() string {
 
 	// Bonded molecules
 	for _, br := range i.BondedFrom {
-		w.str(br.ProtoID)
+		w.str(br.SourceID)
 		w.str(br.BondType)
 		w.str(br.BondPoint)
 	}
@@ -161,6 +168,12 @@ func (i *Issue) ComputeContentHash() string {
 
 	// Molecule type
 	w.str(string(i.MolType))
+
+	// Event fields
+	w.str(i.EventKind)
+	w.str(i.Actor)
+	w.str(i.Target)
+	w.str(i.Payload)
 
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
@@ -394,12 +407,14 @@ const (
 	TypeGate         IssueType = "gate"          // Async coordination gate
 	TypeAgent        IssueType = "agent"         // Agent identity bead
 	TypeRole         IssueType = "role"          // Agent role definition
+	TypeConvoy       IssueType = "convoy"        // Cross-project tracking with reactive completion
+	TypeEvent        IssueType = "event"         // Operational state change record
 )
 
 // IsValid checks if the issue type value is valid
 func (t IssueType) IsValid() bool {
 	switch t {
-	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeMessage, TypeMergeRequest, TypeMolecule, TypeGate, TypeAgent, TypeRole:
+	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeMessage, TypeMergeRequest, TypeMolecule, TypeGate, TypeAgent, TypeRole, TypeConvoy, TypeEvent:
 		return true
 	}
 	return false
@@ -483,6 +498,17 @@ type IssueWithCounts struct {
 	DependentCount  int `json:"dependent_count"`
 }
 
+// IssueDetails extends Issue with labels, dependencies, dependents, and comments.
+// Used for JSON serialization in bd show and RPC responses.
+type IssueDetails struct {
+	Issue
+	Labels       []string                      `json:"labels,omitempty"`
+	Dependencies []*IssueWithDependencyMetadata `json:"dependencies,omitempty"`
+	Dependents   []*IssueWithDependencyMetadata `json:"dependents,omitempty"`
+	Comments     []*Comment                     `json:"comments,omitempty"`
+	Parent       *string                        `json:"parent,omitempty"`
+}
+
 // DependencyType categorizes the relationship
 type DependencyType string
 
@@ -508,6 +534,14 @@ const (
 	DepAuthoredBy DependencyType = "authored-by" // Creator relationship
 	DepAssignedTo DependencyType = "assigned-to" // Assignment relationship
 	DepApprovedBy DependencyType = "approved-by" // Approval relationship
+
+	// Convoy tracking (non-blocking cross-project references)
+	DepTracks DependencyType = "tracks" // Convoy → issue tracking (non-blocking)
+
+	// Reference types (cross-referencing without blocking)
+	DepUntil     DependencyType = "until"     // Active until target closes (e.g., muted until issue resolved)
+	DepCausedBy  DependencyType = "caused-by" // Triggered by target (audit trail)
+	DepValidates DependencyType = "validates" // Approval/validation relationship
 )
 
 // IsValid checks if the dependency type value is valid.
@@ -523,7 +557,8 @@ func (d DependencyType) IsWellKnown() bool {
 	switch d {
 	case DepBlocks, DepParentChild, DepConditionalBlocks, DepWaitsFor, DepRelated, DepDiscoveredFrom,
 		DepRepliesTo, DepRelatesTo, DepDuplicates, DepSupersedes,
-		DepAuthoredBy, DepAssignedTo, DepApprovedBy:
+		DepAuthoredBy, DepAssignedTo, DepApprovedBy, DepTracks,
+		DepUntil, DepCausedBy, DepValidates:
 		return true
 	}
 	return false
@@ -643,6 +678,19 @@ type TreeNode struct {
 	Truncated bool   `json:"truncated"`
 }
 
+// MoleculeProgressStats provides efficient progress info for large molecules.
+// This uses indexed queries instead of loading all steps into memory.
+type MoleculeProgressStats struct {
+	MoleculeID    string     `json:"molecule_id"`
+	MoleculeTitle string     `json:"molecule_title"`
+	Total         int        `json:"total"`           // Total steps (direct children)
+	Completed     int        `json:"completed"`       // Closed steps
+	InProgress    int        `json:"in_progress"`     // Steps currently in progress
+	CurrentStepID string     `json:"current_step_id"` // First in_progress step ID (if any)
+	FirstClosed   *time.Time `json:"first_closed,omitempty"`
+	LastClosed    *time.Time `json:"last_closed,omitempty"`
+}
+
 // Statistics provides aggregate metrics
 type Statistics struct {
 	TotalIssues              int     `json:"total_issues"`
@@ -709,6 +757,9 @@ type IssueFilter struct {
 
 	// Molecule type filtering
 	MolType *MolType // Filter by molecule type (nil = any, swarm/patrol/work)
+
+	// Status exclusion (for default non-closed behavior)
+	ExcludeStatus []Status // Exclude issues with these statuses
 }
 
 // SortPolicy determines how ready work is ordered
@@ -777,7 +828,7 @@ type EpicStatus struct {
 // When protos or molecules are bonded together, BondRefs record
 // which sources were combined and how they were attached.
 type BondRef struct {
-	ProtoID   string `json:"proto_id"`             // Source proto/molecule ID
+	SourceID  string `json:"source_id"`            // Source proto or molecule ID
 	BondType  string `json:"bond_type"`            // sequential, parallel, conditional
 	BondPoint string `json:"bond_point,omitempty"` // Attachment site (issue ID or empty for root)
 }

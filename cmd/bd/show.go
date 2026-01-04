@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -21,6 +23,7 @@ var showCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		showThread, _ := cmd.Flags().GetBool("thread")
 		shortMode, _ := cmd.Flags().GetBool("short")
+		showRefs, _ := cmd.Flags().GetBool("refs")
 		ctx := rootCtx
 
 		// Check database freshness before reading
@@ -74,6 +77,12 @@ var showCmd = &cobra.Command{
 			}
 		}
 
+		// Handle --refs flag: show issues that reference this issue
+		if showRefs {
+			showIssueRefs(ctx, args, resolvedIDs, routedArgs, jsonOutput)
+			return
+		}
+
 		// If daemon is running, use RPC (but fall back to direct mode for routed IDs)
 		if daemonClient != nil {
 			allDetails := []interface{}{}
@@ -105,15 +114,7 @@ var showCmd = &cobra.Command{
 				}
 				if jsonOutput {
 					// Get labels and deps for JSON output
-					type IssueDetails struct {
-						*types.Issue
-						Labels       []string                             `json:"labels,omitempty"`
-						Dependencies []*types.IssueWithDependencyMetadata `json:"dependencies,omitempty"`
-						Dependents   []*types.IssueWithDependencyMetadata `json:"dependents,omitempty"`
-						Comments     []*types.Comment                     `json:"comments,omitempty"`
-						Parent       *string                              `json:"parent,omitempty"`
-					}
-					details := &IssueDetails{Issue: issue}
+					details := &types.IssueDetails{Issue: *issue}
 					details.Labels, _ = issueStore.GetLabels(ctx, issue.ID)
 					if sqliteStore, ok := issueStore.(*sqlite.SQLiteStorage); ok {
 						details.Dependencies, _ = sqliteStore.GetDependenciesWithMetadata(ctx, issue.ID)
@@ -155,15 +156,7 @@ var showCmd = &cobra.Command{
 				}
 
 				if jsonOutput {
-					type IssueDetails struct {
-						types.Issue
-						Labels       []string                             `json:"labels,omitempty"`
-						Dependencies []*types.IssueWithDependencyMetadata `json:"dependencies,omitempty"`
-						Dependents   []*types.IssueWithDependencyMetadata `json:"dependents,omitempty"`
-						Comments     []*types.Comment                     `json:"comments,omitempty"`
-						Parent       *string                              `json:"parent,omitempty"`
-					}
-					var details IssueDetails
+					var details types.IssueDetails
 					if err := json.Unmarshal(resp.Data, &details); err == nil {
 						// Compute parent from dependencies
 						for _, dep := range details.Dependencies {
@@ -182,14 +175,7 @@ var showCmd = &cobra.Command{
 					}
 
 					// Parse response first to check shortMode before output
-					type IssueDetails struct {
-						types.Issue
-						Labels       []string                             `json:"labels,omitempty"`
-						Dependencies []*types.IssueWithDependencyMetadata `json:"dependencies,omitempty"`
-						Dependents   []*types.IssueWithDependencyMetadata `json:"dependents,omitempty"`
-						Comments     []*types.Comment                     `json:"comments,omitempty"`
-					}
-					var details IssueDetails
+					var details types.IssueDetails
 					if err := json.Unmarshal(resp.Data, &details); err != nil {
 						fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
 						os.Exit(1)
@@ -222,6 +208,9 @@ var showCmd = &cobra.Command{
 					fmt.Printf("Status: %s%s\n", issue.Status, statusSuffix)
 					if issue.CloseReason != "" {
 						fmt.Printf("Close reason: %s\n", issue.CloseReason)
+					}
+					if issue.ClosedBySession != "" {
+						fmt.Printf("Closed by session: %s\n", issue.ClosedBySession)
 					}
 					fmt.Printf("Priority: P%d\n", issue.Priority)
 					fmt.Printf("Type: %s\n", issue.IssueType)
@@ -346,6 +335,13 @@ var showCmd = &cobra.Command{
 			if jsonOutput && len(allDetails) > 0 {
 				outputJSON(allDetails)
 			}
+
+			// Track first shown issue as last touched
+			if len(resolvedIDs) > 0 {
+				SetLastTouchedID(resolvedIDs[0])
+			} else if len(routedArgs) > 0 {
+				SetLastTouchedID(routedArgs[0])
+			}
 			return
 		}
 
@@ -380,15 +376,7 @@ var showCmd = &cobra.Command{
 
 			if jsonOutput {
 				// Include labels, dependencies (with metadata), dependents (with metadata), and comments in JSON output
-				type IssueDetails struct {
-					*types.Issue
-					Labels       []string                             `json:"labels,omitempty"`
-					Dependencies []*types.IssueWithDependencyMetadata `json:"dependencies,omitempty"`
-					Dependents   []*types.IssueWithDependencyMetadata `json:"dependents,omitempty"`
-					Comments     []*types.Comment                     `json:"comments,omitempty"`
-					Parent       *string                              `json:"parent,omitempty"`
-				}
-				details := &IssueDetails{Issue: issue}
+				details := &types.IssueDetails{Issue: *issue}
 				details.Labels, _ = issueStore.GetLabels(ctx, issue.ID)
 
 				// Get dependencies with metadata (dependency_type field)
@@ -440,6 +428,9 @@ var showCmd = &cobra.Command{
 			fmt.Printf("Status: %s%s\n", issue.Status, statusSuffix)
 			if issue.CloseReason != "" {
 				fmt.Printf("Close reason: %s\n", issue.CloseReason)
+			}
+			if issue.ClosedBySession != "" {
+				fmt.Printf("Closed by session: %s\n", issue.ClosedBySession)
 			}
 			fmt.Printf("Priority: P%d\n", issue.Priority)
 			fmt.Printf("Type: %s\n", issue.IssueType)
@@ -586,6 +577,11 @@ var showCmd = &cobra.Command{
 			// Show tip after successful show (non-JSON mode)
 			maybeShowTip(store)
 		}
+
+		// Track first shown issue as last touched
+		if len(args) > 0 {
+			SetLastTouchedID(args[0])
+		}
 	},
 }
 
@@ -597,8 +593,215 @@ func formatShortIssue(issue *types.Issue) string {
 		issue.ID, issue.Status, issue.Priority, issue.IssueType, issue.Title)
 }
 
+// showIssueRefs displays issues that reference the given issue(s), grouped by relationship type
+func showIssueRefs(ctx context.Context, args []string, resolvedIDs []string, routedArgs []string, jsonOut bool) {
+	// Collect all refs for all issues
+	allRefs := make(map[string][]*types.IssueWithDependencyMetadata)
+
+	// Process each issue
+	processIssue := func(issueID string, issueStore storage.Storage) error {
+		sqliteStore, ok := issueStore.(*sqlite.SQLiteStorage)
+		if !ok {
+			// Fallback: try to get dependents without metadata
+			dependents, err := issueStore.GetDependents(ctx, issueID)
+			if err != nil {
+				return err
+			}
+			for _, dep := range dependents {
+				allRefs[issueID] = append(allRefs[issueID], &types.IssueWithDependencyMetadata{Issue: *dep})
+			}
+			return nil
+		}
+
+		refs, err := sqliteStore.GetDependentsWithMetadata(ctx, issueID)
+		if err != nil {
+			return err
+		}
+		allRefs[issueID] = refs
+		return nil
+	}
+
+	// Handle routed IDs via direct mode
+	for _, id := range routedArgs {
+		result, err := resolveAndGetIssueWithRouting(ctx, store, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
+			continue
+		}
+		if result == nil || result.Issue == nil {
+			if result != nil {
+				result.Close()
+			}
+			fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
+			continue
+		}
+		if err := processIssue(result.ResolvedID, result.Store); err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting refs for %s: %v\n", id, err)
+		}
+		result.Close()
+	}
+
+	// Handle resolved IDs (daemon mode)
+	if daemonClient != nil {
+		for _, id := range resolvedIDs {
+			// Need to open direct connection for GetDependentsWithMetadata
+			dbStore, err := sqlite.New(ctx, dbPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
+				continue
+			}
+			if err := processIssue(id, dbStore); err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting refs for %s: %v\n", id, err)
+			}
+			_ = dbStore.Close()
+		}
+	} else {
+		// Direct mode - process each arg
+		for _, id := range args {
+			if containsStr(routedArgs, id) {
+				continue // Already processed above
+			}
+			result, err := resolveAndGetIssueWithRouting(ctx, store, id)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
+				continue
+			}
+			if result == nil || result.Issue == nil {
+				if result != nil {
+					result.Close()
+				}
+				fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
+				continue
+			}
+			if err := processIssue(result.ResolvedID, result.Store); err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting refs for %s: %v\n", id, err)
+			}
+			result.Close()
+		}
+	}
+
+	// Output results
+	if jsonOut {
+		outputJSON(allRefs)
+		return
+	}
+
+	// Display refs grouped by issue and relationship type
+	for issueID, refs := range allRefs {
+		if len(refs) == 0 {
+			fmt.Printf("\n%s: No references found\n", ui.RenderAccent(issueID))
+			continue
+		}
+
+		fmt.Printf("\n%s References to %s:\n", ui.RenderAccent("📎"), issueID)
+
+		// Group refs by type
+		refsByType := make(map[types.DependencyType][]*types.IssueWithDependencyMetadata)
+		for _, ref := range refs {
+			refsByType[ref.DependencyType] = append(refsByType[ref.DependencyType], ref)
+		}
+
+		// Display each type
+		typeOrder := []types.DependencyType{
+			types.DepUntil, types.DepCausedBy, types.DepValidates,
+			types.DepBlocks, types.DepParentChild, types.DepRelatesTo,
+			types.DepTracks, types.DepDiscoveredFrom, types.DepRelated,
+			types.DepSupersedes, types.DepDuplicates, types.DepRepliesTo,
+			types.DepApprovedBy, types.DepAuthoredBy, types.DepAssignedTo,
+		}
+
+		// First show types in order, then any others
+		shown := make(map[types.DependencyType]bool)
+		for _, depType := range typeOrder {
+			if refs, ok := refsByType[depType]; ok {
+				displayRefGroup(depType, refs)
+				shown[depType] = true
+			}
+		}
+		// Show any remaining types
+		for depType, refs := range refsByType {
+			if !shown[depType] {
+				displayRefGroup(depType, refs)
+			}
+		}
+		fmt.Println()
+	}
+}
+
+// displayRefGroup displays a group of references with a given type
+func displayRefGroup(depType types.DependencyType, refs []*types.IssueWithDependencyMetadata) {
+	// Get emoji for type
+	emoji := getRefTypeEmoji(depType)
+	fmt.Printf("\n  %s %s (%d):\n", emoji, depType, len(refs))
+
+	for _, ref := range refs {
+		// Color ID based on status
+		var idStr string
+		switch ref.Status {
+		case types.StatusOpen:
+			idStr = ui.StatusOpenStyle.Render(ref.ID)
+		case types.StatusInProgress:
+			idStr = ui.StatusInProgressStyle.Render(ref.ID)
+		case types.StatusBlocked:
+			idStr = ui.StatusBlockedStyle.Render(ref.ID)
+		case types.StatusClosed:
+			idStr = ui.StatusClosedStyle.Render(ref.ID)
+		default:
+			idStr = ref.ID
+		}
+		fmt.Printf("    %s: %s [P%d - %s]\n", idStr, ref.Title, ref.Priority, ref.Status)
+	}
+}
+
+// getRefTypeEmoji returns an emoji for a dependency/reference type
+func getRefTypeEmoji(depType types.DependencyType) string {
+	switch depType {
+	case types.DepUntil:
+		return "⏳" // Hourglass - waiting until
+	case types.DepCausedBy:
+		return "⚡" // Lightning - triggered by
+	case types.DepValidates:
+		return "✅" // Checkmark - validates
+	case types.DepBlocks:
+		return "🚫" // Blocked
+	case types.DepParentChild:
+		return "↳" // Child arrow
+	case types.DepRelatesTo, types.DepRelated:
+		return "↔" // Bidirectional
+	case types.DepTracks:
+		return "👁" // Watching
+	case types.DepDiscoveredFrom:
+		return "◊" // Diamond - discovered
+	case types.DepSupersedes:
+		return "⬆" // Upgrade
+	case types.DepDuplicates:
+		return "🔄" // Duplicate
+	case types.DepRepliesTo:
+		return "💬" // Chat
+	case types.DepApprovedBy:
+		return "👍" // Approved
+	case types.DepAuthoredBy:
+		return "✏" // Authored
+	case types.DepAssignedTo:
+		return "👤" // Assigned
+	default:
+		return "→" // Default arrow
+	}
+}
+
+// containsStr checks if a string slice contains a value
+func containsStr(slice []string, val string) bool {
+	for _, s := range slice {
+		if s == val {
+			return true
+		}
+	}
+	return false
+}
+
 func init() {
 	showCmd.Flags().Bool("thread", false, "Show full conversation thread (for messages)")
 	showCmd.Flags().Bool("short", false, "Show compact one-line output per issue")
+	showCmd.Flags().Bool("refs", false, "Show issues that reference this issue (reverse lookup)")
 	rootCmd.AddCommand(showCmd)
 }

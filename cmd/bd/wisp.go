@@ -147,7 +147,7 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
-	varFlags, _ := cmd.Flags().GetStringSlice("var")
+	varFlags, _ := cmd.Flags().GetStringArray("var")
 
 	// Parse variables
 	vars := make(map[string]string)
@@ -167,7 +167,8 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 
 	// Try to cook formula inline (ephemeral protos)
 	// This works for any valid formula name, not just "mol-" prefixed ones
-	sg, err := resolveAndCookFormula(args[0], nil)
+	// Pass vars for step condition filtering (bd-7zka.1)
+	sg, err := resolveAndCookFormulaWithVars(args[0], nil, vars)
 	if err == nil {
 		subgraph = sg
 		protoID = sg.Root.ID
@@ -663,11 +664,11 @@ func runWispGC(cmd *cobra.Command, args []string) {
 
 func init() {
 	// Wisp command flags (for direct create: bd mol wisp <proto>)
-	wispCmd.Flags().StringSlice("var", []string{}, "Variable substitution (key=value)")
+	wispCmd.Flags().StringArray("var", []string{}, "Variable substitution (key=value)")
 	wispCmd.Flags().Bool("dry-run", false, "Preview what would be created")
 
 	// Wisp create command flags (kept for backwards compat: bd mol wisp create <proto>)
-	wispCreateCmd.Flags().StringSlice("var", []string{}, "Variable substitution (key=value)")
+	wispCreateCmd.Flags().StringArray("var", []string{}, "Variable substitution (key=value)")
 	wispCreateCmd.Flags().Bool("dry-run", false, "Preview what would be created")
 
 	wispListCmd.Flags().Bool("all", false, "Include closed wisps")

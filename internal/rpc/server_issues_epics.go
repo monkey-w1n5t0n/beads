@@ -115,6 +115,26 @@ func updatesFromArgs(a UpdateArgs) map[string]interface{} {
 	if a.LastActivity != nil && *a.LastActivity {
 		u["last_activity"] = time.Now()
 	}
+	// Agent identity fields
+	if a.RoleType != nil {
+		u["role_type"] = *a.RoleType
+	}
+	if a.Rig != nil {
+		u["rig"] = *a.Rig
+	}
+	// Event fields
+	if a.EventCategory != nil {
+		u["event_category"] = *a.EventCategory
+	}
+	if a.EventActor != nil {
+		u["event_actor"] = *a.EventActor
+	}
+	if a.EventTarget != nil {
+		u["event_target"] = *a.EventTarget
+	}
+	if a.EventPayload != nil {
+		u["event_payload"] = *a.EventPayload
+	}
 	return u
 }
 
@@ -198,6 +218,14 @@ func (s *Server) handleCreate(req *Request) Response {
 		CreatedBy: createArgs.CreatedBy,
 		// Molecule type
 		MolType: types.MolType(createArgs.MolType),
+		// Agent identity fields
+		RoleType: createArgs.RoleType,
+		Rig:      createArgs.Rig,
+		// Event fields (map protocol names to internal names)
+		EventKind: createArgs.EventCategory,
+		Actor:     createArgs.EventActor,
+		Target:    createArgs.EventTarget,
+		Payload:   createArgs.EventPayload,
 	}
 	
 	// Check if any dependencies are discovered-from type
@@ -279,6 +307,28 @@ func (s *Server) handleCreate(req *Request) Response {
 			return Response{
 				Success: false,
 				Error:   fmt.Sprintf("failed to add label %s: %v", label, err),
+			}
+		}
+	}
+
+	// Auto-add role_type/rig labels for agent beads (enables filtering queries)
+	if issue.IssueType == types.TypeAgent {
+		if issue.RoleType != "" {
+			label := "role_type:" + issue.RoleType
+			if err := store.AddLabel(ctx, issue.ID, label, s.reqActor(req)); err != nil {
+				return Response{
+					Success: false,
+					Error:   fmt.Sprintf("failed to add role_type label: %v", err),
+				}
+			}
+		}
+		if issue.Rig != "" {
+			label := "rig:" + issue.Rig
+			if err := store.AddLabel(ctx, issue.ID, label, s.reqActor(req)); err != nil {
+				return Response{
+					Success: false,
+					Error:   fmt.Sprintf("failed to add rig label: %v", err),
+				}
 			}
 		}
 	}
@@ -418,8 +468,31 @@ func (s *Server) handleUpdate(req *Request) Response {
 		}
 	}
 
-	updates := updatesFromArgs(updateArgs)
 	actor := s.reqActor(req)
+
+	// Handle claim operation atomically
+	if updateArgs.Claim {
+		// Check if already claimed (has non-empty assignee)
+		if issue.Assignee != "" {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("already claimed by %s", issue.Assignee),
+			}
+		}
+		// Atomically set assignee and status
+		claimUpdates := map[string]interface{}{
+			"assignee": actor,
+			"status":   "in_progress",
+		}
+		if err := store.UpdateIssue(ctx, updateArgs.ID, claimUpdates, actor); err != nil {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("failed to claim issue: %v", err),
+			}
+		}
+	}
+
+	updates := updatesFromArgs(updateArgs)
 
 	// Apply regular field updates if any
 	if len(updates) > 0 {
@@ -478,6 +551,46 @@ func (s *Server) handleUpdate(req *Request) Response {
 			return Response{
 				Success: false,
 				Error:   fmt.Sprintf("failed to remove label %s: %v", label, err),
+			}
+		}
+	}
+
+	// Auto-add role_type/rig labels for agent beads when these fields are set
+	// This enables filtering queries like: bd list --type=agent --label=role_type:witness
+	// Note: We remove old role_type/rig labels first to prevent accumulation
+	if issue.IssueType == types.TypeAgent {
+		if updateArgs.RoleType != nil && *updateArgs.RoleType != "" {
+			// Remove any existing role_type:* labels first
+			existingLabels, _ := store.GetLabels(ctx, updateArgs.ID)
+			for _, l := range existingLabels {
+				if strings.HasPrefix(l, "role_type:") {
+					_ = store.RemoveLabel(ctx, updateArgs.ID, l, actor)
+				}
+			}
+			// Add new label
+			label := "role_type:" + *updateArgs.RoleType
+			if err := store.AddLabel(ctx, updateArgs.ID, label, actor); err != nil {
+				return Response{
+					Success: false,
+					Error:   fmt.Sprintf("failed to add role_type label: %v", err),
+				}
+			}
+		}
+		if updateArgs.Rig != nil && *updateArgs.Rig != "" {
+			// Remove any existing rig:* labels first
+			existingLabels, _ := store.GetLabels(ctx, updateArgs.ID)
+			for _, l := range existingLabels {
+				if strings.HasPrefix(l, "rig:") {
+					_ = store.RemoveLabel(ctx, updateArgs.ID, l, actor)
+				}
+			}
+			// Add new label
+			label := "rig:" + *updateArgs.Rig
+			if err := store.AddLabel(ctx, updateArgs.ID, label, actor); err != nil {
+				return Response{
+					Success: false,
+					Error:   fmt.Sprintf("failed to add rig label: %v", err),
+				}
 			}
 		}
 	}
@@ -541,18 +654,31 @@ func (s *Server) handleUpdate(req *Request) Response {
 
 	// Emit mutation event for event-driven daemon (only if any updates or label/parent operations were performed)
 	if len(updates) > 0 || len(updateArgs.SetLabels) > 0 || len(updateArgs.AddLabels) > 0 || len(updateArgs.RemoveLabels) > 0 || updateArgs.Parent != nil {
+		// Determine effective assignee: use new assignee from update if provided, otherwise use existing
+		effectiveAssignee := issue.Assignee
+		if updateArgs.Assignee != nil && *updateArgs.Assignee != "" {
+			effectiveAssignee = *updateArgs.Assignee
+		}
+
 		// Check if this was a status change - emit rich MutationStatus event
 		if updateArgs.Status != nil && *updateArgs.Status != string(issue.Status) {
 			s.emitRichMutation(MutationEvent{
 				Type:      MutationStatus,
 				IssueID:   updateArgs.ID,
 				Title:     issue.Title,
-				Assignee:  issue.Assignee,
+				Assignee:  effectiveAssignee,
+				Actor:     actor,
 				OldStatus: string(issue.Status),
 				NewStatus: *updateArgs.Status,
 			})
 		} else {
-			s.emitMutation(MutationUpdate, updateArgs.ID, issue.Title, issue.Assignee)
+			s.emitRichMutation(MutationEvent{
+				Type:     MutationUpdate,
+				IssueID:  updateArgs.ID,
+				Title:    issue.Title,
+				Assignee: effectiveAssignee,
+				Actor:    actor,
+			})
 		}
 	}
 
@@ -611,7 +737,7 @@ func (s *Server) handleClose(req *Request) Response {
 		oldStatus = string(issue.Status)
 	}
 
-	if err := store.CloseIssue(ctx, closeArgs.ID, closeArgs.Reason, s.reqActor(req)); err != nil {
+	if err := store.CloseIssue(ctx, closeArgs.ID, closeArgs.Reason, s.reqActor(req), closeArgs.Session); err != nil {
 		return Response{
 			Success: false,
 			Error:   fmt.Sprintf("failed to close issue: %v", err),
@@ -681,6 +807,61 @@ func (s *Server) handleDelete(req *Request) Response {
 		}
 	}
 
+	ctx := s.reqCtx(req)
+
+	// Use batch delete for cascade/multi-issue operations on SQLite storage
+	// This handles cascade delete properly by expanding dependents recursively
+	// For simple single-issue deletes, use the direct path to preserve custom reason
+	if sqlStore, ok := store.(*sqlite.SQLiteStorage); ok {
+		// Use batch delete if: cascade enabled, force enabled, multiple IDs, or dry-run
+		useBatchDelete := deleteArgs.Cascade || deleteArgs.Force || len(deleteArgs.IDs) > 1 || deleteArgs.DryRun
+		if useBatchDelete {
+			result, err := sqlStore.DeleteIssues(ctx, deleteArgs.IDs, deleteArgs.Cascade, deleteArgs.Force, deleteArgs.DryRun)
+			if err != nil {
+				return Response{
+					Success: false,
+					Error:   fmt.Sprintf("delete failed: %v", err),
+				}
+			}
+
+			// Emit mutation events for deleted issues
+			if !deleteArgs.DryRun {
+				for _, issueID := range deleteArgs.IDs {
+					s.emitMutation(MutationDelete, issueID, "", "")
+				}
+			}
+
+			// Build response
+			responseData := map[string]interface{}{
+				"deleted_count": result.DeletedCount,
+				"total_count":   len(deleteArgs.IDs),
+			}
+			if deleteArgs.DryRun {
+				responseData["dry_run"] = true
+				responseData["issue_count"] = result.DeletedCount
+			}
+			if result.DependenciesCount > 0 {
+				responseData["dependencies_removed"] = result.DependenciesCount
+			}
+			if result.LabelsCount > 0 {
+				responseData["labels_removed"] = result.LabelsCount
+			}
+			if result.EventsCount > 0 {
+				responseData["events_removed"] = result.EventsCount
+			}
+			if len(result.OrphanedIssues) > 0 {
+				responseData["orphaned_issues"] = result.OrphanedIssues
+			}
+
+			data, _ := json.Marshal(responseData)
+			return Response{
+				Success: true,
+				Data:    data,
+			}
+		}
+	}
+
+	// Simple single-issue delete path (preserves custom reason)
 	// DryRun mode: just return what would be deleted
 	if deleteArgs.DryRun {
 		data, _ := json.Marshal(map[string]interface{}{
@@ -694,7 +875,6 @@ func (s *Server) handleDelete(req *Request) Response {
 		}
 	}
 
-	ctx := s.reqCtx(req)
 	deletedCount := 0
 	errors := make([]string, 0)
 
@@ -924,6 +1104,13 @@ func (s *Server) handleList(req *Request) Response {
 	if listArgs.MolType != "" {
 		molType := types.MolType(listArgs.MolType)
 		filter.MolType = &molType
+	}
+
+	// Status exclusion (for default non-closed behavior, GH#788)
+	if len(listArgs.ExcludeStatus) > 0 {
+		for _, s := range listArgs.ExcludeStatus {
+			filter.ExcludeStatus = append(filter.ExcludeStatus, types.Status(s))
+		}
 	}
 
 	// Guard against excessive ID lists to avoid SQLite parameter limits
@@ -1305,16 +1492,8 @@ func (s *Server) handleShow(req *Request) Response {
 	comments, _ := store.GetIssueComments(ctx, issue.ID)
 
 	// Create detailed response with related data
-	type IssueDetails struct {
-		*types.Issue
-		Labels       []string                              `json:"labels,omitempty"`
-		Dependencies []*types.IssueWithDependencyMetadata `json:"dependencies,omitempty"`
-		Dependents   []*types.IssueWithDependencyMetadata `json:"dependents,omitempty"`
-		Comments     []*types.Comment                      `json:"comments,omitempty"`
-	}
-
-	details := &IssueDetails{
-		Issue:        issue,
+	details := &types.IssueDetails{
+		Issue:        *issue,
 		Labels:       labels,
 		Dependencies: deps,
 		Dependents:   dependents,
@@ -1534,6 +1713,151 @@ func (s *Server) handleEpicStatus(req *Request) Response {
 	}
 }
 
+// handleGetConfig retrieves a config value from the database
+func (s *Server) handleGetConfig(req *Request) Response {
+	var args GetConfigArgs
+	if err := json.Unmarshal(req.Args, &args); err != nil {
+		return Response{
+			Success: false,
+			Error:   fmt.Sprintf("invalid get_config args: %v", err),
+		}
+	}
+
+	store := s.storage
+	if store == nil {
+		return Response{
+			Success: false,
+			Error:   "storage not available",
+		}
+	}
+
+	ctx := s.reqCtx(req)
+
+	// Get config value from database
+	value, err := store.GetConfig(ctx, args.Key)
+	if err != nil {
+		return Response{
+			Success: false,
+			Error:   fmt.Sprintf("failed to get config %q: %v", args.Key, err),
+		}
+	}
+
+	result := GetConfigResponse{
+		Key:   args.Key,
+		Value: value,
+	}
+
+	data, _ := json.Marshal(result)
+	return Response{
+		Success: true,
+		Data:    data,
+	}
+}
+
+// handleMolStale finds stale molecules (complete-but-unclosed)
+func (s *Server) handleMolStale(req *Request) Response {
+	var args MolStaleArgs
+	if err := json.Unmarshal(req.Args, &args); err != nil {
+		return Response{
+			Success: false,
+			Error:   fmt.Sprintf("invalid mol_stale args: %v", err),
+		}
+	}
+
+	store := s.storage
+	if store == nil {
+		return Response{
+			Success: false,
+			Error:   "storage not available",
+		}
+	}
+
+	ctx := s.reqCtx(req)
+
+	// Get all epics eligible for closure (complete but unclosed)
+	epicStatuses, err := store.GetEpicsEligibleForClosure(ctx)
+	if err != nil {
+		return Response{
+			Success: false,
+			Error:   fmt.Sprintf("failed to query epics: %v", err),
+		}
+	}
+
+	// Get blocked issues to find what each stale molecule is blocking
+	blockedIssues, err := store.GetBlockedIssues(ctx, types.WorkFilter{})
+	if err != nil {
+		return Response{
+			Success: false,
+			Error:   fmt.Sprintf("failed to query blocked issues: %v", err),
+		}
+	}
+
+	// Build map of issue ID -> what issues it's blocking
+	blockingMap := make(map[string][]string)
+	for _, blocked := range blockedIssues {
+		for _, blockerID := range blocked.BlockedBy {
+			blockingMap[blockerID] = append(blockingMap[blockerID], blocked.ID)
+		}
+	}
+
+	var staleMolecules []*StaleMolecule
+	blockingCount := 0
+
+	for _, es := range epicStatuses {
+		// Skip if not eligible for close (not all children closed)
+		if !es.EligibleForClose {
+			continue
+		}
+
+		// Skip if no children and not showing all
+		if es.TotalChildren == 0 && !args.ShowAll {
+			continue
+		}
+
+		// Filter by unassigned if requested
+		if args.UnassignedOnly && es.Epic.Assignee != "" {
+			continue
+		}
+
+		// Find what this molecule is blocking
+		blocking := blockingMap[es.Epic.ID]
+		blockingIssueCount := len(blocking)
+
+		// Filter by blocking if requested
+		if args.BlockingOnly && blockingIssueCount == 0 {
+			continue
+		}
+
+		mol := &StaleMolecule{
+			ID:             es.Epic.ID,
+			Title:          es.Epic.Title,
+			TotalChildren:  es.TotalChildren,
+			ClosedChildren: es.ClosedChildren,
+			Assignee:       es.Epic.Assignee,
+			BlockingIssues: blocking,
+			BlockingCount:  blockingIssueCount,
+		}
+
+		staleMolecules = append(staleMolecules, mol)
+
+		if blockingIssueCount > 0 {
+			blockingCount++
+		}
+	}
+
+	result := &MolStaleResponse{
+		StaleMolecules: staleMolecules,
+		TotalCount:     len(staleMolecules),
+		BlockingCount:  blockingCount,
+	}
+
+	data, _ := json.Marshal(result)
+	return Response{
+		Success: true,
+		Data:    data,
+	}
+}
+
 // Gate handlers
 
 func (s *Server) handleGateCreate(req *Request) Response {
@@ -1745,7 +2069,7 @@ func (s *Server) handleGateClose(req *Request) Response {
 
 	oldStatus := string(gate.Status)
 
-	if err := store.CloseIssue(ctx, gateID, reason, s.reqActor(req)); err != nil {
+	if err := store.CloseIssue(ctx, gateID, reason, s.reqActor(req), ""); err != nil {
 		return Response{
 			Success: false,
 			Error:   fmt.Sprintf("failed to close gate: %v", err),
