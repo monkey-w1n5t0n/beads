@@ -214,7 +214,7 @@ await beads_ready_work(workspace_root="/Users/you/project-a")
 
 **Tools (all support `workspace_root` parameter):**
 - `init` - Initialize bd in current directory
-- `create` - Create new issue (bug, feature, task, epic, chore)
+- `create` - Create new issue (bug, feature, task, epic, chore, decision)
 - `list` - List issues with filters (status, priority, type, assignee)
 - `ready` - Find tasks with no blockers ready to work on
 - `show` - Show detailed issue info including dependencies
@@ -288,7 +288,7 @@ Test daemon RPC with multiple repositories:
 ```bash
 # Start the daemon first
 cd /path/to/beads
-./bd daemon --start
+./bd daemon start
 
 # Run multi-repo test
 cd integrations/beads-mcp

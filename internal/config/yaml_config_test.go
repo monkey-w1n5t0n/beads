@@ -14,24 +14,23 @@ func TestIsYamlOnlyKey(t *testing.T) {
 	}{
 		// Exact matches
 		{"no-db", true},
-		{"no-daemon", true},
-		{"no-auto-flush", true},
 		{"json", true},
-		{"auto-start-daemon", true},
-		{"flush-debounce", true},
 		{"git.author", true},
 		{"git.no-gpg-sign", true},
 
 		// Prefix matches
 		{"routing.mode", true},
 		{"routing.custom-key", true},
-		{"sync.branch", true},
 		{"sync.require_confirmation_on_mass_delete", true},
 		{"directory.labels", true},
 		{"repos.primary", true},
 		{"external_projects.beads", true},
 
-		// SQLite keys (should return false)
+		// Hierarchy settings (GH#995)
+		{"hierarchy.max-depth", true},
+		{"hierarchy.custom_setting", true}, // prefix match
+
+		// Non-yaml keys (should return false)
 		{"jira.url", false},
 		{"jira.project", false},
 		{"linear.api_key", false},
@@ -95,11 +94,11 @@ func TestUpdateYamlKey(t *testing.T) {
 			expected: "actor: \"steve\"\nother: value",
 		},
 		{
-			name:     "handle duration value",
-			content:  "# flush-debounce: \"5s\"",
-			key:      "flush-debounce",
-			value:    "30s",
-			expected: "flush-debounce: 30s",
+			name:     "handle string value",
+			content:  "# actor: \"\"",
+			key:      "actor",
+			value:    "testuser",
+			expected: `actor: "testuser"`,
 		},
 		{
 			name:     "quote special characters",
@@ -158,10 +157,8 @@ func TestNormalizeYamlKey(t *testing.T) {
 		input    string
 		expected string
 	}{
-		{"sync.branch", "sync-branch"},  // alias should be normalized
-		{"sync-branch", "sync-branch"},  // already canonical
-		{"no-db", "no-db"},              // no alias, unchanged
-		{"json", "json"},                // no alias, unchanged
+		{"no-db", "no-db"},               // no alias, unchanged
+		{"json", "json"},                 // no alias, unchanged
 		{"routing.mode", "routing.mode"}, // no alias for this one
 	}
 
@@ -172,55 +169,6 @@ func TestNormalizeYamlKey(t *testing.T) {
 				t.Errorf("normalizeYamlKey(%q) = %q, want %q", tt.input, got, tt.expected)
 			}
 		})
-	}
-}
-
-func TestSetYamlConfig_KeyNormalization(t *testing.T) {
-	// Create a temp directory with .beads/config.yaml
-	tmpDir, err := os.MkdirTemp("", "beads-yaml-key-norm-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("Failed to create .beads dir: %v", err)
-	}
-
-	configPath := filepath.Join(beadsDir, "config.yaml")
-	initialConfig := `# Beads Config
-sync-branch: old-value
-`
-	if err := os.WriteFile(configPath, []byte(initialConfig), 0644); err != nil {
-		t.Fatalf("Failed to write config.yaml: %v", err)
-	}
-
-	// Change to temp directory for the test
-	oldWd, _ := os.Getwd()
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatalf("Failed to chdir: %v", err)
-	}
-	defer os.Chdir(oldWd)
-
-	// Test SetYamlConfig with aliased key (sync.branch should write as sync-branch)
-	if err := SetYamlConfig("sync.branch", "new-value"); err != nil {
-		t.Fatalf("SetYamlConfig() error = %v", err)
-	}
-
-	// Read back and verify
-	content, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("Failed to read config.yaml: %v", err)
-	}
-
-	contentStr := string(content)
-	// Should update the existing sync-branch line, not add sync.branch
-	if !strings.Contains(contentStr, "sync-branch: \"new-value\"") {
-		t.Errorf("config.yaml should contain 'sync-branch: \"new-value\"', got:\n%s", contentStr)
-	}
-	if strings.Contains(contentStr, "sync.branch") {
-		t.Errorf("config.yaml should NOT contain 'sync.branch' (should be normalized to sync-branch), got:\n%s", contentStr)
 	}
 }
 
@@ -275,3 +223,54 @@ other-setting: value
 		t.Errorf("config.yaml should preserve other settings, got:\n%s", contentStr)
 	}
 }
+
+// TestValidateYamlConfigValue_HierarchyMaxDepth tests validation of hierarchy.max-depth (GH#995)
+func TestValidateYamlConfigValue_HierarchyMaxDepth(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		expectErr bool
+		errMsg    string
+	}{
+		{"valid positive integer", "5", false, ""},
+		{"valid minimum value", "1", false, ""},
+		{"valid large value", "100", false, ""},
+		{"invalid zero", "0", true, "hierarchy.max-depth must be at least 1, got 0"},
+		{"invalid negative", "-1", true, "hierarchy.max-depth must be at least 1, got -1"},
+		{"invalid non-integer", "abc", true, "hierarchy.max-depth must be a positive integer, got \"abc\""},
+		{"invalid float", "3.5", true, "hierarchy.max-depth must be a positive integer, got \"3.5\""},
+		{"invalid empty", "", true, "hierarchy.max-depth must be a positive integer, got \"\""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateYamlConfigValue("hierarchy.max-depth", tt.value)
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("expected error for value %q, got nil", tt.value)
+				} else if err.Error() != tt.errMsg {
+					t.Errorf("expected error %q, got %q", tt.errMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error for value %q: %v", tt.value, err)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateYamlConfigValue_OtherKeys tests that other keys are not validated
+func TestValidateYamlConfigValue_OtherKeys(t *testing.T) {
+	// Other keys should pass validation regardless of value
+	err := validateYamlConfigValue("no-db", "invalid")
+	if err != nil {
+		t.Errorf("unexpected error for no-db: %v", err)
+	}
+
+	err = validateYamlConfigValue("routing.mode", "anything")
+	if err != nil {
+		t.Errorf("unexpected error for routing.mode: %v", err)
+	}
+}
+

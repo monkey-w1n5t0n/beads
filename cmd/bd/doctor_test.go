@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -5,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -101,8 +102,6 @@ func TestDoctorJSONOutput(t *testing.T) {
 		t.Errorf("Checks length mismatch: %d != %d", len(decoded.Checks), len(result.Checks))
 	}
 }
-
-// Note: isHashID is tested in migrate_hash_ids_test.go
 
 func TestDetectHashBasedIDs(t *testing.T) {
 	tests := []struct {
@@ -236,6 +235,7 @@ func TestDetectHashBasedIDs(t *testing.T) {
 }
 
 func TestCheckIDFormat(t *testing.T) {
+	t.Skip("SQLite-specific: creates SQLite database directly; Dolt backend can't read it")
 	tests := []struct {
 		name           string
 		issueIDs       []string
@@ -373,21 +373,19 @@ func TestCheckInstallation(t *testing.T) {
 }
 
 func TestCheckDatabaseVersionJSONLMode(t *testing.T) {
-	// Create temporary directory with .beads but no database
+	// Dolt backend doesn't have a "JSONL-only" mode; it reports fresh clone
+	// when no dolt/ directory exists but JSONL is present.
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.Mkdir(beadsDir, 0750); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create empty issues.jsonl to simulate --no-db mode
 	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
 	if err := os.WriteFile(jsonlPath, []byte{}, 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create config.yaml with no-db: true to indicate intentional JSONL-only mode
-	// Without this, doctor treats it as a fresh clone needing 'bd init' (bd-4ew)
 	configPath := filepath.Join(beadsDir, "config.yaml")
 	if err := os.WriteFile(configPath, []byte("no-db: true\n"), 0644); err != nil {
 		t.Fatal(err)
@@ -395,14 +393,12 @@ func TestCheckDatabaseVersionJSONLMode(t *testing.T) {
 
 	check := doctor.CheckDatabaseVersion(tmpDir, Version)
 
-	if check.Status != doctor.StatusOK {
-		t.Errorf("Expected ok status for JSONL mode, got %s", check.Status)
+	// Dolt backend sees JSONL without dolt/ dir → fresh clone warning
+	if check.Status != doctor.StatusWarning {
+		t.Errorf("Expected warning status for Dolt fresh clone, got %s", check.Status)
 	}
-	if check.Message != "JSONL-only mode" {
-		t.Errorf("Expected JSONL-only mode message, got %s", check.Message)
-	}
-	if check.Detail == "" {
-		t.Error("Expected detail field to be set for JSONL mode")
+	if !strings.Contains(check.Message, "Fresh clone") {
+		t.Errorf("Expected fresh clone message, got %s", check.Message)
 	}
 }
 
@@ -426,7 +422,7 @@ func TestCheckDatabaseVersionFreshClone(t *testing.T) {
 	if check.Status != doctor.StatusWarning {
 		t.Errorf("Expected warning status for fresh clone, got %s", check.Status)
 	}
-	if check.Message != "Fresh clone detected (no database)" {
+	if !strings.Contains(check.Message, "Fresh clone detected") {
 		t.Errorf("Expected fresh clone message, got %s", check.Message)
 	}
 	if check.Fix == "" {
@@ -458,74 +454,6 @@ func TestCompareVersions(t *testing.T) {
 	}
 }
 
-func TestCheckMultipleDatabases(t *testing.T) {
-	tests := []struct {
-		name           string
-		dbFiles        []string
-		expectedStatus string
-		expectWarning  bool
-	}{
-		{
-			name:           "no databases",
-			dbFiles:        []string{},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name:           "single database",
-			dbFiles:        []string{"beads.db"},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name:           "multiple databases",
-			dbFiles:        []string{"beads.db", "old.db"},
-			expectedStatus: doctor.StatusWarning,
-			expectWarning:  true,
-		},
-		{
-			name:           "backup files ignored",
-			dbFiles:        []string{"beads.db", "beads.backup.db"},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name:           "vc.db ignored",
-			dbFiles:        []string{"beads.db", "vc.db"},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			beadsDir := filepath.Join(tmpDir, ".beads")
-			if err := os.Mkdir(beadsDir, 0750); err != nil {
-				t.Fatal(err)
-			}
-
-			// Create test database files
-			for _, dbFile := range tc.dbFiles {
-				path := filepath.Join(beadsDir, dbFile)
-				if err := os.WriteFile(path, []byte{}, 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			check := doctor.CheckMultipleDatabases(tmpDir)
-
-			if check.Status != tc.expectedStatus {
-				t.Errorf("Expected status %s, got %s", tc.expectedStatus, check.Status)
-			}
-
-			if tc.expectWarning && check.Fix == "" {
-				t.Error("Expected fix message for warning status")
-			}
-		})
-	}
-}
-
 func TestCheckPermissions(t *testing.T) {
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -537,64 +465,6 @@ func TestCheckPermissions(t *testing.T) {
 
 	if check.Status != doctor.StatusOK {
 		t.Errorf("Expected ok status for writable directory, got %s: %s", check.Status, check.Message)
-	}
-}
-
-func TestCheckDatabaseJSONLSync(t *testing.T) {
-	tests := []struct {
-		name           string
-		hasDB          bool
-		hasJSONL       bool
-		expectedStatus string
-	}{
-		{
-			name:           "no database",
-			hasDB:          false,
-			hasJSONL:       true,
-			expectedStatus: doctor.StatusOK,
-		},
-		{
-			name:           "no JSONL",
-			hasDB:          true,
-			hasJSONL:       false,
-			expectedStatus: doctor.StatusOK,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			beadsDir := filepath.Join(tmpDir, ".beads")
-			if err := os.Mkdir(beadsDir, 0750); err != nil {
-				t.Fatal(err)
-			}
-
-			if tc.hasDB {
-				dbPath := filepath.Join(beadsDir, "beads.db")
-				// Skip database creation tests due to SQLite driver registration in tests
-				// The real doctor command works fine with actual databases
-				if tc.hasJSONL {
-					t.Skip("Database creation in tests requires complex driver setup")
-				}
-				// For no-JSONL case, just create an empty file
-				if err := os.WriteFile(dbPath, []byte{}, 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			if tc.hasJSONL {
-				jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-				if err := os.WriteFile(jsonlPath, []byte{}, 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			check := doctor.CheckDatabaseJSONLSync(tmpDir)
-
-			if check.Status != tc.expectedStatus {
-				t.Errorf("Expected status %s, got %s", tc.expectedStatus, check.Status)
-			}
-		})
 	}
 }
 
@@ -688,11 +558,13 @@ func TestCheckGitHooks(t *testing.T) {
 
 			runInDir(t, tmpDir, func() {
 				if tc.hasGitDir {
-					// Initialize a real git repository in the test directory
-					cmd := exec.Command("git", "init")
-					cmd.Dir = tmpDir
-					if err := cmd.Run(); err != nil {
-						t.Skipf("Skipping test: git init failed: %v", err)
+					// Copy cached git template (bd-ktng optimization)
+					initGitTemplate()
+					if gitTemplateErr != nil {
+						t.Fatalf("git template init failed: %v", gitTemplateErr)
+					}
+					if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+						t.Fatalf("failed to copy git template: %v", err)
 					}
 
 					gitDir, err := git.GetGitDir()
@@ -713,7 +585,7 @@ func TestCheckGitHooks(t *testing.T) {
 					}
 				}
 
-				check := doctor.CheckGitHooks()
+				check := doctor.CheckGitHooks(Version)
 
 				if check.Status != tc.expectedStatus {
 					t.Errorf("Expected status %s, got %s", tc.expectedStatus, check.Status)
@@ -924,7 +796,7 @@ func TestCheckMetadataVersionTracking(t *testing.T) {
 			name: "slightly outdated version",
 			setupVersion: func(beadsDir string) error {
 				// Use a version that's less than 10 minor versions behind current
-				return os.WriteFile(filepath.Join(beadsDir, ".local_version"), []byte("0.35.0\n"), 0644)
+				return os.WriteFile(filepath.Join(beadsDir, ".local_version"), []byte("0.43.0\n"), 0644)
 			},
 			expectedStatus: doctor.StatusOK,
 			expectWarning:  false,
@@ -1042,78 +914,6 @@ func TestParseVersionParts(t *testing.T) {
 	}
 }
 
-func TestCheckSyncBranchConfig(t *testing.T) {
-	tests := []struct {
-		name           string
-		setupFunc      func(t *testing.T, tmpDir string)
-		expectedStatus string
-		expectWarning  bool
-	}{
-		{
-			name: "no beads directory",
-			setupFunc: func(t *testing.T, tmpDir string) {
-				// No .beads directory
-			},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name: "not a git repo",
-			setupFunc: func(t *testing.T, tmpDir string) {
-				beadsDir := filepath.Join(tmpDir, ".beads")
-				if err := os.Mkdir(beadsDir, 0750); err != nil {
-					t.Fatal(err)
-				}
-			},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name: "sync.branch configured via env var",
-			setupFunc: func(t *testing.T, tmpDir string) {
-				// Initialize git repo
-				cmd := exec.Command("git", "init")
-				cmd.Dir = tmpDir
-				if err := cmd.Run(); err != nil {
-					t.Fatal(err)
-				}
-
-				// Create .beads directory
-				beadsDir := filepath.Join(tmpDir, ".beads")
-				if err := os.Mkdir(beadsDir, 0750); err != nil {
-					t.Fatal(err)
-				}
-
-				// Set env var (simulates config.yaml or BEADS_SYNC_BRANCH)
-				t.Setenv("BEADS_SYNC_BRANCH", "beads-sync")
-			},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		// Note: Tests for "not configured" scenarios are difficult because viper
-		// reads config.yaml at startup from the test's working directory.
-		// The env var tests above verify the core functionality.
-		// For full integration testing, use actual fresh clones.
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			tc.setupFunc(t, tmpDir)
-
-			result := doctor.CheckSyncBranchConfig(tmpDir)
-
-			if result.Status != tc.expectedStatus {
-				t.Errorf("Expected status %q, got %q", tc.expectedStatus, result.Status)
-			}
-
-			if tc.expectWarning && result.Fix == "" {
-				t.Error("Expected Fix field to be set for warning status")
-			}
-		})
-	}
-}
-
 // TestInteractiveFlagParsing verifies the --interactive flag is registered (bd-3xl)
 func TestInteractiveFlagParsing(t *testing.T) {
 	// Verify the flag exists and has the right short form
@@ -1226,175 +1026,119 @@ func TestExportDiagnosticsInvalidPath(t *testing.T) {
 	}
 }
 
-// TestCheckSyncBranchHookCompatibility tests the sync-branch hook compatibility check (issue #532)
-// Note: We use BEADS_SYNC_BRANCH env var to control sync-branch detection because the config
-// package reads from the actual beads repo's config.yaml. Only test cases with syncBranchEnv
-// set to a non-empty value are reliable.
-func TestCheckSyncBranchHookCompatibility(t *testing.T) {
-	tests := []struct {
-		name           string
-		syncBranchEnv  string // BEADS_SYNC_BRANCH env var (must be non-empty to override config.yaml)
-		hasGitDir      bool
-		hookVersion    string // Empty means no hook, "custom" means non-bd hook
-		expectedStatus string
-	}{
-		{
-			name:           "sync-branch configured, no git repo",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      false,
-			hookVersion:    "",
-			expectedStatus: doctor.StatusOK, // N/A case
-		},
-		{
-			name:           "sync-branch configured, no pre-push hook",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "",
-			expectedStatus: doctor.StatusOK, // Covered by other check
-		},
-		{
-			name:           "sync-branch configured, custom hook",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "custom",
-			expectedStatus: doctor.StatusWarning,
-		},
-		{
-			name:           "sync-branch configured, old hook (0.24.2)",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "0.24.2",
-			expectedStatus: doctor.StatusError,
-		},
-		{
-			name:           "sync-branch configured, old hook (0.28.0)",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "0.28.0",
-			expectedStatus: doctor.StatusError,
-		},
-		{
-			name:           "sync-branch configured, compatible hook (0.29.0)",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "0.29.0",
-			expectedStatus: doctor.StatusOK,
-		},
-		{
-			name:           "sync-branch configured, newer hook (0.30.0)",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "0.30.0",
-			expectedStatus: doctor.StatusOK,
-		},
+// TestDoctor_WithBEADS_DIR tests that doctor respects BEADS_DIR environment variable
+func TestDoctor_WithBEADS_DIR(t *testing.T) {
+	// Reset Cobra flags to avoid interference
+	defer func() {
+		doctorFix = false
+		doctorYes = false
+		doctorInteractive = false
+		doctorDryRun = false
+	}()
+
+	// Create target directory (where BEADS_DIR points)
+	targetDir := t.TempDir()
+	targetBeadsDir := filepath.Join(targetDir, ".beads")
+	if err := os.Mkdir(targetBeadsDir, 0750); err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
+	// Create CWD directory (where we run from - should be ignored)
+	cwdDir := t.TempDir()
+	// Explicitly do NOT create .beads here - doctor should not check CWD
 
-			// Always set environment variable to control sync-branch detection
-			// This overrides any config.yaml value in the actual beads repo
-			t.Setenv("BEADS_SYNC_BRANCH", tc.syncBranchEnv)
+	// Save original working directory
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 
-			if tc.hasGitDir {
-				// Initialize a real git repo (git rev-parse needs this)
-				cmd := exec.Command("git", "init")
-				cmd.Dir = tmpDir
-				if err := cmd.Run(); err != nil {
-					t.Fatal(err)
-				}
+	// Change to CWD (no .beads)
+	if err := os.Chdir(cwdDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.Chdir(origDir)
+	}()
 
-				// Create pre-push hook if specified
-				if tc.hookVersion != "" {
-					hooksDir := filepath.Join(tmpDir, ".git", "hooks")
-					hookPath := filepath.Join(hooksDir, "pre-push")
-					var hookContent string
-					if tc.hookVersion == "custom" {
-						hookContent = "#!/bin/sh\n# Custom hook\nexit 0\n"
-					} else {
-						hookContent = fmt.Sprintf("#!/bin/sh\n# bd-hooks-version: %s\nexit 0\n", tc.hookVersion)
-					}
-					if err := os.WriteFile(hookPath, []byte(hookContent), 0755); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
+	// Set BEADS_DIR to point to target/.beads
+	t.Setenv("BEADS_DIR", targetBeadsDir)
 
-			check := doctor.CheckSyncBranchHookCompatibility(tmpDir)
+	// The doctor command's Run function determines path from BEADS_DIR
+	// We test that by verifying runDiagnostics receives the parent of BEADS_DIR
+	// Direct call: runDiagnostics uses the path it's given
+	// Through cobra: Run function computes path from BEADS_DIR
 
-			if check.Status != tc.expectedStatus {
-				t.Errorf("Expected status %s, got %s (message: %s)", tc.expectedStatus, check.Status, check.Message)
-			}
+	// Test the path resolution logic directly
+	beadsDir := os.Getenv("BEADS_DIR")
+	if beadsDir == "" {
+		t.Fatal("BEADS_DIR should be set")
+	}
+	checkPath := filepath.Dir(beadsDir) // Parent of .beads
 
-			// Error case should have a fix message
-			if tc.expectedStatus == doctor.StatusError && check.Fix == "" {
-				t.Error("Expected fix message for error status")
-			}
-		})
+	// Verify we get the target directory, not CWD
+	if checkPath != targetDir {
+		t.Errorf("Expected checkPath to be %s, got %s", targetDir, checkPath)
+	}
+
+	// Run diagnostics on the computed path (simulates what cobra Run does)
+	result := runDiagnostics(checkPath)
+
+	// Should find .beads at target location
+	if len(result.Checks) == 0 {
+		t.Fatal("Expected at least one check")
+	}
+	installCheck := result.Checks[0]
+	if installCheck.Status != "ok" {
+		t.Errorf("Expected Installation to pass (found .beads at BEADS_DIR parent), got status=%s, message=%s",
+			installCheck.Status, installCheck.Message)
 	}
 }
 
-// TestCheckSyncBranchHookQuick tests the quick sync-branch hook check (issue #532)
-// Note: We use BEADS_SYNC_BRANCH env var to control sync-branch detection.
-func TestCheckSyncBranchHookQuick(t *testing.T) {
-	tests := []struct {
-		name          string
-		syncBranchEnv string
-		hasGitDir     bool
-		hookVersion   string
-		expectIssue   bool
-	}{
-		{
-			name:          "old hook with sync-branch",
-			syncBranchEnv: "beads-sync",
-			hasGitDir:     true,
-			hookVersion:   "0.24.0",
-			expectIssue:   true,
-		},
-		{
-			name:          "compatible hook with sync-branch",
-			syncBranchEnv: "beads-sync",
-			hasGitDir:     true,
-			hookVersion:   "0.29.0",
-			expectIssue:   false,
-		},
+// TestDoctor_ExplicitPathOverridesBEADS_DIR tests that explicit path arg takes precedence
+func TestDoctor_ExplicitPathOverridesBEADS_DIR(t *testing.T) {
+	// Create two directories: one for explicit path, one for BEADS_DIR
+	explicitDir := t.TempDir()
+	explicitBeadsDir := filepath.Join(explicitDir, ".beads")
+	if err := os.Mkdir(explicitBeadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	// Mark explicit with a file so we can verify it was used
+	if err := os.WriteFile(filepath.Join(explicitBeadsDir, "explicit-marker"), []byte("explicit"), 0644); err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
+	beadsDirTarget := t.TempDir()
+	beadsDirBeads := filepath.Join(beadsDirTarget, ".beads")
+	if err := os.Mkdir(beadsDirBeads, 0750); err != nil {
+		t.Fatal(err)
+	}
 
-			// Always set environment variable to control sync-branch detection
-			// This overrides any config.yaml value in the actual beads repo
-			t.Setenv("BEADS_SYNC_BRANCH", tc.syncBranchEnv)
+	// Set BEADS_DIR
+	t.Setenv("BEADS_DIR", beadsDirBeads)
 
-			if tc.hasGitDir {
-				// Initialize a real git repo (git rev-parse needs this)
-				cmd := exec.Command("git", "init")
-				cmd.Dir = tmpDir
-				if err := cmd.Run(); err != nil {
-					t.Fatal(err)
-				}
+	// Test precedence: explicit arg > BEADS_DIR > CWD
+	// When explicit path is given, BEADS_DIR should be ignored
 
-				if tc.hookVersion != "" {
-					hooksDir := filepath.Join(tmpDir, ".git", "hooks")
-					hookPath := filepath.Join(hooksDir, "pre-push")
-					hookContent := fmt.Sprintf("#!/bin/sh\n# bd-hooks-version: %s\nexit 0\n", tc.hookVersion)
-					if err := os.WriteFile(hookPath, []byte(hookContent), 0755); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
+	// Simulate the logic from doctor.go's Run function:
+	args := []string{explicitDir}
+	var checkPath string
+	if len(args) > 0 {
+		checkPath = args[0]
+	} else if beadsDir := os.Getenv("BEADS_DIR"); beadsDir != "" {
+		checkPath = filepath.Dir(beadsDir)
+	} else {
+		checkPath = "."
+	}
 
-			issue := doctor.CheckSyncBranchHookQuick(tmpDir)
+	// Should use explicit path, not BEADS_DIR
+	if checkPath != explicitDir {
+		t.Errorf("Expected explicit path %s to take precedence, got %s", explicitDir, checkPath)
+	}
 
-			if tc.expectIssue && issue == "" {
-				t.Error("Expected issue to be reported, got empty string")
-			}
-			if !tc.expectIssue && issue != "" {
-				t.Errorf("Expected no issue, got: %s", issue)
-			}
-		})
+	// Verify the marker file exists at the chosen path
+	markerPath := filepath.Join(checkPath, ".beads", "explicit-marker")
+	if _, err := os.Stat(markerPath); os.IsNotExist(err) {
+		t.Error("Expected to find explicit-marker in chosen path - wrong directory was selected")
 	}
 }

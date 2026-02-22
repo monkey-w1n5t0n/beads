@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -27,24 +26,24 @@ with dependencies forming a DAG (directed acyclic graph) of work.`,
 
 // SwarmAnalysis holds the results of analyzing an epic's structure for swarming.
 type SwarmAnalysis struct {
-	EpicID          string                  `json:"epic_id"`
-	EpicTitle       string                  `json:"epic_title"`
-	TotalIssues     int                     `json:"total_issues"`
-	ClosedIssues    int                     `json:"closed_issues"`
-	ReadyFronts     []ReadyFront            `json:"ready_fronts"`
-	MaxParallelism  int                     `json:"max_parallelism"`
+	EpicID            string                `json:"epic_id"`
+	EpicTitle         string                `json:"epic_title"`
+	TotalIssues       int                   `json:"total_issues"`
+	ClosedIssues      int                   `json:"closed_issues"`
+	ReadyFronts       []ReadyFront          `json:"ready_fronts"`
+	MaxParallelism    int                   `json:"max_parallelism"`
 	EstimatedSessions int                   `json:"estimated_sessions"`
-	Warnings        []string                `json:"warnings"`
-	Errors          []string                `json:"errors"`
-	Swarmable       bool                    `json:"swarmable"`
-	Issues          map[string]*IssueNode   `json:"issues,omitempty"` // Only included with --verbose
+	Warnings          []string              `json:"warnings"`
+	Errors            []string              `json:"errors"`
+	Swarmable         bool                  `json:"swarmable"`
+	Issues            map[string]*IssueNode `json:"issues,omitempty"` // Only included with --verbose
 }
 
 // ReadyFront represents a group of issues that can be worked on in parallel.
 type ReadyFront struct {
-	Wave    int      `json:"wave"`
-	Issues  []string `json:"issues"`
-	Titles  []string `json:"titles,omitempty"` // Only for human output
+	Wave   int      `json:"wave"`
+	Issues []string `json:"issues"`
+	Titles []string `json:"titles,omitempty"` // Only for human output
 }
 
 // IssueNode represents an issue in the dependency graph.
@@ -77,7 +76,7 @@ func findExistingSwarm(ctx context.Context, s SwarmStorage, epicID string) (*typ
 	// Find a swarm molecule with relates-to dependency to this epic
 	for _, dep := range dependents {
 		// Only consider molecules (GetDependents doesn't populate mol_type, so we fetch full issue)
-		if dep.IssueType != types.TypeMolecule {
+		if dep.IssueType != "molecule" {
 			continue
 		}
 
@@ -159,16 +158,7 @@ Examples:
 
 		// Swarm commands require direct store access
 		if store == nil {
-			if daemonClient != nil {
-				var err error
-				store, err = sqlite.New(ctx, dbPath)
-				if err != nil {
-					FatalErrorRespectJSON("failed to open database: %v", err)
-				}
-				defer func() { _ = store.Close() }()
-			} else {
-				FatalErrorRespectJSON("no database connection")
-			}
+			FatalErrorRespectJSON("no database connection")
 		}
 
 		// Resolve epic ID
@@ -187,7 +177,7 @@ Examples:
 		}
 
 		// Verify it's an epic
-		if epic.IssueType != types.TypeEpic && epic.IssueType != types.TypeMolecule {
+		if epic.IssueType != types.TypeEpic && epic.IssueType != "molecule" {
 			FatalErrorRespectJSON("'%s' is not an epic or molecule (type: %s)", epicID, epic.IssueType)
 		}
 
@@ -625,16 +615,7 @@ Examples:
 
 		// Swarm commands require direct store access
 		if store == nil {
-			if daemonClient != nil {
-				var err error
-				store, err = sqlite.New(ctx, dbPath)
-				if err != nil {
-					FatalErrorRespectJSON("failed to open database: %v", err)
-				}
-				defer func() { _ = store.Close() }()
-			} else {
-				FatalErrorRespectJSON("no database connection")
-			}
+			FatalErrorRespectJSON("no database connection")
 		}
 
 		// Resolve ID
@@ -655,7 +636,7 @@ Examples:
 		var epic *types.Issue
 
 		// Check if it's a swarm molecule - if so, follow the link to the epic
-		if issue.IssueType == types.TypeMolecule && issue.MolType == types.MolTypeSwarm {
+		if issue.IssueType == "molecule" && issue.MolType == types.MolTypeSwarm {
 			// Find linked epic via relates-to dependency
 			deps, err := store.GetDependencyRecords(ctx, issue.ID)
 			if err != nil {
@@ -673,7 +654,7 @@ Examples:
 			if epic == nil {
 				FatalErrorRespectJSON("swarm molecule '%s' has no linked epic", issueID)
 			}
-		} else if issue.IssueType == types.TypeEpic || issue.IssueType == types.TypeMolecule {
+		} else if issue.IssueType == types.TypeEpic || issue.IssueType == "molecule" {
 			epic = issue
 		} else {
 			FatalErrorRespectJSON("'%s' is not an epic or swarm molecule (type: %s)", issueID, issue.IssueType)
@@ -919,16 +900,7 @@ Examples:
 
 		// Swarm commands require direct store access
 		if store == nil {
-			if daemonClient != nil {
-				var err error
-				store, err = sqlite.New(ctx, dbPath)
-				if err != nil {
-					FatalErrorRespectJSON("failed to open database: %v", err)
-				}
-				defer func() { _ = store.Close() }()
-			} else {
-				FatalErrorRespectJSON("no database connection")
-			}
+			FatalErrorRespectJSON("no database connection")
 		}
 
 		// Resolve the input ID
@@ -950,7 +922,7 @@ Examples:
 		var epicTitle string
 
 		// Check if it's an epic or single issue that needs wrapping
-		if issue.IssueType == types.TypeEpic || issue.IssueType == types.TypeMolecule {
+		if issue.IssueType == types.TypeEpic || issue.IssueType == "molecule" {
 			epicID = issue.ID
 			epicTitle = issue.Title
 		} else {
@@ -999,8 +971,8 @@ Examples:
 		if existingSwarm != nil && !force {
 			if jsonOutput {
 				outputJSON(map[string]interface{}{
-					"error":         "swarm already exists",
-					"existing_id":   existingSwarm.ID,
+					"error":          "swarm already exists",
+					"existing_id":    existingSwarm.ID,
 					"existing_title": existingSwarm.Title,
 				})
 			} else {
@@ -1042,7 +1014,7 @@ Examples:
 			Description: fmt.Sprintf("Swarm molecule orchestrating epic %s.\n\nEpic: %s\nCoordinator: %s", epicID, epicID, coordinator),
 			Status:      types.StatusOpen,
 			Priority:    epic.Priority,
-			IssueType:   types.TypeMolecule,
+			IssueType:   "molecule",
 			MolType:     types.MolTypeSwarm,
 			Assignee:    coordinator,
 			CreatedBy:   actor,
@@ -1101,16 +1073,7 @@ Examples:
 
 		// Swarm commands require direct store access
 		if store == nil {
-			if daemonClient != nil {
-				var err error
-				store, err = sqlite.New(ctx, dbPath)
-				if err != nil {
-					FatalErrorRespectJSON("failed to open database: %v", err)
-				}
-				defer func() { _ = store.Close() }()
-			} else {
-				FatalErrorRespectJSON("no database connection")
-			}
+			FatalErrorRespectJSON("no database connection")
 		}
 
 		// Query for all swarm molecules

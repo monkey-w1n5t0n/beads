@@ -13,8 +13,7 @@ Complete installation guide for all platforms.
 ### Homebrew (macOS/Linux)
 
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Why Homebrew?**
@@ -30,10 +29,35 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 ```
 
 The installer will:
-- Detect your platform (macOS/Linux, amd64/arm64)
+- Detect your platform (macOS/Linux/FreeBSD, amd64/arm64)
 - Install via `go install` if Go is available
 - Fall back to building from source if needed
 - Guide you through PATH setup if necessary
+
+## Build Dependencies (go install / from source)
+
+If you install via `go install` or build from source, you need system dependencies for CGO:
+
+macOS (Homebrew):
+```bash
+brew install icu4c zstd
+```
+
+Linux (Debian/Ubuntu):
+```bash
+sudo apt-get install -y libicu-dev libzstd-dev
+```
+
+Linux (Fedora/RHEL):
+```bash
+sudo dnf install -y libicu-devel libzstd-devel
+```
+
+If you see `unicode/uregex.h` missing on macOS, `icu4c` is keg-only. Use:
+```bash
+ICU_PREFIX="$(brew --prefix icu4c)"
+CGO_CFLAGS="-I${ICU_PREFIX}/include" CGO_CPPFLAGS="-I${ICU_PREFIX}/include" CGO_LDFLAGS="-L${ICU_PREFIX}/lib" go install github.com/steveyegge/beads/cmd/bd@latest
+```
 
 ## Platform-Specific Installation
 
@@ -41,8 +65,7 @@ The installer will:
 
 **Via Homebrew** (recommended):
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Via go install**:
@@ -62,8 +85,7 @@ sudo mv bd /usr/local/bin/
 
 **Via Homebrew** (works on Linux too):
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Arch Linux** (AUR):
@@ -72,6 +94,18 @@ brew install bd
 yay -S beads-git
 # or
 paru -S beads-git
+```
+
+**Via go install**:
+```bash
+go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
+### FreeBSD
+
+**Via quick install script**:
+```bash
+curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
 ```
 
 **Via go install**:
@@ -92,10 +126,14 @@ Beads ships with native Windows support—no MSYS or MinGW required.
 irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
 ```
 
+The script installs a prebuilt Windows release if available. Go is only required for `go install` or building from source.
+
 **Via go install**:
 ```pwsh
 go install github.com/steveyegge/beads/cmd/bd@latest
 ```
+
+If you see `unicode/uregex.h` missing while building, use the PowerShell install script instead.
 
 ## IDE and Editor Integrations
 
@@ -105,7 +143,7 @@ The recommended approach for Claude Code, Cursor, Windsurf, and other editors wi
 
 ```bash
 # 1. Install bd CLI (see Quick Install above)
-brew install bd
+brew install beads
 
 # 2. Initialize in your project
 cd your-project
@@ -188,10 +226,22 @@ CGO_ENABLED=1 go install github.com/steveyegge/beads/cmd/bd@latest
 
 ## Updating bd
 
+### Quick install script (macOS/Linux/FreeBSD)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+```
+
+### PowerShell installer (Windows)
+
+```pwsh
+irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
+```
+
 ### Homebrew
 
 ```bash
-brew upgrade bd
+brew upgrade beads
 ```
 
 ### go install
@@ -199,6 +249,8 @@ brew upgrade bd
 ```bash
 go install github.com/steveyegge/beads/cmd/bd@latest
 ```
+
+For post-upgrade steps (hooks, daemons, migrations), see [Upgrading](/getting-started/upgrading).
 
 ## Next Steps
 

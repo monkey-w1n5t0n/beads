@@ -17,7 +17,6 @@ var obsidianCheckbox = map[types.Status]string{
 	types.StatusInProgress: "- [/]",
 	types.StatusBlocked:    "- [c]",
 	types.StatusClosed:     "- [x]",
-	types.StatusTombstone:  "- [-]",
 	types.StatusDeferred:   "- [-]",
 	types.StatusPinned:     "- [n]", // Review/attention
 	types.StatusHooked:     "- [/]", // Treat as in-progress
@@ -32,21 +31,14 @@ var obsidianPriority = []string{
 	"⏬", // 4 = backlog/lowest
 }
 
-// obsidianTypeTag maps bd issue type to Obsidian tag
+// obsidianTypeTag maps bd issue type to Obsidian tag (core types only)
+// Gas Town types are custom types and will use their issue_type value as a tag.
 var obsidianTypeTag = map[types.IssueType]string{
-	types.TypeBug:          "#Bug",
-	types.TypeFeature:      "#Feature",
-	types.TypeTask:         "#Task",
-	types.TypeEpic:         "#Epic",
-	types.TypeChore:        "#Chore",
-	types.TypeMessage:      "#Message",
-	types.TypeMergeRequest: "#MergeRequest",
-	types.TypeMolecule:     "#Molecule",
-	types.TypeGate:         "#Gate",
-	types.TypeAgent:        "#Agent",
-	types.TypeRole:         "#Role",
-	types.TypeConvoy:       "#Convoy",
-	types.TypeEvent:        "#Event",
+	types.TypeBug:     "#Bug",
+	types.TypeFeature: "#Feature",
+	types.TypeTask:    "#Task",
+	types.TypeEpic:    "#Epic",
+	types.TypeChore:   "#Chore",
 }
 
 // formatObsidianTask converts a single issue to Obsidian Tasks format

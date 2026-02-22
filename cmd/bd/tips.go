@@ -14,8 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // Tip represents a contextual hint that can be shown to users after successful commands
@@ -61,7 +60,7 @@ func initTipRand() {
 
 // maybeShowTip selects and displays an eligible tip based on priority and probability
 // Respects --json and --quiet flags
-func maybeShowTip(store storage.Storage) {
+func maybeShowTip(store *dolt.DoltStore) {
 	// Skip tips in JSON output mode or quiet mode
 	if jsonOutput || quietFlag {
 		return
@@ -85,7 +84,7 @@ func maybeShowTip(store storage.Storage) {
 
 // selectNextTip finds the next tip to show based on conditions, frequency, priority, and probability
 // Returns nil if no tip should be shown
-func selectNextTip(store storage.Storage) *Tip {
+func selectNextTip(store *dolt.DoltStore) *Tip {
 	if store == nil {
 		return nil
 	}
@@ -135,7 +134,7 @@ func selectNextTip(store storage.Storage) *Tip {
 
 // getLastShown retrieves the timestamp when a tip was last shown
 // Returns zero time if never shown
-func getLastShown(store storage.Storage, tipID string) time.Time {
+func getLastShown(store *dolt.DoltStore, tipID string) time.Time {
 	key := fmt.Sprintf("tip_%s_last_shown", tipID)
 	value, err := store.GetMetadata(context.Background(), key)
 	if err != nil || value == "" {
@@ -152,10 +151,35 @@ func getLastShown(store storage.Storage, tipID string) time.Time {
 }
 
 // recordTipShown records the timestamp when a tip was shown
-func recordTipShown(store storage.Storage, tipID string) {
+func recordTipShown(store *dolt.DoltStore, tipID string) {
+	if store == nil || tipID == "" {
+		return
+	}
+
+	// If dolt auto-commit is enabled, defer the metadata write so it can be
+	// committed as a separate Dolt commit in PostRun.
+	// This avoids tip metadata getting bundled into the main command commit.
+	if mode, err := getDoltAutoCommitMode(); err == nil && mode == doltAutoCommitOn {
+		commandDidWriteTipMetadata = true
+		if commandTipIDsShown == nil {
+			commandTipIDsShown = make(map[string]struct{})
+		}
+		commandTipIDsShown[tipID] = struct{}{}
+		return
+	}
+
 	key := fmt.Sprintf("tip_%s_last_shown", tipID)
 	value := time.Now().Format(time.RFC3339)
-	_ = store.SetMetadata(context.Background(), key, value) // Non-critical metadata, ok to fail silently
+
+	// Non-critical metadata, ok to fail silently.
+	// If it succeeds, track the write for tip auto-commit behavior.
+	if err := store.SetMetadata(context.Background(), key, value); err == nil {
+		commandDidWriteTipMetadata = true
+		if commandTipIDsShown == nil {
+			commandTipIDsShown = make(map[string]struct{})
+		}
+		commandTipIDsShown[tipID] = struct{}{}
+	}
 }
 
 // InjectTip adds a dynamic tip to the registry at runtime.
@@ -347,9 +371,9 @@ func initDefaultTips() {
 	InjectTip(
 		"claude_setup",
 		"Install the beads plugin for automatic workflow context, or run 'bd setup claude' for CLI-only mode",
-		100,              // Highest priority - this is important for Claude users
-		24*time.Hour,     // Daily minimum gap
-		0.6,              // 60% chance when eligible (~4 times per week)
+		100,          // Highest priority - this is important for Claude users
+		24*time.Hour, // Daily minimum gap
+		0.6,          // 60% chance when eligible (~4 times per week)
 		func() bool {
 			return isClaudeDetected() && !isClaudeSetupComplete()
 		},
@@ -360,24 +384,17 @@ func initDefaultTips() {
 	InjectTip(
 		"sync_conflict",
 		"Run 'bd sync' to resolve sync conflict",
-		200,         // Higher than Claude setup - sync issues are urgent
-		0,           // No frequency limit - always show when applicable
-		1.0,         // 100% probability - always show when condition is true
+		200, // Higher than Claude setup - sync issues are urgent
+		0,   // No frequency limit - always show when applicable
+		1.0, // 100% probability - always show when condition is true
 		syncConflictCondition,
 	)
 }
 
 // syncConflictCondition checks if there's a sync conflict that needs manual resolution.
-// This is the condition function for the sync_conflict tip.
+// Sync conflict tracking was removed — always returns false.
 func syncConflictCondition() bool {
-	// Find beads directory to check sync state
-	beadsDir := beads.FindBeadsDir()
-	if beadsDir == "" {
-		return false
-	}
-
-	state := LoadSyncState(beadsDir)
-	return state.NeedsManualSync
+	return false
 }
 
 // init initializes the tip system with default tips

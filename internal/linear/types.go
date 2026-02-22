@@ -32,6 +32,7 @@ const (
 type Client struct {
 	APIKey     string
 	TeamID     string
+	ProjectID  string // Optional: filter issues to a specific project
 	Endpoint   string // GraphQL endpoint URL (defaults to DefaultAPIEndpoint)
 	HTTPClient *http.Client
 }
@@ -249,4 +250,3 @@ type TeamsResponse struct {
 		Nodes []Team `json:"nodes"`
 	} `json:"teams"`
 }
-

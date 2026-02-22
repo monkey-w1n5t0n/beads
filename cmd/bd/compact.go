@@ -5,31 +5,33 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/compact"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/types"
 )
 
 var (
-	compactDryRun          bool
-	compactTier            int
-	compactAll             bool
-	compactID              string
-	compactForce           bool
-	compactBatch           int
-	compactWorkers         int
-	compactStats           bool
-	compactAnalyze         bool
-	compactApply           bool
-	compactAuto            bool
-	compactPrune           bool
-	compactPurgeTombstones bool
-	compactSummary         string
-	compactActor           string
-	compactLimit           int
-	compactOlderThan       int
+	compactDryRun  bool
+	compactTier    int
+	compactAll     bool
+	compactID      string
+	compactForce   bool
+	compactBatch   int
+	compactWorkers int
+	compactStats   bool
+	compactAnalyze bool
+	compactApply   bool
+	compactAuto    bool
+	compactSummary string
+	compactActor   string
+	compactLimit   int
+	compactDolt    bool
 )
 
 var compactCmd = &cobra.Command{
@@ -41,34 +43,26 @@ Compaction reduces database size by summarizing closed issues that are no longer
 actively referenced. This is permanent graceful decay - original content is discarded.
 
 Modes:
-  - Prune: Remove expired tombstones from issues.jsonl (no API key needed)
   - Analyze: Export candidates for agent review (no API key needed)
   - Apply: Accept agent-provided summary (no API key needed)
   - Auto: AI-powered compaction (requires ANTHROPIC_API_KEY, legacy)
+  - Dolt: Run Dolt garbage collection (for Dolt-backend repositories)
 
 Tiers:
   - Tier 1: Semantic compression (30 days closed, 70% reduction)
   - Tier 2: Ultra compression (90 days closed, 95% reduction)
 
-Tombstone Cleanup:
-  Tombstones are soft-delete markers that prevent resurrection of deleted issues.
+Dolt Garbage Collection:
+  With auto-commit per mutation, Dolt commit history grows over time. Use
+  --dolt to run Dolt garbage collection and reclaim disk space.
 
-  --prune: Remove tombstones by AGE (default 30 days). Safe but may keep
-           tombstones that could be deleted.
-
-  --purge-tombstones: Remove tombstones by DEPENDENCY ANALYSIS. More aggressive -
-           removes any tombstone that no open issues depend on, regardless of age.
-           Also cleans stale deps from closed issues to tombstones.
+  --dolt: Run Dolt GC on .beads/dolt directory to free disk space.
+          This removes unreachable commits and compacts storage.
 
 Examples:
-  # Age-based pruning
-  bd compact --prune                       # Remove tombstones older than 30 days
-  bd compact --prune --older-than 7        # Remove tombstones older than 7 days
-  bd compact --prune --dry-run             # Preview what would be pruned
-
-  # Dependency-aware purging (more aggressive)
-  bd compact --purge-tombstones --dry-run  # Preview what would be purged
-  bd compact --purge-tombstones            # Remove tombstones with no open deps
+  # Dolt garbage collection
+  bd compact --dolt                        # Run Dolt GC
+  bd compact --dolt --dry-run              # Preview without running GC
 
   # Agent-driven workflow (recommended)
   bd compact --analyze --json              # Get candidates with full content
@@ -84,36 +78,21 @@ Examples:
   bd compact --stats                       # Show statistics
 `,
 	Run: func(_ *cobra.Command, _ []string) {
-		// Compact modifies data unless --stats or --analyze or --dry-run
-		if !compactStats && !compactAnalyze && !compactDryRun {
+		// Compact modifies data unless --stats or --analyze or --dry-run or --dolt with --dry-run
+		if !compactStats && !compactAnalyze && !compactDryRun && !(compactDolt && compactDryRun) {
 			CheckReadonly("compact")
 		}
 		ctx := rootCtx
 
 		// Handle compact stats first
 		if compactStats {
-			if daemonClient != nil {
-				runCompactStatsRPC()
-			} else {
-				sqliteStore, ok := store.(*sqlite.SQLiteStorage)
-				if !ok {
-					fmt.Fprintf(os.Stderr, "Error: compact requires SQLite storage\n")
-					os.Exit(1)
-				}
-				runCompactStats(ctx, sqliteStore)
-			}
+			runCompactStats(ctx, store)
 			return
 		}
 
-		// Handle prune mode (standalone tombstone pruning by age)
-		if compactPrune {
-			runCompactPrune()
-			return
-		}
-
-		// Handle purge-tombstones mode (dependency-aware tombstone cleanup)
-		if compactPurgeTombstones {
-			runCompactPurgeTombstones()
+		// Handle dolt GC mode
+		if compactDolt {
+			runCompactDolt()
 			return
 		}
 
@@ -131,11 +110,11 @@ Examples:
 
 		// Check for exactly one mode
 		if activeModes == 0 {
-			fmt.Fprintf(os.Stderr, "Error: must specify one mode: --prune, --purge-tombstones, --analyze, --apply, or --auto\n")
+			fmt.Fprintf(os.Stderr, "Error: must specify one mode: --analyze, --apply, or --auto\n")
 			os.Exit(1)
 		}
 		if activeModes > 1 {
-			fmt.Fprintf(os.Stderr, "Error: cannot use multiple modes together (--prune, --purge-tombstones, --analyze, --apply, --auto are mutually exclusive)\n")
+			fmt.Fprintf(os.Stderr, "Error: cannot use multiple modes together (--analyze, --apply, --auto are mutually exclusive)\n")
 			os.Exit(1)
 		}
 
@@ -143,16 +122,10 @@ Examples:
 		if compactAnalyze {
 			if err := ensureDirectMode("compact --analyze requires direct database access"); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Hint: Use --no-daemon flag to bypass daemon and access database directly\n")
+				fmt.Fprintf(os.Stderr, "Hint: Ensure a beads database is initialized (run 'bd init')\n")
 				os.Exit(1)
 			}
-			sqliteStore, ok := store.(*sqlite.SQLiteStorage)
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: failed to open database in direct mode\n")
-				fmt.Fprintf(os.Stderr, "Hint: Ensure .beads/beads.db exists and is readable\n")
-				os.Exit(1)
-			}
-			runCompactAnalyze(ctx, sqliteStore)
+			runCompactAnalyze(ctx, store)
 			return
 		}
 
@@ -160,7 +133,7 @@ Examples:
 		if compactApply {
 			if err := ensureDirectMode("compact --apply requires direct database access"); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Hint: Use --no-daemon flag to bypass daemon and access database directly\n")
+				fmt.Fprintf(os.Stderr, "Hint: Ensure a beads database is initialized (run 'bd init')\n")
 				os.Exit(1)
 			}
 			if compactID == "" {
@@ -171,13 +144,7 @@ Examples:
 				fmt.Fprintf(os.Stderr, "Error: --apply requires --summary\n")
 				os.Exit(1)
 			}
-			sqliteStore, ok := store.(*sqlite.SQLiteStorage)
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: failed to open database in direct mode\n")
-				fmt.Fprintf(os.Stderr, "Hint: Ensure .beads/beads.db exists and is readable\n")
-				os.Exit(1)
-			}
-			runCompactApply(ctx, sqliteStore)
+			runCompactApply(ctx, store)
 			return
 		}
 
@@ -197,22 +164,10 @@ Examples:
 				os.Exit(1)
 			}
 
-			// Use RPC if daemon available, otherwise direct mode
-			if daemonClient != nil {
-				runCompactRPC(ctx)
-				return
-			}
-
-			// Fallback to direct mode
+			// Direct mode
 			apiKey := os.Getenv("ANTHROPIC_API_KEY")
 			if apiKey == "" && !compactDryRun {
 				fmt.Fprintf(os.Stderr, "Error: --auto mode requires ANTHROPIC_API_KEY environment variable\n")
-				os.Exit(1)
-			}
-
-			sqliteStore, ok := store.(*sqlite.SQLiteStorage)
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: compact requires SQLite storage\n")
 				os.Exit(1)
 			}
 
@@ -222,23 +177,23 @@ Examples:
 				DryRun:      compactDryRun,
 			}
 
-			compactor, err := compact.New(sqliteStore, apiKey, config)
+			compactor, err := compact.New(store, apiKey, config)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to create compactor: %v\n", err)
 				os.Exit(1)
 			}
 
 			if compactID != "" {
-				runCompactSingle(ctx, compactor, sqliteStore, compactID)
+				runCompactSingle(ctx, compactor, store, compactID)
 				return
 			}
 
-			runCompactAll(ctx, compactor, sqliteStore)
+			runCompactAll(ctx, compactor, store)
 		}
 	},
 }
 
-func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store *sqlite.SQLiteStorage, issueID string) {
+func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store *dolt.DoltStore, issueID string) {
 	start := time.Now()
 
 	if !compactForce {
@@ -324,20 +279,9 @@ func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store *
 		originalSize, compactedSize, savingBytes,
 		float64(savingBytes)/float64(originalSize)*100)
 	fmt.Printf("  Time: %v\n", elapsed)
-
-	// Prune expired tombstones
-	if tombstonePruneResult, err := pruneExpiredTombstones(0); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to prune expired tombstones: %v\n", err)
-	} else if tombstonePruneResult != nil && tombstonePruneResult.PrunedCount > 0 {
-		fmt.Printf("\nTombstones pruned: %d expired (older than %d days)\n",
-			tombstonePruneResult.PrunedCount, tombstonePruneResult.TTLDays)
-	}
-
-	// Schedule auto-flush to export changes
-	markDirtyAndScheduleFlush()
 }
 
-func runCompactAll(ctx context.Context, compactor *compact.Compactor, store *sqlite.SQLiteStorage) {
+func runCompactAll(ctx context.Context, compactor *compact.Compactor, store *dolt.DoltStore) {
 	start := time.Now()
 
 	var candidates []string
@@ -456,22 +400,9 @@ func runCompactAll(ctx context.Context, compactor *compact.Compactor, store *sql
 	if totalOriginal > 0 {
 		fmt.Printf("  Saved: %d bytes (%.1f%%)\n", totalSaved, float64(totalSaved)/float64(totalOriginal)*100)
 	}
-
-	// Prune expired tombstones
-	if tombstonePruneResult, err := pruneExpiredTombstones(0); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to prune expired tombstones: %v\n", err)
-	} else if tombstonePruneResult != nil && tombstonePruneResult.PrunedCount > 0 {
-		fmt.Printf("\nTombstones pruned: %d expired (older than %d days)\n",
-			tombstonePruneResult.PrunedCount, tombstonePruneResult.TTLDays)
-	}
-
-	// Schedule auto-flush to export changes
-	if successCount > 0 {
-		markDirtyAndScheduleFlush()
-	}
 }
 
-func runCompactStats(ctx context.Context, store *sqlite.SQLiteStorage) {
+func runCompactStats(ctx context.Context, store *dolt.DoltStore) {
 	tier1, err := store.GetTier1Candidates(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to get Tier 1 candidates: %v\n", err)
@@ -525,7 +456,7 @@ func runCompactStats(ctx context.Context, store *sqlite.SQLiteStorage) {
 	}
 }
 
-func runCompactAnalyze(ctx context.Context, store *sqlite.SQLiteStorage) {
+func runCompactAnalyze(ctx context.Context, store *dolt.DoltStore) {
 	type Candidate struct {
 		ID                 string `json:"id"`
 		Title              string `json:"title"`
@@ -569,7 +500,7 @@ func runCompactAnalyze(ctx context.Context, store *sqlite.SQLiteStorage) {
 		})
 	} else {
 		// Get tier candidates
-		var tierCandidates []*sqlite.CompactionCandidate
+		var tierCandidates []*types.CompactionCandidate
 		var err error
 		if compactTier == 1 {
 			tierCandidates, err = store.GetTier1Candidates(ctx)
@@ -630,7 +561,7 @@ func runCompactAnalyze(ctx context.Context, store *sqlite.SQLiteStorage) {
 	fmt.Printf("Total: %d candidates\n", len(candidates))
 }
 
-func runCompactApply(ctx context.Context, store *sqlite.SQLiteStorage) {
+func runCompactApply(ctx context.Context, store *dolt.DoltStore) {
 	start := time.Now()
 
 	// Read summary
@@ -717,18 +648,7 @@ func runCompactApply(ctx context.Context, store *sqlite.SQLiteStorage) {
 		os.Exit(1)
 	}
 
-	if err := store.MarkIssueDirty(ctx, compactID); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to mark dirty: %v\n", err)
-		os.Exit(1)
-	}
-
 	elapsed := time.Since(start)
-
-	// Prune expired tombstones from issues.jsonl
-	tombstonePruneResult, tombstoneErr := pruneExpiredTombstones(0)
-	if tombstoneErr != nil && !jsonOutput {
-		fmt.Fprintf(os.Stderr, "Warning: failed to prune expired tombstones: %v\n", tombstoneErr)
-	}
 
 	if jsonOutput {
 		output := map[string]interface{}{
@@ -741,13 +661,6 @@ func runCompactApply(ctx context.Context, store *sqlite.SQLiteStorage) {
 			"reduction_pct":  reductionPct,
 			"elapsed_ms":     elapsed.Milliseconds(),
 		}
-		// Include tombstone pruning results
-		if tombstonePruneResult != nil && tombstonePruneResult.PrunedCount > 0 {
-			output["tombstones_pruned"] = map[string]interface{}{
-				"count":    tombstonePruneResult.PrunedCount,
-				"ttl_days": tombstonePruneResult.TTLDays,
-			}
-		}
 		outputJSON(output)
 		return
 	}
@@ -755,15 +668,152 @@ func runCompactApply(ctx context.Context, store *sqlite.SQLiteStorage) {
 	fmt.Printf("✓ Compacted %s (Tier %d)\n", compactID, compactTier)
 	fmt.Printf("  %d → %d bytes (saved %d, %.1f%%)\n", originalSize, compactedSize, savingBytes, reductionPct)
 	fmt.Printf("  Time: %v\n", elapsed)
+}
 
-	// Report tombstone pruning results
-	if tombstonePruneResult != nil && tombstonePruneResult.PrunedCount > 0 {
-		fmt.Printf("\nTombstones pruned: %d expired tombstones (older than %d days) removed\n",
-			tombstonePruneResult.PrunedCount, tombstonePruneResult.TTLDays)
+// runCompactDolt runs Dolt garbage collection on the .beads/dolt directory
+func runCompactDolt() {
+	start := time.Now()
+
+	// Find beads directory
+	beadsDir := beads.FindBeadsDir()
+	if beadsDir == "" {
+		fmt.Fprintf(os.Stderr, "Error: could not find .beads directory\n")
+		os.Exit(1)
 	}
 
-	// Schedule auto-flush to export changes
-	markDirtyAndScheduleFlush()
+	// Check for dolt directory
+	doltPath := filepath.Join(beadsDir, "dolt")
+	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Error: Dolt directory not found at %s\n", doltPath)
+		fmt.Fprintf(os.Stderr, "Hint: --dolt flag is only for repositories using the Dolt backend\n")
+		os.Exit(1)
+	}
+
+	// Check if dolt command is available
+	if _, err := exec.LookPath("dolt"); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: dolt command not found in PATH\n")
+		fmt.Fprintf(os.Stderr, "Hint: install Dolt from https://github.com/dolthub/dolt\n")
+		os.Exit(1)
+	}
+
+	// Get size before GC
+	sizeBefore, err := getDirSize(doltPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not calculate directory size: %v\n", err)
+		sizeBefore = 0
+	}
+
+	if compactDryRun {
+		if jsonOutput {
+			output := map[string]interface{}{
+				"dry_run":      true,
+				"dolt_path":    doltPath,
+				"size_before":  sizeBefore,
+				"size_display": formatBytes(sizeBefore),
+			}
+			outputJSON(output)
+			return
+		}
+		fmt.Printf("DRY RUN - Dolt garbage collection\n\n")
+		fmt.Printf("Dolt directory: %s\n", doltPath)
+		fmt.Printf("Current size: %s\n", formatBytes(sizeBefore))
+		fmt.Printf("\nRun without --dry-run to perform garbage collection.\n")
+		return
+	}
+
+	if !jsonOutput {
+		fmt.Printf("Running Dolt garbage collection...\n")
+	}
+
+	// Run dolt gc
+	cmd := exec.Command("dolt", "gc") // #nosec G204 -- fixed command, no user input
+	cmd.Dir = doltPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: dolt gc failed: %v\n", err)
+		if len(output) > 0 {
+			fmt.Fprintf(os.Stderr, "Output: %s\n", string(output))
+		}
+		os.Exit(1)
+	}
+
+	// Get size after GC
+	sizeAfter, err := getDirSize(doltPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not calculate directory size after GC: %v\n", err)
+		sizeAfter = 0
+	}
+
+	elapsed := time.Since(start)
+	freed := sizeBefore - sizeAfter
+	if freed < 0 {
+		freed = 0 // GC may not always reduce size
+	}
+
+	if jsonOutput {
+		result := map[string]interface{}{
+			"success":       true,
+			"dolt_path":     doltPath,
+			"size_before":   sizeBefore,
+			"size_after":    sizeAfter,
+			"freed_bytes":   freed,
+			"freed_display": formatBytes(freed),
+			"elapsed_ms":    elapsed.Milliseconds(),
+		}
+		outputJSON(result)
+		return
+	}
+
+	fmt.Printf("✓ Dolt garbage collection complete\n")
+	fmt.Printf("  %s → %s (freed %s)\n", formatBytes(sizeBefore), formatBytes(sizeAfter), formatBytes(freed))
+	fmt.Printf("  Time: %v\n", elapsed)
+}
+
+// getDirSize calculates the total size of a directory recursively
+func getDirSize(path string) (int64, error) {
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size, err
+}
+
+// formatBytes formats a byte count as a human-readable string
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// progressBar renders a text-based progress bar.
+func progressBar(current, total int) string {
+	const width = 40
+	if total == 0 {
+		return "[" + string(make([]byte, width)) + "]"
+	}
+	filled := (current * width) / total
+	bar := ""
+	for i := 0; i < width; i++ {
+		if i < filled {
+			bar += "█"
+		} else {
+			bar += " "
+		}
+	}
+	return "[" + bar + "]"
 }
 
 func init() {
@@ -781,12 +831,10 @@ func init() {
 	compactCmd.Flags().BoolVar(&compactAnalyze, "analyze", false, "Analyze mode: export candidates for agent review")
 	compactCmd.Flags().BoolVar(&compactApply, "apply", false, "Apply mode: accept agent-provided summary")
 	compactCmd.Flags().BoolVar(&compactAuto, "auto", false, "Auto mode: AI-powered compaction (legacy)")
-	compactCmd.Flags().BoolVar(&compactPrune, "prune", false, "Prune mode: remove expired tombstones from issues.jsonl (by age)")
-	compactCmd.Flags().IntVar(&compactOlderThan, "older-than", -1, "Prune tombstones older than N days (0=all, default: 30)")
-	compactCmd.Flags().BoolVar(&compactPurgeTombstones, "purge-tombstones", false, "Purge mode: remove tombstones with no open deps (by dependency analysis)")
 	compactCmd.Flags().StringVar(&compactSummary, "summary", "", "Path to summary file (use '-' for stdin)")
 	compactCmd.Flags().StringVar(&compactActor, "actor", "agent", "Actor name for audit trail")
 	compactCmd.Flags().IntVar(&compactLimit, "limit", 0, "Limit number of candidates (0 = no limit)")
+	compactCmd.Flags().BoolVar(&compactDolt, "dolt", false, "Dolt mode: run Dolt garbage collection on .beads/dolt")
 
 	// Note: compactCmd is added to adminCmd in admin.go
 }

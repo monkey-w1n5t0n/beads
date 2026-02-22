@@ -1,13 +1,15 @@
 package main
+
 import (
 	"fmt"
-	"os"
-	"regexp"
-	"strings"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
+	"os"
+	"regexp"
+	"strings"
 )
+
 var duplicatesCmd = &cobra.Command{
 	Use:     "duplicates",
 	GroupID: "deps",
@@ -29,39 +31,24 @@ Example:
 		if autoMerge && !dryRun {
 			CheckReadonly("duplicates --auto-merge")
 		}
-		// Check daemon mode - not supported yet (merge command limitation)
-		if daemonClient != nil {
-			fmt.Fprintf(os.Stderr, "Error: duplicates command not yet supported in daemon mode (see bd-190)\n")
-			fmt.Fprintf(os.Stderr, "Use: bd --no-daemon duplicates\n")
-			os.Exit(1)
-		}
 		// Use global jsonOutput set by PersistentPreRun
 		ctx := rootCtx
-
-		// Check database freshness before reading (bd-2q6d, bd-c4rq)
-		// Skip check when using daemon (daemon auto-imports on staleness)
-		if daemonClient == nil {
-			if err := ensureDatabaseFresh(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		}
 
 		// Get all issues
 		allIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
 		if err != nil {
-		fmt.Fprintf(os.Stderr, "Error fetching issues: %v\n", err)
-		os.Exit(1)
+			fmt.Fprintf(os.Stderr, "Error fetching issues: %v\n", err)
+			os.Exit(1)
 		}
 		// Filter out closed issues - they're done, no point detecting duplicates
 		openIssues := make([]*types.Issue, 0, len(allIssues))
-	for _, issue := range allIssues {
-		if issue.Status != types.StatusClosed {
-			openIssues = append(openIssues, issue)
+		for _, issue := range allIssues {
+			if issue.Status != types.StatusClosed {
+				openIssues = append(openIssues, issue)
+			}
 		}
-	}
-	// Find duplicates (only among open issues)
-	duplicateGroups := findDuplicateGroups(openIssues)
+		// Find duplicates (only among open issues)
+		duplicateGroups := findDuplicateGroups(openIssues)
 		if len(duplicateGroups) == 0 {
 			if !jsonOutput {
 				fmt.Println("No duplicates found!")
@@ -75,11 +62,13 @@ Example:
 		}
 		// Count references for each issue
 		refCounts := countReferences(allIssues)
+		// Count structural relationships (children, dependencies) for duplicate groups
+		structuralScores := countStructuralRelationships(duplicateGroups)
 		// Prepare output
 		var mergeCommands []string
 		var mergeResults []map[string]interface{}
 		for _, group := range duplicateGroups {
-			target := chooseMergeTarget(group, refCounts)
+			target := chooseMergeTarget(group, refCounts, structuralScores)
 			sources := make([]string, 0, len(group)-1)
 			for _, issue := range group {
 				if issue.ID != target.ID {
@@ -94,7 +83,7 @@ Example:
 				strings.Join(sources, " "),
 				target.ID)
 			mergeCommands = append(mergeCommands, cmd)
-			
+
 			if autoMerge || dryRun {
 				if !dryRun {
 					result := performMerge(target.ID, sources)
@@ -102,15 +91,11 @@ Example:
 				}
 			}
 		}
-		// Mark dirty if we performed merges
-		if autoMerge && !dryRun && len(mergeCommands) > 0 {
-			markDirtyAndScheduleFlush()
-		}
 		// Output results
 		if jsonOutput {
 			output := map[string]interface{}{
 				"duplicate_groups": len(duplicateGroups),
-				"groups":           formatDuplicateGroupsJSON(duplicateGroups, refCounts),
+				"groups":           formatDuplicateGroupsJSON(duplicateGroups, refCounts, structuralScores),
 			}
 			if autoMerge || dryRun {
 				output["merge_commands"] = mergeCommands
@@ -122,16 +107,20 @@ Example:
 		} else {
 			fmt.Printf("%s Found %d duplicate group(s):\n\n", ui.RenderWarn("🔍"), len(duplicateGroups))
 			for i, group := range duplicateGroups {
-				target := chooseMergeTarget(group, refCounts)
+				target := chooseMergeTarget(group, refCounts, structuralScores)
 				fmt.Printf("%s Group %d: %s\n", ui.RenderAccent("━━"), i+1, group[0].Title)
 				for _, issue := range group {
 					refs := refCounts[issue.ID]
+					weight := 0
+					if score, ok := structuralScores[issue.ID]; ok {
+						weight = score.dependentCount + score.dependsOnCount
+					}
 					marker := "  "
 					if issue.ID == target.ID {
 						marker = ui.RenderPass("→ ")
 					}
-					fmt.Printf("%s%s (%s, P%d, %d references)\n",
-						marker, issue.ID, issue.Status, issue.Priority, refs)
+					fmt.Printf("%s%s (%s, P%d, weight=%d, %d refs)\n",
+						marker, issue.ID, issue.Status, issue.Priority, weight, refs)
 				}
 				sources := make([]string, 0, len(group)-1)
 				for _, issue := range group {
@@ -155,11 +144,13 @@ Example:
 		}
 	},
 }
+
 func init() {
 	duplicatesCmd.Flags().Bool("auto-merge", false, "Automatically merge all duplicates")
 	duplicatesCmd.Flags().Bool("dry-run", false, "Show what would be merged without making changes")
 	rootCmd.AddCommand(duplicatesCmd)
 }
+
 // contentKey represents the fields we use to identify duplicate issues
 type contentKey struct {
 	title              string
@@ -168,6 +159,7 @@ type contentKey struct {
 	acceptanceCriteria string
 	status             string // Only group issues with same status
 }
+
 // findDuplicateGroups groups issues by content hash
 func findDuplicateGroups(issues []*types.Issue) [][]*types.Issue {
 	groups := make(map[contentKey][]*types.Issue)
@@ -190,6 +182,14 @@ func findDuplicateGroups(issues []*types.Issue) [][]*types.Issue {
 	}
 	return duplicates
 }
+
+// issueScore captures all factors used to choose which duplicate to keep
+type issueScore struct {
+	dependentCount int // Issues that depend on this one (children, blocked-by) - highest priority
+	dependsOnCount int // Issues this one depends on
+	textRefs       int // Text mentions in other issues' descriptions/notes
+}
+
 // countReferences counts how many times each issue is referenced in text fields
 func countReferences(issues []*types.Issue) map[string]int {
 	counts := make(map[string]int)
@@ -211,36 +211,118 @@ func countReferences(issues []*types.Issue) map[string]int {
 	}
 	return counts
 }
+
+// countStructuralRelationships counts dependency relationships for issues in duplicate groups.
+// Uses the efficient GetDependencyCounts batch query.
+func countStructuralRelationships(groups [][]*types.Issue) map[string]*issueScore {
+	scores := make(map[string]*issueScore)
+	ctx := rootCtx
+
+	// Collect all issue IDs from all groups
+	var issueIDs []string
+	for _, group := range groups {
+		for _, issue := range group {
+			issueIDs = append(issueIDs, issue.ID)
+			scores[issue.ID] = &issueScore{}
+		}
+	}
+
+	// Batch query for dependency counts
+	depCounts, err := store.GetDependencyCounts(ctx, issueIDs)
+	if err != nil {
+		// On error, return empty scores - fallback to text refs only
+		return scores
+	}
+
+	// Populate scores from dependency counts
+	for id, counts := range depCounts {
+		if score, ok := scores[id]; ok {
+			score.dependentCount = counts.DependentCount // Issues that depend on this one (children, etc)
+			score.dependsOnCount = counts.DependencyCount
+		}
+	}
+
+	return scores
+}
+
 // chooseMergeTarget selects the best issue to merge into
-// Priority: highest reference count, then lexicographically smallest ID
-func chooseMergeTarget(group []*types.Issue, refCounts map[string]int) *types.Issue {
+// Priority order:
+// 1. Highest structural weight (dependents + dependencies) - most connected issue wins
+// 2. Highest text reference count (mentions in descriptions/notes)
+// 3. Lexicographically smallest ID (stable tiebreaker)
+func chooseMergeTarget(group []*types.Issue, refCounts map[string]int, structuralScores map[string]*issueScore) *types.Issue {
 	if len(group) == 0 {
 		return nil
 	}
+
+	getScore := func(id string) (int, int) {
+		weight := 0
+		if score, ok := structuralScores[id]; ok {
+			// Weight = children/dependents + dependencies
+			// An issue with ANY structural connections should be preferred over an empty shell
+			weight = score.dependentCount + score.dependsOnCount
+		}
+		textRefs := refCounts[id]
+		return weight, textRefs
+	}
+
 	target := group[0]
-	targetRefs := refCounts[target.ID]
+	targetWeight, targetRefs := getScore(target.ID)
+
 	for _, issue := range group[1:] {
-		issueRefs := refCounts[issue.ID]
-		if issueRefs > targetRefs || (issueRefs == targetRefs && issue.ID < target.ID) {
+		issueWeight, issueRefs := getScore(issue.ID)
+
+		// Compare by structural weight first (dependents + dependencies)
+		if issueWeight > targetWeight {
 			target = issue
-			targetRefs = issueRefs
+			targetWeight, targetRefs = issueWeight, issueRefs
+			continue
+		}
+		if issueWeight < targetWeight {
+			continue
+		}
+
+		// Equal weight - compare by text references
+		if issueRefs > targetRefs {
+			target = issue
+			targetWeight, targetRefs = issueWeight, issueRefs
+			continue
+		}
+		if issueRefs < targetRefs {
+			continue
+		}
+
+		// Equal on both - use lexicographically smallest ID as tiebreaker
+		if issue.ID < target.ID {
+			target = issue
+			targetWeight, targetRefs = issueWeight, issueRefs
 		}
 	}
 	return target
 }
+
 // formatDuplicateGroupsJSON formats duplicate groups for JSON output
-func formatDuplicateGroupsJSON(groups [][]*types.Issue, refCounts map[string]int) []map[string]interface{} {
+func formatDuplicateGroupsJSON(groups [][]*types.Issue, refCounts map[string]int, structuralScores map[string]*issueScore) []map[string]interface{} {
 	var result []map[string]interface{}
 	for _, group := range groups {
-		target := chooseMergeTarget(group, refCounts)
+		target := chooseMergeTarget(group, refCounts, structuralScores)
 		issues := make([]map[string]interface{}, len(group))
 		for i, issue := range group {
+			dependents := 0
+			dependencies := 0
+			if score, ok := structuralScores[issue.ID]; ok {
+				dependents = score.dependentCount
+				dependencies = score.dependsOnCount
+			}
 			issues[i] = map[string]interface{}{
 				"id":              issue.ID,
 				"title":           issue.Title,
 				"status":          issue.Status,
 				"priority":        issue.Priority,
 				"references":      refCounts[issue.ID],
+				"dependents":      dependents,
+				"dependencies":    dependencies,
+				"weight":          dependents + dependencies,
 				"is_merge_target": issue.ID == target.ID,
 			}
 		}

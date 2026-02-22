@@ -7,11 +7,16 @@ import (
 	"sort"
 	"strings"
 
+	"context"
+
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
+	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
+// doctorFindOrphanedIssues is the function used to find orphaned issues.
+// It accepts a git path and an IssueProvider for flexibility (cross-repo, mock testing).
 var doctorFindOrphanedIssues = doctor.FindOrphanedIssues
 
 var closeIssueRunner = func(issueID string) error {
@@ -103,9 +108,50 @@ type orphanIssueOutput struct {
 	LatestCommitMessage string `json:"latest_commit_message,omitempty"`
 }
 
-// findOrphanedIssues wraps the shared doctor package function and converts to output format
+// doltStoreProvider wraps *dolt.DoltStore to implement types.IssueProvider.
+type doltStoreProvider struct{}
+
+func (p *doltStoreProvider) GetOpenIssues(ctx context.Context) ([]*types.Issue, error) {
+	openStatus := types.StatusOpen
+	openIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{Status: &openStatus})
+	if err != nil {
+		return nil, err
+	}
+	inProgressStatus := types.StatusInProgress
+	inProgressIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{Status: &inProgressStatus})
+	if err != nil {
+		return nil, err
+	}
+	return append(openIssues, inProgressIssues...), nil
+}
+
+func (p *doltStoreProvider) GetIssuePrefix() string {
+	ctx := context.Background()
+	prefix, err := store.GetConfig(ctx, "issue_prefix")
+	if err != nil || prefix == "" {
+		return "bd"
+	}
+	return prefix
+}
+
+// getIssueProvider returns an IssueProvider backed by the global Dolt store.
+func getIssueProvider() (types.IssueProvider, func(), error) {
+	if store != nil {
+		return &doltStoreProvider{}, func() {}, nil
+	}
+	return nil, nil, fmt.Errorf("no database available")
+}
+
+// findOrphanedIssues wraps the shared doctor package function and converts to output format.
+// It respects the --db flag for cross-repo orphan detection.
 func findOrphanedIssues(path string) ([]orphanIssueOutput, error) {
-	orphans, err := doctorFindOrphanedIssues(path)
+	provider, cleanup, err := getIssueProvider()
+	if err != nil {
+		return nil, fmt.Errorf("unable to find orphaned issues: %w", err)
+	}
+	defer cleanup()
+
+	orphans, err := doctorFindOrphanedIssues(path, provider)
 	if err != nil {
 		return nil, fmt.Errorf("unable to find orphaned issues: %w", err)
 	}

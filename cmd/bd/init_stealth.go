@@ -41,8 +41,9 @@ func setupStealthMode(verbose bool) error {
 // This is the correct approach for per-repository user-specific ignores (GitHub #704).
 // Unlike global gitignore, patterns here are relative to the repo root.
 func setupGitExclude(verbose bool) error {
-	// Find the .git directory (handles both regular repos and worktrees)
-	gitDir, err := exec.Command("git", "rev-parse", "--git-dir").Output()
+	// Find the common .git directory (handles worktrees correctly - GH#1053)
+	// Use --git-common-dir to get the main repo's .git, not the worktree's .git/worktrees/<name>
+	gitDir, err := exec.Command("git", "rev-parse", "--git-common-dir").Output()
 	if err != nil {
 		return fmt.Errorf("not a git repository")
 	}
@@ -113,7 +114,8 @@ func setupGitExclude(verbose bool) error {
 // This is separate from stealth mode - fork protection is specifically about
 // preventing beads/Claude files from appearing in upstream PRs.
 func setupForkExclude(verbose bool) error {
-	gitDir, err := exec.Command("git", "rev-parse", "--git-dir").Output()
+	// Use --git-common-dir to get main repo's .git, not worktree's (GH#1053)
+	gitDir, err := exec.Command("git", "rev-parse", "--git-common-dir").Output()
 	if err != nil {
 		return fmt.Errorf("not a git repository")
 	}
@@ -187,9 +189,9 @@ func containsExactPattern(content, pattern string) bool {
 }
 
 // promptForkExclude asks if user wants to configure .git/info/exclude for fork workflow (GH#742)
-func promptForkExclude(upstreamURL string, quiet bool) bool {
+func promptForkExclude(upstreamURL string, quiet bool) (bool, error) {
 	if quiet {
-		return false // Don't prompt in quiet mode
+		return false, nil // Don't prompt in quiet mode
 	}
 
 	fmt.Printf("\n%s Detected fork (upstream: %s)\n\n", ui.RenderAccent("▶"), upstreamURL)
@@ -198,11 +200,17 @@ func promptForkExclude(upstreamURL string, quiet bool) bool {
 	fmt.Print("\n[Y/n]: ")
 
 	reader := bufio.NewReader(os.Stdin)
-	response, _ := reader.ReadString('\n')
+	response, err := readLineWithContext(getRootContext(), reader, os.Stdin)
+	if err != nil {
+		if isCanceled(err) {
+			return false, err
+		}
+		response = ""
+	}
 	response = strings.TrimSpace(strings.ToLower(response))
 
 	// Default to yes (empty or "y" or "yes")
-	return response == "" || response == "y" || response == "yes"
+	return response == "" || response == "y" || response == "yes", nil
 }
 
 // setupGlobalGitIgnore configures global gitignore to ignore beads and claude files for a specific project

@@ -2,8 +2,10 @@ package git
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -62,10 +64,16 @@ func initGitContext() {
 	// Derive isWorktree from comparing absolute paths
 	gitCtx.isWorktree = absGitDir != absCommon
 
-	// Process repoRoot: normalize Windows paths and resolve symlinks
+	// Process repoRoot: normalize Windows paths, resolve symlinks,
+	// and canonicalize case on case-insensitive filesystems (GH#880).
+	// This is critical for git worktree operations which string-compare paths.
 	repoRoot := NormalizePath(repoRootRaw)
 	if resolved, err := filepath.EvalSymlinks(repoRoot); err == nil {
 		repoRoot = resolved
+	}
+	// Canonicalize case on macOS/Windows (GH#880)
+	if canonicalized := canonicalizeCase(repoRoot); canonicalized != "" {
+		repoRoot = canonicalized
 	}
 	gitCtx.repoRoot = repoRoot
 }
@@ -93,14 +101,69 @@ func GetGitDir() (string, error) {
 	return ctx.gitDir, nil
 }
 
-// GetGitHooksDir returns the path to the Git hooks directory.
-// This function is worktree-aware and handles both regular repos and worktrees.
-func GetGitHooksDir() (string, error) {
-	gitDir, err := GetGitDir()
+// GetGitCommonDir returns the common git directory shared across all worktrees.
+// For regular repos, this equals GetGitDir(). For worktrees, this returns
+// the main repository's .git directory where shared data (like worktree
+// registrations, hooks, and objects) lives.
+//
+// Use this instead of GetGitDir() when you need to create new worktrees or
+// access shared git data that should not be scoped to a single worktree.
+// GH#639: This is critical for bare repo setups where GetGitDir() returns
+// a worktree-specific path that cannot host new worktrees.
+func GetGitCommonDir() (string, error) {
+	ctx, err := getGitContext()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(gitDir, "hooks"), nil
+	return ctx.commonDir, nil
+}
+
+// GetGitHooksDir returns the path to the Git hooks directory.
+// This function is worktree-aware: hooks are shared across all worktrees
+// and live in the common git directory (e.g., /repo/.git/hooks), not in
+// the worktree-specific directory (e.g., /repo/.git/worktrees/feature/hooks).
+func GetGitHooksDir() (string, error) {
+	ctx, err := getGitContext()
+	if err != nil {
+		return "", err
+	}
+
+	// Respect core.hooksPath if configured.
+	// This is used by beads' Dolt backend (hooks installed to .beads/hooks/).
+	cmd := exec.Command("git", "config", "--get", "core.hooksPath")
+	cmd.Dir = ctx.repoRoot
+	if out, err := cmd.Output(); err == nil {
+		hooksPath := strings.TrimSpace(string(out))
+		if hooksPath != "" {
+			// Expand tilde — git config may return ~/... which Go doesn't expand.
+			// Without this, Windows treats "~/.githooks" as a relative path and
+			// joins it to the repo root, creating a literal "~" directory. (GH#1796)
+			if strings.HasPrefix(hooksPath, "~/") || strings.HasPrefix(hooksPath, "~\\") {
+				if home, err := os.UserHomeDir(); err == nil {
+					hooksPath = filepath.Join(home, hooksPath[2:])
+				}
+			} else if hooksPath == "~" {
+				if home, err := os.UserHomeDir(); err == nil {
+					hooksPath = home
+				}
+			}
+
+			if filepath.IsAbs(hooksPath) {
+				return hooksPath, nil
+			}
+			// Git treats relative core.hooksPath as relative to the repo root in common usage.
+			// (e.g., ".beads/hooks", ".githooks").
+			p := filepath.Join(ctx.repoRoot, hooksPath)
+			if abs, err := filepath.Abs(p); err == nil {
+				return abs, nil
+			}
+
+			return p, nil
+		}
+	}
+
+	// Default: hooks are stored in the common git directory.
+	return filepath.Join(ctx.commonDir, "hooks"), nil
 }
 
 // GetGitRefsDir returns the path to the Git refs directory.
@@ -149,8 +212,13 @@ func GetMainRepoRoot() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// The main repo root is the parent of the .git directory (commonDir)
-	return filepath.Dir(ctx.commonDir), nil
+	if ctx.isWorktree {
+		// For worktrees, the main repo root is the parent of the shared .git directory.
+		return filepath.Dir(ctx.commonDir), nil
+	}
+
+	// For regular repos (including submodules), repoRoot is the correct root.
+	return ctx.repoRoot, nil
 }
 
 // GetRepoRoot returns the root directory of the current git repository.
@@ -166,6 +234,27 @@ func GetRepoRoot() string {
 		return ""
 	}
 	return ctx.repoRoot
+}
+
+// canonicalizeCase resolves a path to its true filesystem case on
+// case-insensitive filesystems (macOS/Windows). This is needed because
+// git operations string-compare paths exactly - a path with wrong case
+// will fail even though it points to the same location. (GH#880)
+//
+// On macOS, uses realpath(1) which returns the canonical case.
+// Returns empty string if resolution fails or isn't needed.
+func canonicalizeCase(path string) string {
+	if runtime.GOOS == "darwin" {
+		// Use realpath to get canonical path with correct case
+		cmd := exec.Command("realpath", path)
+		output, err := cmd.Output()
+		if err == nil {
+			return strings.TrimSpace(string(output))
+		}
+	}
+	// Windows: filepath.EvalSymlinks already handles case
+	// Linux: case-sensitive, no canonicalization needed
+	return ""
 }
 
 // NormalizePath converts Git's Windows path formats to native format.
@@ -196,4 +285,46 @@ func NormalizePath(path string) string {
 func ResetCaches() {
 	gitCtxOnce = sync.Once{}
 	gitCtx = gitContext{}
+}
+
+// IsJujutsuRepo returns true if the current directory is in a jujutsu (jj) repository.
+// Jujutsu stores its data in a .jj directory at the repository root.
+func IsJujutsuRepo() bool {
+	_, err := GetJujutsuRoot()
+	return err == nil
+}
+
+// IsColocatedJJGit returns true if this is a colocated jujutsu+git repository.
+// Colocated repos have both .jj and .git directories, created via `jj git init --colocate`.
+// In colocated repos, git hooks work normally since jj manages the git repo.
+func IsColocatedJJGit() bool {
+	if !IsJujutsuRepo() {
+		return false
+	}
+	// If we're also in a git repo, it's colocated
+	_, err := getGitContext()
+	return err == nil
+}
+
+// GetJujutsuRoot returns the root directory of the jujutsu repository.
+// Returns empty string and error if not in a jujutsu repository.
+func GetJujutsuRoot() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current directory: %w", err)
+	}
+
+	dir := cwd
+	for {
+		jjPath := filepath.Join(dir, ".jj")
+		if info, err := os.Stat(jjPath); err == nil && info.IsDir() {
+			return dir, nil
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("not a jujutsu repository (no .jj directory found)")
+		}
+		dir = parent
+	}
 }

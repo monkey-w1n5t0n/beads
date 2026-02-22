@@ -57,8 +57,6 @@ func TestCheckConfigValues(t *testing.T) {
 	// Test with valid config
 	t.Run("valid config", func(t *testing.T) {
 		configContent := `issue-prefix: "test"
-flush-debounce: "30s"
-sync-branch: "beads-sync"
 `
 		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
 			t.Fatalf("failed to write config.yaml: %v", err)
@@ -67,24 +65,6 @@ sync-branch: "beads-sync"
 		check := CheckConfigValues(tmpDir)
 		if check.Status != "ok" {
 			t.Errorf("expected ok status, got %s: %s", check.Status, check.Detail)
-		}
-	})
-
-	// Test with invalid flush-debounce
-	t.Run("invalid flush-debounce", func(t *testing.T) {
-		configContent := `issue-prefix: "test"
-flush-debounce: "not-a-duration"
-`
-		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
-			t.Fatalf("failed to write config.yaml: %v", err)
-		}
-
-		check := CheckConfigValues(tmpDir)
-		if check.Status != "warning" {
-			t.Errorf("expected warning status, got %s", check.Status)
-		}
-		if check.Detail == "" || !contains(check.Detail, "flush-debounce") {
-			t.Errorf("expected detail to mention flush-debounce, got: %s", check.Detail)
 		}
 	})
 
@@ -123,23 +103,6 @@ flush-debounce: "not-a-duration"
 		}
 	})
 
-	// Test with invalid sync-branch
-	t.Run("invalid sync-branch", func(t *testing.T) {
-		configContent := `sync-branch: "branch with spaces"
-`
-		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
-			t.Fatalf("failed to write config.yaml: %v", err)
-		}
-
-		check := CheckConfigValues(tmpDir)
-		if check.Status != "warning" {
-			t.Errorf("expected warning status, got %s", check.Status)
-		}
-		if check.Detail == "" || !contains(check.Detail, "sync-branch") {
-			t.Errorf("expected detail to mention sync-branch, got: %s", check.Detail)
-		}
-	})
-
 	// Test with too long issue-prefix
 	t.Run("too long issue-prefix", func(t *testing.T) {
 		configContent := `issue-prefix: "thisprefiswaytooolongtobevalid"
@@ -166,11 +129,27 @@ func TestCheckMetadataConfigValues(t *testing.T) {
 		t.Fatalf("failed to create .beads dir: %v", err)
 	}
 
-	// Test with valid metadata
+	// Test with valid metadata (Dolt backend)
 	t.Run("valid metadata", func(t *testing.T) {
 		metadataContent := `{
-  "database": "beads.db",
+  "database": "dolt",
   "jsonl_export": "issues.jsonl"
+}`
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
+			t.Fatalf("failed to write metadata.json: %v", err)
+		}
+
+		issues := checkMetadataConfigValues(tmpDir)
+		if len(issues) > 0 {
+			t.Errorf("expected no issues, got: %v", issues)
+		}
+	})
+
+	t.Run("valid dolt metadata", func(t *testing.T) {
+		metadataContent := `{
+  "database": "dolt",
+  "jsonl_export": "issues.jsonl",
+  "backend": "dolt"
 }`
 		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
 			t.Fatalf("failed to write metadata.json: %v", err)
@@ -420,11 +399,9 @@ func TestCheckConfigValuesDbPath(t *testing.T) {
 		}
 
 		check := CheckConfigValues(tmpDir)
-		if check.Status != "warning" {
-			t.Errorf("expected warning status, got %s", check.Status)
-		}
-		if check.Detail == "" || !contains(check.Detail, "db") {
-			t.Errorf("expected detail to mention db, got: %s", check.Detail)
+		// Dolt backend doesn't validate db file extension (it's directory-based)
+		if check.Status != "ok" {
+			t.Errorf("expected ok status (db extension not validated for Dolt), got %s: %s", check.Status, check.Detail)
 		}
 	})
 
@@ -436,6 +413,121 @@ func TestCheckConfigValuesDbPath(t *testing.T) {
 		}
 
 		check := CheckConfigValues(tmpDir)
+		if check.Status != "ok" {
+			t.Errorf("expected ok status, got %s: %s", check.Status, check.Detail)
+		}
+	})
+
+	// Test routing + hydration consistency (bd-fix-routing)
+	t.Run("routing.mode=auto without hydration", func(t *testing.T) {
+		configContent := `routing:
+  mode: auto
+  contributor: ~/planning-repo
+`
+		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
+			t.Fatalf("failed to write config.yaml: %v", err)
+		}
+
+		check := CheckConfigValues(tmpDir)
+		if check.Status != "warning" {
+			t.Errorf("expected warning status, got %s", check.Status)
+		}
+		if check.Detail == "" || !contains(check.Detail, "repos.additional not configured") {
+			t.Errorf("expected detail to mention repos.additional, got: %s", check.Detail)
+		}
+	})
+
+	t.Run("routing.mode=auto with hydration configured correctly", func(t *testing.T) {
+		// Create the planning repo directory so path validation passes
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Fatalf("failed to get home dir: %v", err)
+		}
+		planningRepo := filepath.Join(home, "planning-repo")
+		if err := os.MkdirAll(planningRepo, 0755); err != nil {
+			t.Fatalf("failed to create planning repo: %v", err)
+		}
+		defer os.RemoveAll(planningRepo)
+
+		configContent := `routing:
+  mode: auto
+  contributor: ~/planning-repo
+repos:
+  additional:
+    - ~/planning-repo
+`
+		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
+			t.Fatalf("failed to write config.yaml: %v", err)
+		}
+
+		check := CheckConfigValues(tmpDir)
+		if check.Status != "ok" {
+			t.Errorf("expected ok status, got %s: %s", check.Status, check.Detail)
+		}
+	})
+
+	t.Run("routing.mode=auto with routing target not in hydration list", func(t *testing.T) {
+		configContent := `routing:
+  mode: auto
+  contributor: ~/planning-repo
+repos:
+  additional:
+    - ~/other-repo
+`
+		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
+			t.Fatalf("failed to write config.yaml: %v", err)
+		}
+
+		check := CheckConfigValues(tmpDir)
+		if check.Status != "warning" {
+			t.Errorf("expected warning status, got %s", check.Status)
+		}
+		if check.Detail == "" || !contains(check.Detail, "not in repos.additional") {
+			t.Errorf("expected detail to mention routing target not in repos.additional, got: %s", check.Detail)
+		}
+	})
+
+	t.Run("routing.mode=auto with maintainer routing", func(t *testing.T) {
+		// Create the maintainer repo directory so path validation passes
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Fatalf("failed to get home dir: %v", err)
+		}
+		maintainerRepo := filepath.Join(home, "maintainer-repo")
+		if err := os.MkdirAll(maintainerRepo, 0755); err != nil {
+			t.Fatalf("failed to create maintainer repo: %v", err)
+		}
+		defer os.RemoveAll(maintainerRepo)
+
+		configContent := `routing:
+  mode: auto
+  maintainer: ~/maintainer-repo
+repos:
+  additional:
+    - ~/maintainer-repo
+`
+		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
+			t.Fatalf("failed to write config.yaml: %v", err)
+		}
+
+		check := CheckConfigValues(tmpDir)
+		if check.Status != "ok" {
+			t.Errorf("expected ok status, got %s: %s", check.Status, check.Detail)
+		}
+	})
+
+	t.Run("routing.mode=auto with maintainer='.' (current repo)", func(t *testing.T) {
+		// maintainer="." means current repo, which should not require hydration
+		configContent := `routing:
+  mode: auto
+  maintainer: "."
+`
+		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
+			t.Fatalf("failed to write config.yaml: %v", err)
+		}
+
+		check := CheckConfigValues(tmpDir)
+		// Should be OK because maintainer="." doesn't need hydration
 		if check.Status != "ok" {
 			t.Errorf("expected ok status, got %s: %s", check.Status, check.Detail)
 		}

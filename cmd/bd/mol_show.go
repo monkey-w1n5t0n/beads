@@ -34,12 +34,7 @@ Example:
 
 		// mol show requires direct store access for subgraph loading
 		if store == nil {
-			if daemonClient != nil {
-				fmt.Fprintf(os.Stderr, "Error: mol show requires direct database access\n")
-				fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon mol show %s\n", args[0])
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			}
+			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
 			os.Exit(1)
 		}
 
@@ -70,13 +65,26 @@ func showMolecule(subgraph *MoleculeSubgraph) {
 			"issues":       subgraph.Issues,
 			"dependencies": subgraph.Dependencies,
 			"variables":    extractAllVariables(subgraph),
+			"is_compound":  subgraph.Root.IsCompound(),
+			"bonded_from":  subgraph.Root.BondedFrom,
 		})
 		return
 	}
 
-	fmt.Printf("\n%s Molecule: %s\n", ui.RenderAccent("🧪"), subgraph.Root.Title)
+	// Determine molecule type label
+	moleculeType := "Molecule"
+	if subgraph.Root.IsCompound() {
+		moleculeType = "Compound"
+	}
+
+	fmt.Printf("\n%s %s: %s\n", ui.RenderAccent("🧪"), moleculeType, subgraph.Root.Title)
 	fmt.Printf("   ID: %s\n", subgraph.Root.ID)
 	fmt.Printf("   Steps: %d\n", len(subgraph.Issues))
+
+	// Show compound bonding info if this is a compound molecule
+	if subgraph.Root.IsCompound() {
+		showCompoundBondingInfo(subgraph.Root)
+	}
 
 	vars := extractAllVariables(subgraph)
 	if len(vars) > 0 {
@@ -91,23 +99,66 @@ func showMolecule(subgraph *MoleculeSubgraph) {
 	fmt.Println()
 }
 
+// showCompoundBondingInfo displays the bonding lineage for compound molecules.
+// Caller must ensure root.IsCompound() is true.
+func showCompoundBondingInfo(root *types.Issue) {
+	constituents := root.GetConstituents()
+	fmt.Printf("\n%s Bonded from:\n", ui.RenderAccent("🔗"))
+
+	for i, ref := range constituents {
+		connector := "├──"
+		if i == len(constituents)-1 {
+			connector = "└──"
+		}
+
+		// Format bond type for display
+		bondTypeDisplay := formatBondType(ref.BondType)
+
+		// Show source ID with bond type
+		if ref.BondPoint != "" {
+			fmt.Printf("   %s %s (%s, at %s)\n", connector, ref.SourceID, bondTypeDisplay, ref.BondPoint)
+		} else {
+			fmt.Printf("   %s %s (%s)\n", connector, ref.SourceID, bondTypeDisplay)
+		}
+	}
+}
+
+// formatBondType returns a human-readable bond type description
+func formatBondType(bondType string) string {
+	switch bondType {
+	case types.BondTypeSequential:
+		return "sequential"
+	case types.BondTypeParallel:
+		return "parallel"
+	case types.BondTypeConditional:
+		return "on-failure"
+	case types.BondTypeRoot:
+		return "root"
+	default:
+		if bondType == "" {
+			return "default"
+		}
+		return bondType
+	}
+}
+
 // ParallelInfo holds parallel analysis information for a step
 type ParallelInfo struct {
 	StepID        string   `json:"step_id"`
 	Status        string   `json:"status"`
-	IsReady       bool     `json:"is_ready"`        // Can start now (no blocking deps)
-	ParallelGroup string   `json:"parallel_group"`  // Group ID (steps with same group can parallelize)
-	BlockedBy     []string `json:"blocked_by"`      // IDs of open steps blocking this one
-	Blocks        []string `json:"blocks"`          // IDs of steps this one blocks
-	CanParallel   []string `json:"can_parallel"`    // IDs of steps that can run in parallel with this
+	IsReady       bool     `json:"is_ready"`       // Can start now (no blocking deps)
+	ParallelGroup string   `json:"parallel_group"` // Group ID (steps with same group can parallelize)
+	BlockedBy     []string `json:"blocked_by"`     // IDs of open steps blocking this one
+	Blocks        []string `json:"blocks"`         // IDs of steps this one blocks
+	CanParallel   []string `json:"can_parallel"`   // IDs of steps that can run in parallel with this
 }
 
 // ParallelAnalysis holds the complete parallel analysis for a molecule
 type ParallelAnalysis struct {
-	MoleculeID     string                  `json:"molecule_id"`
-	TotalSteps     int                     `json:"total_steps"`
-	ReadySteps     int                     `json:"ready_steps"`
-	ParallelGroups map[string][]string     `json:"parallel_groups"` // group ID -> step IDs
+	MoleculeID     string                   `json:"molecule_id"`
+	TotalSteps     int                      `json:"total_steps"`
+	ReadySteps     int                      `json:"ready_steps"`
+	ParallelGroups map[string][]string      `json:"parallel_groups"` // group ID -> step IDs
 	Steps          map[string]*ParallelInfo `json:"steps"`
 }
 
@@ -327,13 +378,26 @@ func showMoleculeWithParallel(subgraph *MoleculeSubgraph) {
 			"dependencies": subgraph.Dependencies,
 			"variables":    extractAllVariables(subgraph),
 			"parallel":     analysis,
+			"is_compound":  subgraph.Root.IsCompound(),
+			"bonded_from":  subgraph.Root.BondedFrom,
 		})
 		return
 	}
 
-	fmt.Printf("\n%s Molecule: %s\n", ui.RenderAccent("🧪"), subgraph.Root.Title)
+	// Determine molecule type label
+	moleculeType := "Molecule"
+	if subgraph.Root.IsCompound() {
+		moleculeType = "Compound"
+	}
+
+	fmt.Printf("\n%s %s: %s\n", ui.RenderAccent("🧪"), moleculeType, subgraph.Root.Title)
 	fmt.Printf("   ID: %s\n", subgraph.Root.ID)
 	fmt.Printf("   Steps: %d (%d ready)\n", analysis.TotalSteps, analysis.ReadySteps)
+
+	// Show compound bonding info if this is a compound molecule
+	if subgraph.Root.IsCompound() {
+		showCompoundBondingInfo(subgraph.Root)
+	}
 
 	// Show parallel groups summary
 	if len(analysis.ParallelGroups) > 0 {

@@ -1,8 +1,72 @@
 # Agent Instructions
 
-See [CLAUDE.md](CLAUDE.md) for full instructions.
+See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full instructions.
 
 This file exists for compatibility with tools that look for AGENTS.md.
+
+## Key Sections
+
+- **Issue Tracking** - How to use bd for work management
+- **Development Guidelines** - Code standards and testing
+- **Visual Design System** - Status icons, colors, and semantic styling for CLI output
+
+## Visual Design Anti-Patterns
+
+**NEVER use emoji-style icons** (🔴🟠🟡🔵⚪) in CLI output. They cause cognitive overload.
+
+**ALWAYS use small Unicode symbols** with semantic colors:
+- Status: `○ ◐ ● ✓ ❄`
+- Priority: `● P0` (filled circle with color)
+
+See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full development guidelines.
+
+## Agent Warning: Interactive Commands
+
+**DO NOT use `bd edit`** - it opens an interactive editor ($EDITOR) which AI agents cannot use.
+
+Use `bd update` with flags instead:
+```bash
+bd update <id> --description "new description"
+bd update <id> --title "new title"
+bd update <id> --design "design notes"
+bd update <id> --notes "additional notes"
+bd update <id> --acceptance "acceptance criteria"
+```
+
+## Testing Commands (No Ambiguity)
+
+- Default local test command: `make test` (or `./scripts/test.sh`).
+- Full CGO-enabled suite: `make test-full-cgo` (or `./scripts/test-cgo.sh ./...`).
+- On macOS, do **not** run raw `CGO_ENABLED=1 go test ./...` unless ICU flags are set; use the script/Make target above.
+- If you need package- or test-scoped CGO runs:
+```bash
+./scripts/test-cgo.sh ./cmd/bd/...
+./scripts/test-cgo.sh -run '^TestName$' ./cmd/bd/...
+```
+
+## Non-Interactive Shell Commands
+
+**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
+
+Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+
+**Use these forms instead:**
+```bash
+# Force overwrite without prompting
+cp -f source dest           # NOT: cp source dest
+mv -f source dest           # NOT: mv source dest
+rm -f file                  # NOT: rm file
+
+# For recursive operations
+rm -rf directory            # NOT: rm -r directory
+cp -rf source dest          # NOT: cp -r source dest
+```
+
+**Other commands that may prompt:**
+- `scp` - use `-o BatchMode=yes` for non-interactive
+- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
+- `apt-get` - use `-y` flag
+- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
 ## Landing the Plane (Session Completion)
 
@@ -16,7 +80,6 @@ This file exists for compatibility with tools that look for AGENTS.md.
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd sync
    git push
    git status  # MUST show "up to date with origin"
    ```

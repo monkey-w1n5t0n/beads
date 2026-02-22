@@ -4,6 +4,7 @@ Common issues and solutions for bd users.
 
 ## Table of Contents
 
+- [Debug Environment Variables](#debug-environment-variables)
 - [Installation Issues](#installation-issues)
 - [Antivirus False Positives](#antivirus-false-positives)
 - [Database Issues](#database-issues)
@@ -12,6 +13,116 @@ Common issues and solutions for bd users.
 - [Performance Issues](#performance-issues)
 - [Agent-Specific Issues](#agent-specific-issues)
 - [Platform-Specific Issues](#platform-specific-issues)
+
+## Debug Environment Variables
+
+bd supports several environment variables for debugging specific subsystems. Enable these when troubleshooting issues or when requested by maintainers.
+
+### Available Debug Variables
+
+| Variable | Purpose | Output Location | Usage |
+|----------|---------|----------------|-------|
+| `BD_DEBUG` | General debug logging | stderr | Set to any value to enable |
+| `BD_DEBUG_RPC` | RPC communication between CLI and daemon | stderr | Set to `1` or `true` |
+| `BD_DEBUG_SYNC` | Sync and import timestamp protection | stderr | Set to any value to enable |
+| `BD_DEBUG_ROUTING` | Issue routing and multi-repo resolution | stderr | Set to any value to enable |
+| `BD_DEBUG_FRESHNESS` | Database file replacement detection | daemon logs | Set to any value to enable |
+
+### Usage Examples
+
+**General debugging:**
+```bash
+# Enable all general debug logging
+export BD_DEBUG=1
+bd ready
+```
+
+**RPC communication issues:**
+```bash
+# Debug daemon communication
+export BD_DEBUG_RPC=1
+bd list
+
+# Example output:
+# [RPC DEBUG] Connecting to daemon at .beads/bd.sock
+# [RPC DEBUG] Sent request: list (correlation_id=abc123)
+# [RPC DEBUG] Received response: 200 OK
+```
+
+**Sync conflicts:**
+```bash
+# Debug timestamp protection during sync
+export BD_DEBUG_SYNC=1
+bd sync
+
+# Example output:
+# [debug] Protected bd-123: local=2024-01-20T10:00:00Z >= incoming=2024-01-20T09:55:00Z
+```
+
+**Routing issues:**
+```bash
+# Debug issue routing in multi-repo setups
+export BD_DEBUG_ROUTING=1
+bd create "Test issue" --rig=planning
+
+# Example output:
+# [routing] Rig "planning" -> prefix plan, path /path/to/planning-repo (townRoot=/path/to/town)
+# [routing] ID plan-123 matched prefix plan -> /path/to/planning-repo/beads
+```
+
+**Database reconnection issues:**
+```bash
+# Debug database file replacement detection
+export BD_DEBUG_FRESHNESS=1
+bd daemon start --foreground
+
+# Example output:
+# [freshness] FreshnessChecker: inode changed 27548143 -> 7945906
+# [freshness] FreshnessChecker: triggering reconnection
+# [freshness] Database file replaced, reconnection triggered
+
+# Or check daemon logs
+BD_DEBUG_FRESHNESS=1 bd daemon restart
+bd daemons logs . -n 100 | grep freshness
+```
+
+**Multiple debug flags:**
+```bash
+# Enable multiple subsystems
+export BD_DEBUG=1
+export BD_DEBUG_RPC=1
+export BD_DEBUG_FRESHNESS=1
+bd daemon start --foreground
+```
+
+### Tips
+
+- **Disable after debugging**: Debug logging can be verbose. Disable by unsetting the variable:
+  ```bash
+  unset BD_DEBUG
+  unset BD_DEBUG_RPC
+  # etc.
+  ```
+
+- **Capture debug output**: Redirect stderr to a file for analysis:
+  ```bash
+  BD_DEBUG=1 bd sync 2> debug.log
+  ```
+
+- **Daemon logs**: `BD_DEBUG_FRESHNESS` output goes to daemon logs, not stderr:
+  ```bash
+  # View daemon logs
+  bd daemons logs . -n 200
+
+  # Or directly:
+  tail -f .beads/daemon.log
+  ```
+
+- **When filing bug reports**: Include relevant debug output to help maintainers diagnose issues faster.
+
+### Related Documentation
+
+- [ROUTING.md](ROUTING.md) - Multi-repo routing configuration
 
 ## Installation Issues
 
@@ -121,18 +232,21 @@ If you installed via Homebrew, this shouldn't be necessary as the formula alread
 
 ### `database is locked`
 
-Another bd process is accessing the database, or SQLite didn't close properly. Solutions:
+Another bd process is accessing the database. Solutions:
 
 ```bash
 # Find and kill hanging processes
 ps aux | grep bd
 kill <pid>
 
-# Remove lock files (safe if no bd processes running)
-rm .beads/*.db-journal .beads/*.db-wal .beads/*.db-shm
+# For embedded mode: remove the lock file
+rm .beads/dolt/.dolt/lock
+
+# For server mode: restart the Dolt server
+# (server mode handles concurrent access natively)
 ```
 
-**Note**: bd uses a pure Go SQLite driver (`modernc.org/sqlite`) for better portability. Under extreme concurrent load (100+ simultaneous operations), you may see "database is locked" errors. This is a known limitation of the pure Go implementation and does not affect normal usage. For very high concurrency scenarios, consider using the CGO-enabled driver or PostgreSQL (planned for future release).
+**Note**: For high-concurrency scenarios (multiple agents), use Dolt server mode (`bd dolt set mode server`) which handles concurrent access natively via `dolt sql-server`.
 
 ### `bd init` fails with "directory not empty"
 
@@ -156,7 +270,7 @@ You're trying to import issues that conflict with existing ones. Options:
 bd import -i issues.jsonl --skip-existing
 
 # Or clear database and re-import everything
-rm .beads/*.db
+rm -rf .beads/dolt
 bd import -i .beads/issues.jsonl
 ```
 
@@ -211,18 +325,67 @@ bd config set import.orphan_handling "strict"
 
 See [CONFIG.md](CONFIG.md#example-import-orphan-handling) for complete configuration documentation.
 
+### Old data returns after reset
+
+**Symptom:** After running `bd admin reset --force` and `bd init`, old issues reappear.
+
+**Cause:** `bd admin reset --force` only removes **local** beads data. Old data can return from:
+
+1. **Remote sync branch** - If you configured a sync branch (via `bd init --branch` or `bd config set sync.branch`), old JSONL data may exist on the remote
+2. **Git history** - JSONL files committed to git are preserved in history
+3. **Other machines** - Other clones may push old data after you reset
+
+**Solution for complete clean slate:**
+
+```bash
+# 1. Reset local beads
+bd admin reset --force
+
+# 2. Delete remote sync branch (if configured)
+# Check your sync branch name first:
+bd config get sync.branch
+# Then delete it from remote:
+git push origin --delete <sync-branch-name>
+# Common names: beads-sync, beads-metadata
+
+# 3. Remove JSONL from git history (optional, destructive)
+# Only do this if you want to completely erase beads history
+git filter-branch --force --index-filter \
+  'git rm --cached --ignore-unmatch .beads/issues.jsonl' \
+  --prune-empty -- --all
+git push origin --force --all
+
+# 4. Re-initialize
+bd init
+```
+
+**Less destructive alternatives:**
+
+```bash
+# Option A: Just delete the sync branch and reinit
+bd admin reset --force
+git push origin --delete beads-sync  # or your sync branch name
+bd init
+
+# Option B: Start fresh without sync branch
+bd admin reset --force
+bd init
+bd config set sync.branch ""  # Disable sync branch feature
+```
+
+**Note:** The `--hard` and `--skip-init` flags mentioned in [GH#479](https://github.com/steveyegge/beads/issues/479) were never implemented. Use the workarounds above for a complete reset.
+
+**Related:** [GH#922](https://github.com/steveyegge/beads/issues/922)
+
 ### Database corruption
 
-**Important**: Distinguish between **logical consistency issues** (ID collisions, wrong prefixes) and **physical SQLite corruption**.
+**Important**: Distinguish between **logical consistency issues** (ID collisions, wrong prefixes) and **physical database corruption**.
 
 For **physical database corruption** (disk failures, power loss, filesystem errors):
 
 ```bash
-# Check database integrity
-sqlite3 .beads/*.db "PRAGMA integrity_check;"
-
 # If corrupted, reimport from JSONL (source of truth in git)
-mv .beads/*.db .beads/*.db.backup
+mv .beads/dolt .beads/dolt.backup
 bd init
 bd import -i .beads/issues.jsonl
 ```
@@ -234,7 +397,7 @@ For **logical consistency issues** (ID collisions from branch merges, parallel w
 bd import -i .beads/issues.jsonl
 ```
 
-See [FAQ](FAQ.md#whats-the-difference-between-sqlite-corruption-and-id-collisions) for the distinction.
+See [FAQ](FAQ.md#whats-the-difference-between-database-corruption-and-id-collisions) for the distinction.
 
 ### Multiple databases detected warning
 
@@ -577,7 +740,7 @@ See [integrations/beads-mcp/README.md](../integrations/beads-mcp/README.md) for 
 
 **Common symptoms:**
 - "Database out of sync with JSONL" errors that persist after running `bd import`
-- `bd daemon --stop` fails with "operation not permitted"
+- `bd daemon stop` fails with "operation not permitted"
 - Cannot kill daemon process with `kill <pid>`
 - JSONL hash mismatch warnings (bd-160)
 - Commands intermittently fail with staleness errors
@@ -605,7 +768,7 @@ bd --no-daemon --no-auto-flush --no-auto-import <command>
 ```
 
 **What sandbox mode does:**
-- Disables daemon (uses direct SQLite mode)
+- Disables daemon (uses direct database mode)
 - Disables auto-export to JSONL
 - Disables auto-import from JSONL
 - Allows bd to work in network-restricted environments
@@ -690,7 +853,6 @@ bd sync
 | `--allow-stale` | Skip staleness validation | Emergency access to database | **High** - may show stale data |
 
 **Related:**
-- See [DAEMON.md](DAEMON.md) for daemon troubleshooting
 - See [Claude Code sandboxing documentation](https://www.anthropic.com/engineering/claude-code-sandboxing) for more about sandbox restrictions
 - GitHub issue [#353](https://github.com/steveyegge/beads/issues/353) for background
 
@@ -721,6 +883,29 @@ The daemon listens on loopback TCP. Allow `bd.exe` through Windows Firewall:
 2. Click "Allow an app through firewall"
 3. Add `bd.exe` and enable for Private networks
 4. Or disable firewall temporarily for testing
+
+### Windows: Controlled Folder Access blocks bd init
+
+**Symptom:** `bd init` hangs indefinitely with high CPU usage, and CTRL+C doesn't work.
+
+**Cause:** Windows Controlled Folder Access is blocking `bd.exe` from creating the `.beads` directory.
+
+**Diagnosis:** Run with verbose flag to see the actual error:
+```pwsh
+bd init -v
+# Error: failed to create .beads directory: mkdir .beads: The system cannot find the file specified
+```
+
+**Solution:** Add `bd.exe` to the Controlled Folder Access whitelist:
+
+1. Open Windows Security → Virus & threat protection
+2. Click "Ransomware protection" → "Manage ransomware protection"
+3. Under "Controlled folder access", click "Allow an app through Controlled folder access"
+4. Click "Add an allowed app" → "Browse all apps"
+5. Navigate to and select `bd.exe` (typically in `%USERPROFILE%\go\bin\bd.exe`)
+6. Retry `bd init` - it should work instantly
+
+**Note:** Unlike typical blocked apps, Controlled Folder Access may not show a notification when blocking `bd init`, making this issue hard to diagnose without the `-v` flag.
 
 ### macOS: Gatekeeper blocking execution
 

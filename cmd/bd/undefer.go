@@ -1,12 +1,10 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -29,69 +27,19 @@ Examples:
 
 		ctx := rootCtx
 
-		// Resolve partial IDs first
-		var resolvedIDs []string
-		if daemonClient != nil {
-			for _, id := range args {
-				resolveArgs := &rpc.ResolveIDArgs{ID: id}
-				resp, err := daemonClient.ResolveID(resolveArgs)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error resolving ID %s: %v\n", id, err)
-					os.Exit(1)
-				}
-				var resolvedID string
-				if err := json.Unmarshal(resp.Data, &resolvedID); err != nil {
-					fmt.Fprintf(os.Stderr, "Error unmarshaling resolved ID: %v\n", err)
-					os.Exit(1)
-				}
-				resolvedIDs = append(resolvedIDs, resolvedID)
-			}
-		} else {
-			var err error
-			resolvedIDs, err = utils.ResolvePartialIDs(ctx, store, args)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
+		// Resolve partial IDs
+		_, err := utils.ResolvePartialIDs(ctx, store, args)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
 		}
 
 		undeferredIssues := []*types.Issue{}
 
-		// If daemon is running, use RPC
-		if daemonClient != nil {
-			for _, id := range resolvedIDs {
-				status := string(types.StatusOpen)
-				updateArgs := &rpc.UpdateArgs{
-					ID:     id,
-					Status: &status,
-				}
-
-				resp, err := daemonClient.Update(updateArgs)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error undeferring %s: %v\n", id, err)
-					continue
-				}
-
-				if jsonOutput {
-					var issue types.Issue
-					if err := json.Unmarshal(resp.Data, &issue); err == nil {
-						undeferredIssues = append(undeferredIssues, &issue)
-					}
-				} else {
-					fmt.Printf("%s Undeferred %s (now open)\n", ui.RenderPass("*"), id)
-				}
-			}
-
-			if jsonOutput && len(undeferredIssues) > 0 {
-				outputJSON(undeferredIssues)
-			}
-			return
-		}
-
-		// Fall back to direct storage access
+		// Direct storage access
 		if store == nil {
-			fmt.Fprintln(os.Stderr, "Error: database not initialized")
-			os.Exit(1)
+			FatalErrorWithHint("database not initialized",
+				"run 'bd init' to create a database, or use 'bd --no-db' for JSONL-only mode")
 		}
 
 		for _, id := range args {
@@ -102,7 +50,8 @@ Examples:
 			}
 
 			updates := map[string]interface{}{
-				"status": string(types.StatusOpen),
+				"status":      string(types.StatusOpen),
+				"defer_until": nil, // Clear defer_until timestamp (GH#820)
 			}
 
 			if err := store.UpdateIssue(ctx, fullID, updates, actor); err != nil {
@@ -120,11 +69,6 @@ Examples:
 			}
 		}
 
-		// Schedule auto-flush if any issues were undeferred
-		if len(args) > 0 {
-			markDirtyAndScheduleFlush()
-		}
-
 		if jsonOutput && len(undeferredIssues) > 0 {
 			outputJSON(undeferredIssues)
 		}
@@ -132,5 +76,6 @@ Examples:
 }
 
 func init() {
+	undeferCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(undeferCmd)
 }

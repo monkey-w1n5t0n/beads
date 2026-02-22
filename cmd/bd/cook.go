@@ -11,7 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/formula"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -227,8 +227,8 @@ func outputCookDryRun(resolved *formula.Formula, protoID string, runtimeMode boo
 		modeLabel = "runtime"
 		// Apply defaults for runtime mode display
 		for name, def := range resolved.Vars {
-			if _, provided := inputVars[name]; !provided && def.Default != "" {
-				inputVars[name] = def.Default
+			if _, provided := inputVars[name]; !provided && def.Default != nil {
+				inputVars[name] = *def.Default
 			}
 		}
 	}
@@ -268,8 +268,8 @@ func outputCookDryRun(resolved *formula.Formula, protoID string, runtimeMode boo
 			if def.Required {
 				attrs = append(attrs, "required")
 			}
-			if def.Default != "" {
-				attrs = append(attrs, fmt.Sprintf("default=%s", def.Default))
+			if def.Default != nil {
+				attrs = append(attrs, fmt.Sprintf("default=%s", *def.Default))
 			}
 			if len(def.Enum) > 0 {
 				attrs = append(attrs, fmt.Sprintf("enum=[%s]", strings.Join(def.Enum, ",")))
@@ -288,8 +288,8 @@ func outputCookEphemeral(resolved *formula.Formula, runtimeMode bool, inputVars 
 	if runtimeMode {
 		// Apply defaults from formula variable definitions
 		for name, def := range resolved.Vars {
-			if _, provided := inputVars[name]; !provided && def.Default != "" {
-				inputVars[name] = def.Default
+			if _, provided := inputVars[name]; !provided && def.Default != nil {
+				inputVars[name] = *def.Default
 			}
 		}
 
@@ -332,9 +332,6 @@ func persistCookFormula(ctx context.Context, resolved *formula.Formula, protoID 
 		return fmt.Errorf("cooking formula: %w", err)
 	}
 
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
-
 	if jsonOutput {
 		outputJSON(cookResult{
 			ProtoID:    result.ProtoID,
@@ -370,12 +367,7 @@ func runCook(cmd *cobra.Command, args []string) {
 	if flags.persist {
 		CheckReadonly("cook --persist")
 		if store == nil {
-			if daemonClient != nil {
-				fmt.Fprintf(os.Stderr, "Error: cook --persist requires direct database access\n")
-				fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon cook %s --persist ...\n", flags.formulaPath)
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			}
+			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
 			os.Exit(1)
 		}
 	}
@@ -443,11 +435,25 @@ func cookFormulaToSubgraph(f *formula.Formula, protoID string) (*TemplateSubgrap
 	var issues []*types.Issue
 	var deps []*types.Dependency
 
+	// Determine root title: use {{title}} placeholder if the variable is defined,
+	// otherwise fall back to formula name (GH#852)
+	rootTitle := f.Formula
+	if _, hasTitle := f.Vars["title"]; hasTitle {
+		rootTitle = "{{title}}"
+	}
+
+	// Determine root description: use {{desc}} placeholder if the variable is defined,
+	// otherwise fall back to formula description (GH#852)
+	rootDesc := f.Description
+	if _, hasDesc := f.Vars["desc"]; hasDesc {
+		rootDesc = "{{desc}}"
+	}
+
 	// Create root proto epic
 	rootIssue := &types.Issue{
 		ID:          protoID,
-		Title:       f.Formula, // Title is the original formula name
-		Description: f.Description,
+		Title:       rootTitle,
+		Description: rootDesc,
 		Status:      types.StatusOpen,
 		Priority:    2,
 		IssueType:   types.TypeEpic,
@@ -474,6 +480,47 @@ func cookFormulaToSubgraph(f *formula.Formula, protoID string) (*TemplateSubgrap
 		Dependencies: deps,
 		IssueMap:     issueMap,
 	}, nil
+}
+
+// createGateIssue creates a gate issue for a step with a Gate field.
+// Gate issues have type=gate and block the step they guard.
+// Returns the gate issue and its ID.
+func createGateIssue(step *formula.Step, parentID string) *types.Issue {
+	if step.Gate == nil {
+		return nil
+	}
+
+	// Generate gate issue ID: {parentID}.gate-{step.ID}
+	gateID := fmt.Sprintf("%s.gate-%s", parentID, step.ID)
+
+	// Build title from gate type and ID
+	title := fmt.Sprintf("Gate: %s", step.Gate.Type)
+	if step.Gate.ID != "" {
+		title = fmt.Sprintf("Gate: %s %s", step.Gate.Type, step.Gate.ID)
+	}
+
+	// Parse timeout if specified
+	var timeout time.Duration
+	if step.Gate.Timeout != "" {
+		if parsed, err := time.ParseDuration(step.Gate.Timeout); err == nil {
+			timeout = parsed
+		}
+	}
+
+	return &types.Issue{
+		ID:          gateID,
+		Title:       title,
+		Description: fmt.Sprintf("Async gate for step %s", step.ID),
+		Status:      types.StatusOpen,
+		Priority:    2,
+		IssueType:   "gate",
+		AwaitType:   step.Gate.Type,
+		AwaitID:     step.Gate.ID,
+		Timeout:     timeout,
+		IsTemplate:  true,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
 }
 
 // processStepToIssue converts a formula.Step to a types.Issue.
@@ -562,13 +609,47 @@ func collectSteps(steps []*formula.Step, parentID string,
 			Type:        types.DepParentChild,
 		})
 
+		// Create gate issue if step has a Gate (bd-7zka.2)
+		if step.Gate != nil {
+			gateIssue := createGateIssue(step, parentID)
+			*issues = append(*issues, gateIssue)
+
+			// Add gate to mapping (use gate-{step.ID} as key)
+			gateKey := fmt.Sprintf("gate-%s", step.ID)
+			idMapping[gateKey] = gateIssue.ID
+			if issueMap != nil {
+				issueMap[gateIssue.ID] = gateIssue
+			}
+
+			// Handle gate labels if needed
+			if labelHandler != nil && len(gateIssue.Labels) > 0 {
+				for _, label := range gateIssue.Labels {
+					labelHandler(gateIssue.ID, label)
+				}
+				gateIssue.Labels = nil
+			}
+
+			// Gate is a child of the parent (same level as the step)
+			*deps = append(*deps, &types.Dependency{
+				IssueID:     gateIssue.ID,
+				DependsOnID: parentID,
+				Type:        types.DepParentChild,
+			})
+
+			// Step depends on gate (gate blocks the step)
+			*deps = append(*deps, &types.Dependency{
+				IssueID:     issue.ID,
+				DependsOnID: gateIssue.ID,
+				Type:        types.DepBlocks,
+			})
+		}
+
 		// Recursively collect children
 		if len(step.Children) > 0 {
 			collectSteps(step.Children, issue.ID, idMapping, issueMap, issues, deps, labelHandler)
 		}
 	}
 }
-
 
 // resolveAndCookFormula loads a formula by name, resolves it, applies all transformations,
 // and returns an in-memory TemplateSubgraph ready for instantiation.
@@ -646,8 +727,8 @@ func resolveAndCookFormulaWithVars(formulaName string, searchPaths []string, con
 		// Merge with formula defaults for complete evaluation
 		mergedVars := make(map[string]string)
 		for name, def := range resolved.Vars {
-			if def != nil && def.Default != "" {
-				mergedVars[name] = def.Default
+			if def != nil && def.Default != nil {
+				mergedVars[name] = *def.Default
 			}
 		}
 		for k, v := range conditionVars {
@@ -688,15 +769,9 @@ func cookFormulaToSubgraphWithVars(f *formula.Formula, protoID string, vars map[
 
 // cookFormula creates a proto bead from a resolved formula.
 // protoID is the final ID for the proto (may include a prefix).
-func cookFormula(ctx context.Context, s storage.Storage, f *formula.Formula, protoID string) (*cookFormulaResult, error) {
+func cookFormula(ctx context.Context, s *dolt.DoltStore, f *formula.Formula, protoID string) (*cookFormulaResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
-	}
-
-	// Check for SQLite store (needed for batch create with skip prefix)
-	sqliteStore, ok := s.(*sqlite.SQLiteStorage)
-	if !ok {
-		return nil, fmt.Errorf("cook requires SQLite storage")
 	}
 
 	// Map step ID -> created issue ID
@@ -707,11 +782,25 @@ func cookFormula(ctx context.Context, s storage.Storage, f *formula.Formula, pro
 	var deps []*types.Dependency
 	var labels []struct{ issueID, label string }
 
+	// Determine root title: use {{title}} placeholder if the variable is defined,
+	// otherwise fall back to formula name (GH#852)
+	rootTitle := f.Formula
+	if _, hasTitle := f.Vars["title"]; hasTitle {
+		rootTitle = "{{title}}"
+	}
+
+	// Determine root description: use {{desc}} placeholder if the variable is defined,
+	// otherwise fall back to formula description (GH#852)
+	rootDesc := f.Description
+	if _, hasDesc := f.Vars["desc"]; hasDesc {
+		rootDesc = "{{desc}}"
+	}
+
 	// Create root proto epic using provided protoID (may include prefix)
 	rootIssue := &types.Issue{
 		ID:          protoID,
-		Title:       f.Formula, // Title is the original formula name
-		Description: f.Description,
+		Title:       rootTitle,
+		Description: rootDesc,
 		Status:      types.StatusOpen,
 		Priority:    2,
 		IssueType:   types.TypeEpic,
@@ -734,10 +823,11 @@ func cookFormula(ctx context.Context, s storage.Storage, f *formula.Formula, pro
 	}
 
 	// Create all issues using batch with skip prefix validation
-	opts := sqlite.BatchCreateOptions{
+	opts := storage.BatchCreateOptions{
 		SkipPrefixValidation: true, // Molecules use mol-* prefix
+		OrphanHandling:       storage.OrphanAllow,
 	}
-	if err := sqliteStore.CreateIssuesWithFullOptions(ctx, issues, actor, opts); err != nil {
+	if err := s.CreateIssuesWithFullOptions(ctx, issues, actor, opts); err != nil {
 		return nil, fmt.Errorf("failed to create issues: %w", err)
 	}
 
@@ -855,7 +945,7 @@ func collectDependencies(step *formula.Step, idMapping map[string]string, deps *
 }
 
 // deleteProtoSubgraph deletes a proto and all its children.
-func deleteProtoSubgraph(ctx context.Context, s storage.Storage, protoID string) error {
+func deleteProtoSubgraph(ctx context.Context, s *dolt.DoltStore, protoID string) error {
 	// Load the subgraph
 	subgraph, err := loadTemplateSubgraph(ctx, s, protoID)
 	if err != nil {

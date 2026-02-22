@@ -11,6 +11,7 @@ import (
 	"context"
 
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -21,9 +22,19 @@ type Storage = beads.Storage
 // Use Storage.RunInTransaction() to obtain a Transaction instance.
 type Transaction = beads.Transaction
 
-// NewSQLiteStorage creates a new SQLite storage instance at the given path
-func NewSQLiteStorage(ctx context.Context, dbPath string) (Storage, error) {
-	return beads.NewSQLiteStorage(ctx, dbPath)
+// Open opens a Dolt-backed beads database at the given path.
+// This always opens in embedded mode. Use OpenFromConfig to respect
+// server mode settings from metadata.json.
+func Open(ctx context.Context, dbPath string) (Storage, error) {
+	return dolt.New(ctx, &dolt.Config{Path: dbPath})
+}
+
+// OpenFromConfig opens a beads database using configuration from metadata.json.
+// Unlike Open, this respects Dolt server mode settings and database name
+// configuration, connecting to the Dolt SQL server when dolt_mode is "server".
+// beadsDir is the path to the .beads directory.
+func OpenFromConfig(ctx context.Context, beadsDir string) (Storage, error) {
+	return dolt.NewFromConfig(ctx, beadsDir)
 }
 
 // FindDatabasePath finds the beads database in the current directory tree
@@ -61,24 +72,25 @@ func GetRedirectInfo() RedirectInfo {
 
 // Core types from internal/types
 type (
-	Issue              = types.Issue
-	Status             = types.Status
-	IssueType          = types.IssueType
-	Dependency         = types.Dependency
-	DependencyType     = types.DependencyType
-	Label              = types.Label
-	Comment            = types.Comment
-	Event              = types.Event
-	EventType          = types.EventType
-	BlockedIssue       = types.BlockedIssue
-	TreeNode           = types.TreeNode
-	IssueFilter        = types.IssueFilter
-	WorkFilter         = types.WorkFilter
-	StaleFilter        = types.StaleFilter
-	DependencyCounts   = types.DependencyCounts
-	IssueWithCounts    = types.IssueWithCounts
-	SortPolicy         = types.SortPolicy
-	EpicStatus         = types.EpicStatus
+	Issue            = types.Issue
+	Status           = types.Status
+	IssueType        = types.IssueType
+	Dependency       = types.Dependency
+	DependencyType   = types.DependencyType
+	Label            = types.Label
+	Comment          = types.Comment
+	Event            = types.Event
+	EventType        = types.EventType
+	BlockedIssue     = types.BlockedIssue
+	TreeNode         = types.TreeNode
+	IssueFilter      = types.IssueFilter
+	WorkFilter       = types.WorkFilter
+	StaleFilter      = types.StaleFilter
+	DependencyCounts = types.DependencyCounts
+	IssueWithCounts              = types.IssueWithCounts
+	IssueWithDependencyMetadata  = types.IssueWithDependencyMetadata
+	SortPolicy                   = types.SortPolicy
+	EpicStatus                   = types.EpicStatus
 )
 
 // Status constants

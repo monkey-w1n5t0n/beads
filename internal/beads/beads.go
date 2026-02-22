@@ -8,7 +8,6 @@
 package beads
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,8 +16,6 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
-	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/utils"
 )
 
@@ -27,9 +24,6 @@ const CanonicalDatabaseName = "beads.db"
 
 // RedirectFileName is the name of the file that redirects to another .beads directory
 const RedirectFileName = "redirect"
-
-// LegacyDatabaseNames are old names that should be migrated
-var LegacyDatabaseNames = []string{"bd.db", "issues.db", "bugs.db"}
 
 // FollowRedirect checks if a .beads directory contains a redirect file and follows it.
 // If a redirect file exists, it returns the target .beads directory path.
@@ -90,6 +84,10 @@ func FollowRedirect(beadsDir string) string {
 		fmt.Fprintf(os.Stderr, "Warning: redirect chains not allowed, ignoring redirect in %s\n", target)
 	}
 
+	if os.Getenv("BD_DEBUG_ROUTING") != "" {
+		fmt.Fprintf(os.Stderr, "[routing] Followed redirect from %s -> %s\n", beadsDir, target)
+	}
+
 	return target
 }
 
@@ -106,26 +104,42 @@ type RedirectInfo struct {
 // GetRedirectInfo checks if the current beads directory is redirected.
 // It searches for the local .beads/ directory and checks if it contains a redirect file.
 // Returns RedirectInfo with IsRedirected=true if a redirect is active.
+//
+// bd-wayc3: This function now also checks the git repo's local .beads directory even when
+// BEADS_DIR is set. This handles the case where BEADS_DIR is pre-set to the redirect target
+// (e.g., by shell environment or tooling), but we still need to detect that a redirect exists.
 func GetRedirectInfo() RedirectInfo {
-	info := RedirectInfo{}
-
-	// Find the local .beads directory without following redirects
-	localBeadsDir := findLocalBeadsDir()
-	if localBeadsDir == "" {
-		return info
+	// First, always check the git repo's local .beads directory for redirects
+	// This handles the case where BEADS_DIR is pre-set to the redirect target
+	if localBeadsDir := findLocalBdsDirInRepo(); localBeadsDir != "" {
+		if info := checkRedirectInDir(localBeadsDir); info.IsRedirected {
+			return info
+		}
 	}
-	info.LocalDir = localBeadsDir
+
+	// Fall back to original logic for non-git-repo cases
+	if localBeadsDir := findLocalBeadsDir(); localBeadsDir != "" {
+		return checkRedirectInDir(localBeadsDir)
+	}
+
+	return RedirectInfo{}
+}
+
+// checkRedirectInDir checks if a beads directory has a redirect file and returns redirect info.
+// Returns RedirectInfo with IsRedirected=true if a valid redirect exists.
+func checkRedirectInDir(beadsDir string) RedirectInfo {
+	info := RedirectInfo{LocalDir: beadsDir}
 
 	// Check if this directory has a redirect file
-	redirectFile := filepath.Join(localBeadsDir, RedirectFileName)
+	redirectFile := filepath.Join(beadsDir, RedirectFileName)
 	if _, err := os.Stat(redirectFile); err != nil {
 		// No redirect file
 		return info
 	}
 
 	// There's a redirect - find the target
-	targetDir := FollowRedirect(localBeadsDir)
-	if targetDir == localBeadsDir {
+	targetDir := FollowRedirect(beadsDir)
+	if targetDir == beadsDir {
 		// Redirect file exists but failed to resolve (invalid target)
 		return info
 	}
@@ -133,6 +147,24 @@ func GetRedirectInfo() RedirectInfo {
 	info.IsRedirected = true
 	info.TargetDir = targetDir
 	return info
+}
+
+// findLocalBdsDirInRepo finds the .beads directory relative to the git repo root.
+// This ignores BEADS_DIR to find the "true local" .beads for redirect detection.
+// bd-wayc3: Added to detect redirects even when BEADS_DIR is pre-set.
+func findLocalBdsDirInRepo() string {
+	// Get git repo root
+	repoRoot := git.GetRepoRoot()
+	if repoRoot == "" {
+		return ""
+	}
+
+	beadsDir := filepath.Join(repoRoot, ".beads")
+	if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+		return beadsDir
+	}
+
+	return ""
 }
 
 // findLocalBeadsDir finds the local .beads directory without following redirects.
@@ -144,6 +176,7 @@ func findLocalBeadsDir() string {
 	}
 
 	// Check for worktree - use main repo's .beads
+	// Note: GetMainRepoRoot() is safe to call outside a git repo - it returns an error
 	mainRepoRoot, err := git.GetMainRepoRoot()
 	if err == nil && mainRepoRoot != "" {
 		beadsDir := filepath.Join(mainRepoRoot, ".beads")
@@ -158,172 +191,52 @@ func findLocalBeadsDir() string {
 		return ""
 	}
 
-	for dir := cwd; dir != "/" && dir != "."; dir = filepath.Dir(dir) {
+	for dir := cwd; dir != "/" && dir != "."; {
 		beadsDir := filepath.Join(dir, ".beads")
 		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
 			return beadsDir
 		}
+
+		// Move up one directory
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Reached filesystem root (works on both Unix and Windows)
+			// On Unix: filepath.Dir("/") returns "/"
+			// On Windows: filepath.Dir("C:\\") returns "C:\\"
+			break
+		}
+		dir = parent
 	}
 
 	return ""
 }
 
-// findDatabaseInBeadsDir searches for a database file within a .beads directory.
-// It implements the standard search order:
-// 1. Check config.json first (single source of truth)
-// 2. Fall back to canonical beads.db
-// 3. Search for *.db files, filtering out backups and vc.db
-//
-// If warnOnIssues is true, warnings are printed to stderr for:
-// - Multiple databases found (ambiguous state)
-// - Legacy database names that should be migrated
-//
+// findDatabaseInBeadsDir searches for a database within a .beads directory.
+// Checks metadata.json for the Dolt database path. For server mode, no local
+// directory is required. For embedded mode, the dolt/ directory must exist.
 // Returns empty string if no database is found.
-func findDatabaseInBeadsDir(beadsDir string, warnOnIssues bool) string {
-	// Check for config.json first (single source of truth)
+func findDatabaseInBeadsDir(beadsDir string, _ bool) string {
+	// Check for metadata.json first (single source of truth)
 	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
-		dbPath := cfg.DatabasePath(beadsDir)
-		if _, err := os.Stat(dbPath); err == nil {
-			return dbPath
+		// For Dolt server mode, database is on the server - no local directory required
+		if cfg.IsDoltServerMode() {
+			return cfg.DatabasePath(beadsDir)
+		}
+		// For embedded Dolt, check if the configured database directory exists
+		doltPath := cfg.DatabasePath(beadsDir)
+		if info, err := os.Stat(doltPath); err == nil && info.IsDir() {
+			return doltPath
 		}
 	}
 
-	// Fall back to canonical beads.db for backward compatibility
-	canonicalDB := filepath.Join(beadsDir, CanonicalDatabaseName)
-	if _, err := os.Stat(canonicalDB); err == nil {
-		return canonicalDB
+	// Fall back: check if dolt directory exists without metadata.json
+	doltPath := filepath.Join(beadsDir, "dolt")
+	if info, err := os.Stat(doltPath); err == nil && info.IsDir() {
+		return doltPath
 	}
 
-	// Look for any .db file in the beads directory
-	matches, err := filepath.Glob(filepath.Join(beadsDir, "*.db"))
-	if err != nil || len(matches) == 0 {
-		return ""
-	}
-
-	// Filter out backup files and vc.db
-	var validDBs []string
-	for _, match := range matches {
-		baseName := filepath.Base(match)
-		// Skip backup files (contains ".backup" in name) and vc.db
-		if !strings.Contains(baseName, ".backup") && baseName != "vc.db" {
-			validDBs = append(validDBs, match)
-		}
-	}
-
-	if len(validDBs) == 0 {
-		return ""
-	}
-
-	if warnOnIssues {
-		// Warn about multiple databases found
-		if len(validDBs) > 1 {
-			fmt.Fprintf(os.Stderr, "Warning: Multiple database files found in %s:\n", beadsDir)
-			for _, db := range validDBs {
-				fmt.Fprintf(os.Stderr, "  - %s\n", filepath.Base(db))
-			}
-			fmt.Fprintf(os.Stderr, "Run 'bd init' to migrate to %s or manually remove old databases.\n\n", CanonicalDatabaseName)
-		}
-
-		// Warn about legacy database names
-		dbName := filepath.Base(validDBs[0])
-		if dbName != CanonicalDatabaseName {
-			for _, legacy := range LegacyDatabaseNames {
-				if dbName == legacy {
-					fmt.Fprintf(os.Stderr, "WARNING: Using legacy database name: %s\n", dbName)
-					fmt.Fprintf(os.Stderr, "Run 'bd migrate' to upgrade to canonical name: %s\n\n", CanonicalDatabaseName)
-					break
-				}
-			}
-		}
-	}
-
-	return validDBs[0]
+	return ""
 }
-
-// Issue represents a tracked work item with metadata, dependencies, and status.
-type (
-	Issue = types.Issue
-	// Status represents the current state of an issue (open, in progress, closed, blocked).
-	Status = types.Status
-	// IssueType represents the type of issue (bug, feature, task, epic, chore).
-	IssueType = types.IssueType
-	// Dependency represents a relationship between issues.
-	Dependency = types.Dependency
-	// DependencyType represents the type of dependency (blocks, related, parent-child, discovered-from).
-	DependencyType = types.DependencyType
-	// Comment represents a user comment on an issue.
-	Comment = types.Comment
-	// Event represents an audit log event.
-	Event = types.Event
-	// EventType represents the type of audit event.
-	EventType = types.EventType
-	// Label represents a tag attached to an issue.
-	Label = types.Label
-	// BlockedIssue represents an issue with blocking dependencies.
-	BlockedIssue = types.BlockedIssue
-	// TreeNode represents a node in a dependency tree.
-	TreeNode = types.TreeNode
-	// Statistics represents project-wide metrics.
-	Statistics = types.Statistics
-	// IssueFilter represents filtering criteria for issue queries.
-	IssueFilter = types.IssueFilter
-	// WorkFilter represents filtering criteria for work queries.
-	WorkFilter = types.WorkFilter
-	// SortPolicy determines how ready work is ordered.
-	SortPolicy = types.SortPolicy
-	// EpicStatus represents the status of an epic issue.
-	EpicStatus = types.EpicStatus
-)
-
-// Status constants
-const (
-	StatusOpen       = types.StatusOpen
-	StatusInProgress = types.StatusInProgress
-	StatusBlocked    = types.StatusBlocked
-	StatusDeferred   = types.StatusDeferred
-	StatusClosed     = types.StatusClosed
-)
-
-// IssueType constants
-const (
-	TypeBug      = types.TypeBug
-	TypeFeature  = types.TypeFeature
-	TypeTask     = types.TypeTask
-	TypeEpic     = types.TypeEpic
-	TypeChore    = types.TypeChore
-	TypeMolecule = types.TypeMolecule
-)
-
-// DependencyType constants
-const (
-	DepBlocks            = types.DepBlocks
-	DepRelated           = types.DepRelated
-	DepParentChild       = types.DepParentChild
-	DepDiscoveredFrom    = types.DepDiscoveredFrom
-	DepConditionalBlocks = types.DepConditionalBlocks // B runs only if A fails
-)
-
-// SortPolicy constants
-const (
-	SortPolicyHybrid   = types.SortPolicyHybrid
-	SortPolicyPriority = types.SortPolicyPriority
-	SortPolicyOldest   = types.SortPolicyOldest
-)
-
-// EventType constants
-const (
-	EventCreated           = types.EventCreated
-	EventUpdated           = types.EventUpdated
-	EventStatusChanged     = types.EventStatusChanged
-	EventCommented         = types.EventCommented
-	EventClosed            = types.EventClosed
-	EventReopened          = types.EventReopened
-	EventDependencyAdded   = types.EventDependencyAdded
-	EventDependencyRemoved = types.EventDependencyRemoved
-	EventLabelAdded        = types.EventLabelAdded
-	EventLabelRemoved      = types.EventLabelRemoved
-	EventCompacted         = types.EventCompacted
-)
 
 // Storage provides the minimal interface for extension orchestration
 type Storage = storage.Storage
@@ -331,12 +244,6 @@ type Storage = storage.Storage
 // Transaction provides atomic multi-operation support within a database transaction.
 // Use Storage.RunInTransaction() to obtain a Transaction instance.
 type Transaction = storage.Transaction
-
-// NewSQLiteStorage opens a bd SQLite database for programmatic access.
-// Most extensions should use this to query ready work and update issue status.
-func NewSQLiteStorage(ctx context.Context, dbPath string) (Storage, error) {
-	return sqlite.New(ctx, dbPath)
-}
 
 // FindDatabasePath discovers the bd database path using bd's standard search order:
 //  1. $BEADS_DIR environment variable (points to .beads directory)
@@ -465,12 +372,13 @@ func FindBeadsDir() string {
 
 	// Find git root to limit the search
 	gitRoot := findGitRoot()
+	worktreeRoot := gitRoot // save worktree-specific boundary
 	if git.IsWorktree() && mainRepoRoot != "" {
 		// For worktrees, extend search boundary to include main repo
 		gitRoot = mainRepoRoot
 	}
 
-	for dir := cwd; dir != "/" && dir != "."; dir = filepath.Dir(dir) {
+	for dir := cwd; dir != "/" && dir != "."; {
 		beadsDir := filepath.Join(dir, ".beads")
 		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
 			// Follow redirect if present
@@ -486,6 +394,22 @@ func FindBeadsDir() string {
 		if gitRoot != "" && dir == gitRoot {
 			break
 		}
+
+		// Also stop at worktree root when it differs from main repo root
+		// This prevents escaping the worktree boundary into unrelated directories
+		if worktreeRoot != "" && worktreeRoot != gitRoot && dir == worktreeRoot {
+			break
+		}
+
+		// Move up one directory
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Reached filesystem root (works on both Unix and Windows)
+			// On Unix: filepath.Dir("/") returns "/"
+			// On Windows: filepath.Dir("C:\\") returns "C:\\"
+			break
+		}
+		dir = parent
 	}
 
 	return ""
@@ -508,9 +432,9 @@ func FindJSONLPath(dbPath string) string {
 
 // DatabaseInfo contains information about a discovered beads database
 type DatabaseInfo struct {
-	Path      string // Full path to the .db file
-	BeadsDir  string // Parent .beads directory
-	IssueCount int   // Number of issues (-1 if unknown)
+	Path       string // Full path to the .db file
+	BeadsDir   string // Parent .beads directory
+	IssueCount int    // Number of issues (-1 if unknown)
 }
 
 // findGitRoot returns the root directory of the current git repository,
@@ -626,11 +550,20 @@ func FindAllDatabases() []DatabaseInfo {
 			// Follow redirect if present
 			beadsDir = FollowRedirect(beadsDir)
 
-			// Found .beads/ directory, look for *.db files
-			matches, err := filepath.Glob(filepath.Join(beadsDir, "*.db"))
-			if err == nil && len(matches) > 0 {
-				dbPath := matches[0]
+			// Look for database: dolt directory first, then legacy *.db files
+			dbPath := ""
+			doltDir := filepath.Join(beadsDir, "dolt")
+			if dInfo, dErr := os.Stat(doltDir); dErr == nil && dInfo.IsDir() {
+				dbPath = doltDir
+			} else {
+				// Legacy: check for *.db files (pre-migration)
+				matches, err := filepath.Glob(filepath.Join(beadsDir, "*.db"))
+				if err == nil && len(matches) > 0 {
+					dbPath = matches[0]
+				}
+			}
 
+			if dbPath != "" {
 				// Resolve symlinks to get canonical path for deduplication
 				canonicalPath := dbPath
 				if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
@@ -649,27 +582,13 @@ func FindAllDatabases() []DatabaseInfo {
 				}
 				seen[canonicalPath] = true
 
-				// Count issues if we can open the database (best-effort)
-				issueCount := -1
-				// Don't fail if we can't open/query the database - it might be locked
-				// or corrupted, but we still want to detect and warn about it
-				ctx := context.Background()
-				store, err := sqlite.New(ctx, dbPath)
-				if err == nil {
-					if issues, err := store.SearchIssues(ctx, "", types.IssueFilter{}); err == nil {
-						issueCount = len(issues)
-					}
-					_ = store.Close()
-				}
-
 				databases = append(databases, DatabaseInfo{
 					Path:       dbPath,
 					BeadsDir:   beadsDir,
-					IssueCount: issueCount,
+					IssueCount: -1,
 				})
 
 				// Stop searching upward - the closest .beads is the one to use
-				// Parent directories are out of scope in multi-workspace setups
 				break
 			}
 		}

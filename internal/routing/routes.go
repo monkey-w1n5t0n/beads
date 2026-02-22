@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // RoutesFileName is the name of the routes configuration file
@@ -53,6 +53,16 @@ func LoadRoutes(beadsDir string) ([]Route, error) {
 	}
 
 	return routes, scanner.Err()
+}
+
+// LoadTownRoutes loads routes from the town-level routes.jsonl.
+// It first checks the given beadsDir, then walks up to find the town root
+// and loads routes from there. This is useful for multi-rig setups (Gas Town)
+// where routes.jsonl lives at ~/gt/.beads/ rather than in individual rig directories.
+// Returns routes and nil error on success, or nil routes if not in a town or no routes found.
+func LoadTownRoutes(beadsDir string) ([]Route, error) {
+	routes, _ := findTownRoutes(beadsDir)
+	return routes, nil
 }
 
 // ExtractPrefix extracts the prefix from an issue ID.
@@ -174,7 +184,7 @@ func ResolveBeadsDirForRig(rigOrPrefix, currentBeadsDir string) (beadsDir string
 	}
 
 	// Follow redirect if present
-	targetPath = resolveRedirect(targetPath)
+	targetPath = beads.FollowRedirect(targetPath)
 
 	// Verify the target exists
 	if info, statErr := os.Stat(targetPath); statErr != nil || !info.IsDir() {
@@ -252,7 +262,7 @@ func ResolveBeadsDirForID(ctx context.Context, id, currentBeadsDir string) (stri
 					}
 
 					// Follow redirect if present
-					targetPath = resolveRedirect(targetPath)
+					targetPath = beads.FollowRedirect(targetPath)
 
 					// Verify the target exists
 					if info, err := os.Stat(targetPath); err == nil && info.IsDir() {
@@ -291,20 +301,52 @@ func findTownRoot(startDir string) string {
 	}
 }
 
+// findTownRootFromCWD walks up from the current working directory looking for a town root.
+// This is used to handle symlinked .beads directories correctly.
+// By starting from CWD instead of the beads directory path, we find the correct
+// town root even when .beads is a symlink that points elsewhere.
+func findTownRootFromCWD() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return findTownRoot(cwd)
+}
+
 // findTownRoutes searches for routes.jsonl at the town level.
 // It walks up from currentBeadsDir to find the town root, then loads routes
 // from <townRoot>/.beads/routes.jsonl.
 // Returns (routes, townRoot). Returns nil routes if not in an orchestrator town or no routes found.
+//
+// IMPORTANT: This function handles symlinked .beads directories correctly.
+// When .beads is a symlink (e.g., ~/gt/.beads -> ~/gt/olympus/.beads), we must
+// use findTownRoot() starting from CWD to determine the actual town root rather
+// than starting from currentBeadsDir, which may be the resolved symlink path.
 func findTownRoutes(currentBeadsDir string) ([]Route, string) {
 	// First try the current beads dir (works if we're already at town level)
 	routes, err := LoadRoutes(currentBeadsDir)
 	if err == nil && len(routes) > 0 {
-		// Return the parent of the beads dir as "town root" for path resolution
+		// Use findTownRoot() starting from CWD to determine the actual town root.
+		// We must NOT use currentBeadsDir as the starting point because if .beads
+		// is a symlink (e.g., ~/gt/.beads -> ~/gt/olympus/.beads), currentBeadsDir
+		// will be the resolved path (e.g., ~/gt/olympus/.beads) and walking up
+		// from there would find ~/gt/olympus as the town root instead of ~/gt.
+		townRoot := findTownRootFromCWD()
+		if townRoot != "" {
+			if os.Getenv("BD_DEBUG_ROUTING") != "" {
+				fmt.Fprintf(os.Stderr, "[routing] findTownRoutes: found routes in %s, townRoot=%s (via findTownRootFromCWD)\n", currentBeadsDir, townRoot)
+			}
+			return routes, townRoot
+		}
+		// Fallback to parent dir if not in a town structure (for non-Gas Town repos)
+		if os.Getenv("BD_DEBUG_ROUTING") != "" {
+			fmt.Fprintf(os.Stderr, "[routing] findTownRoutes: found routes in %s, townRoot=%s (fallback to parent dir)\n", currentBeadsDir, filepath.Dir(currentBeadsDir))
+		}
 		return routes, filepath.Dir(currentBeadsDir)
 	}
 
-	// Walk up to find town root
-	townRoot := findTownRoot(currentBeadsDir)
+	// Walk up from CWD to find town root
+	townRoot := findTownRootFromCWD()
 	if townRoot == "" {
 		return nil, "" // Not in a town
 	}
@@ -316,57 +358,17 @@ func findTownRoutes(currentBeadsDir string) ([]Route, string) {
 		return nil, "" // No town routes
 	}
 
+	if os.Getenv("BD_DEBUG_ROUTING") != "" {
+		fmt.Fprintf(os.Stderr, "[routing] findTownRoutes: loaded routes from %s, townRoot=%s\n", townBeadsDir, townRoot)
+	}
+
 	return routes, townRoot
-}
-
-// resolveRedirect checks for a redirect file in the beads directory
-// and resolves the redirect path if present.
-func resolveRedirect(beadsDir string) string {
-	redirectFile := filepath.Join(beadsDir, "redirect")
-	data, err := os.ReadFile(redirectFile) //nolint:gosec // redirectFile is constructed from known beadsDir
-	if err != nil {
-		if os.Getenv("BD_DEBUG_ROUTING") != "" {
-			fmt.Fprintf(os.Stderr, "[routing] No redirect file at %s: %v\n", redirectFile, err)
-		}
-		return beadsDir // No redirect
-	}
-
-	redirectPath := strings.TrimSpace(string(data))
-	if os.Getenv("BD_DEBUG_ROUTING") != "" {
-		fmt.Fprintf(os.Stderr, "[routing] Read redirect: %q from %s\n", redirectPath, redirectFile)
-	}
-	if redirectPath == "" {
-		return beadsDir
-	}
-
-	// Handle relative paths
-	if !filepath.IsAbs(redirectPath) {
-		redirectPath = filepath.Join(beadsDir, redirectPath)
-	}
-
-	// Clean and resolve the path
-	redirectPath = filepath.Clean(redirectPath)
-	if os.Getenv("BD_DEBUG_ROUTING") != "" {
-		fmt.Fprintf(os.Stderr, "[routing] Resolved redirect path: %s\n", redirectPath)
-	}
-
-	// Verify the redirect target exists
-	if info, err := os.Stat(redirectPath); err == nil && info.IsDir() {
-		if os.Getenv("BD_DEBUG_ROUTING") != "" {
-			fmt.Fprintf(os.Stderr, "[routing] Followed redirect from %s -> %s\n", beadsDir, redirectPath)
-		}
-		return redirectPath
-	} else if os.Getenv("BD_DEBUG_ROUTING") != "" {
-		fmt.Fprintf(os.Stderr, "[routing] Redirect target check failed: %v\n", err)
-	}
-
-	return beadsDir
 }
 
 // RoutedStorage represents a storage connection that may have been routed
 // to a different beads directory than the local one.
 type RoutedStorage struct {
-	Storage  storage.Storage
+	Storage  *dolt.DoltStore
 	BeadsDir string
 	Routed   bool // true if this is a routed (non-local) storage
 }
@@ -379,12 +381,27 @@ func (rs *RoutedStorage) Close() error {
 	return nil
 }
 
+// StorageOpener is a function that opens storage for a given beads directory.
+// This allows callers to provide custom storage opening logic (e.g., using factory).
+type StorageOpener func(ctx context.Context, beadsDir string) (*dolt.DoltStore, error)
+
 // GetRoutedStorageForID returns a storage connection for the given issue ID.
 // If the ID matches a route, it opens a connection to the routed database.
 // Otherwise, it returns nil (caller should use their existing storage).
 //
+// DEPRECATED: Use GetRoutedStorageWithOpener for proper backend support.
 // The caller is responsible for closing the returned RoutedStorage.
 func GetRoutedStorageForID(ctx context.Context, id, currentBeadsDir string) (*RoutedStorage, error) {
+	return GetRoutedStorageWithOpener(ctx, id, currentBeadsDir, nil)
+}
+
+// GetRoutedStorageWithOpener returns a storage connection for the given issue ID.
+// If the ID matches a route, it opens a connection to the routed database.
+// The opener function is used to create storage; if nil, an error is returned.
+// Otherwise, it returns nil (caller should use their existing storage).
+//
+// The caller is responsible for closing the returned RoutedStorage.
+func GetRoutedStorageWithOpener(ctx context.Context, id, currentBeadsDir string, opener StorageOpener) (*RoutedStorage, error) {
 	beadsDir, routed, err := ResolveBeadsDirForID(ctx, id, currentBeadsDir)
 	if err != nil {
 		return nil, err
@@ -394,9 +411,16 @@ func GetRoutedStorageForID(ctx context.Context, id, currentBeadsDir string) (*Ro
 		return nil, nil // No routing needed, caller should use existing storage
 	}
 
+	// Check if target is same as current - no need to open a new store
+	if beadsDir == currentBeadsDir {
+		return nil, nil // Same directory, caller should use existing storage
+	}
+
 	// Open storage for the routed directory
-	dbPath := filepath.Join(beadsDir, "beads.db")
-	store, err := sqlite.New(ctx, dbPath)
+	if opener == nil {
+		return nil, fmt.Errorf("no storage opener provided for routed storage (use GetRoutedStorageWithOpener with an explicit opener)")
+	}
+	store, err := opener(ctx, beadsDir)
 	if err != nil {
 		return nil, err
 	}

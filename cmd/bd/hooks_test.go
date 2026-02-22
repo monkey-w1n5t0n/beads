@@ -2,7 +2,6 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -34,12 +33,8 @@ func TestGetEmbeddedHooks(t *testing.T) {
 }
 
 func TestInstallHooks(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := newGitRepo(t)
 	runInDir(t, tmpDir, func() {
-		if err := exec.Command("git", "init").Run(); err != nil {
-			t.Skipf("Skipping test: git init failed: %v", err)
-		}
-
 		gitDirPath, err := git.GetGitDir()
 		if err != nil {
 			t.Fatalf("git.GetGitDir() failed: %v", err)
@@ -77,12 +72,8 @@ func TestInstallHooks(t *testing.T) {
 }
 
 func TestInstallHooksBackup(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := newGitRepo(t)
 	runInDir(t, tmpDir, func() {
-		if err := exec.Command("git", "init").Run(); err != nil {
-			t.Skipf("Skipping test: git init failed: %v", err)
-		}
-
 		gitDirPath, err := git.GetGitDir()
 		if err != nil {
 			t.Fatalf("git.GetGitDir() failed: %v", err)
@@ -123,11 +114,8 @@ func TestInstallHooksBackup(t *testing.T) {
 }
 
 func TestInstallHooksForce(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := newGitRepo(t)
 	runInDir(t, tmpDir, func() {
-		if err := exec.Command("git", "init").Run(); err != nil {
-			t.Skipf("Skipping test: git init failed: %v", err)
-		}
 
 		gitDirPath, err := git.GetGitDir()
 		if err != nil {
@@ -160,11 +148,8 @@ func TestInstallHooksForce(t *testing.T) {
 }
 
 func TestUninstallHooks(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := newGitRepo(t)
 	runInDir(t, tmpDir, func() {
-		if err := exec.Command("git", "init").Run(); err != nil {
-			t.Skipf("Skipping test: git init failed: %v", err)
-		}
 
 		gitDirPath, err := git.GetGitDir()
 		if err != nil {
@@ -194,11 +179,8 @@ func TestUninstallHooks(t *testing.T) {
 }
 
 func TestHooksCheckGitHooks(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := newGitRepo(t)
 	runInDir(t, tmpDir, func() {
-		if err := exec.Command("git", "init").Run(); err != nil {
-			t.Skipf("Skipping test: git init failed: %v", err)
-		}
 
 		statuses := CheckGitHooks()
 		for _, status := range statuses {
@@ -234,11 +216,8 @@ func TestHooksCheckGitHooks(t *testing.T) {
 }
 
 func TestInstallHooksShared(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := newGitRepo(t)
 	runInDir(t, tmpDir, func() {
-		if err := exec.Command("git", "init").Run(); err != nil {
-			t.Skipf("Skipping test: git init failed (git may not be available): %v", err)
-		}
 
 		hooks, err := getEmbeddedHooks()
 		if err != nil {
@@ -284,11 +263,8 @@ func TestInstallHooksShared(t *testing.T) {
 }
 
 func TestInstallHooksChaining(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := newGitRepo(t)
 	runInDir(t, tmpDir, func() {
-		if err := exec.Command("git", "init").Run(); err != nil {
-			t.Skipf("Skipping test: git init failed: %v", err)
-		}
 
 		gitDirPath, err := git.GetGitDir()
 		if err != nil {
@@ -458,4 +434,297 @@ func TestHasBeadsJSONL(t *testing.T) {
 	if !hasBeadsJSONL() {
 		t.Error("hasBeadsJSONL() = false, want true (issues.jsonl exists)")
 	}
+}
+
+// TestInstallHooksChainingSkipsBdShim verifies that bd hooks install --chain
+// does NOT rename existing bd shims to .old (which would cause infinite recursion).
+// See: https://github.com/steveyegge/beads/issues/843
+func TestInstallHooksChainingSkipsBdShim(t *testing.T) {
+	tmpDir := newGitRepo(t)
+	runInDir(t, tmpDir, func() {
+
+		gitDirPath, err := git.GetGitDir()
+		if err != nil {
+			t.Fatalf("git.GetGitDir() failed: %v", err)
+		}
+		gitDir := filepath.Join(gitDirPath, "hooks")
+		if err := os.MkdirAll(gitDir, 0750); err != nil {
+			t.Fatalf("Failed to create hooks directory: %v", err)
+		}
+
+		// Create an existing hook that IS a bd shim
+		existingHook := filepath.Join(gitDir, "pre-commit")
+		shimContent := "#!/bin/sh\n# bd-shim v1\nexec bd hooks run pre-commit \"$@\"\n"
+		if err := os.WriteFile(existingHook, []byte(shimContent), 0755); err != nil {
+			t.Fatalf("Failed to create existing shim hook: %v", err)
+		}
+
+		hooks, err := getEmbeddedHooks()
+		if err != nil {
+			t.Fatalf("getEmbeddedHooks() failed: %v", err)
+		}
+
+		// Install with chain=true
+		if err := installHooks(hooks, false, false, true); err != nil {
+			t.Fatalf("installHooks() with chain=true failed: %v", err)
+		}
+
+		// Verify the shim was NOT renamed to .old (would cause infinite loop)
+		oldPath := existingHook + ".old"
+		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+			t.Errorf("bd shim was renamed to .old - this would cause infinite recursion!")
+		}
+
+		// Verify new hook was installed (overwrote the shim)
+		if _, err := os.Stat(existingHook); os.IsNotExist(err) {
+			t.Errorf("New pre-commit hook was not installed")
+		}
+	})
+}
+
+// TestRunChainedHookSkipsBdShim verifies that runChainedHook() skips
+// .old hooks that are bd shims (to prevent infinite recursion).
+// See: https://github.com/steveyegge/beads/issues/843
+func TestRunChainedHookSkipsBdShim(t *testing.T) {
+	tmpDir := newGitRepo(t)
+	runInDir(t, tmpDir, func() {
+
+		gitDirPath, err := git.GetGitDir()
+		if err != nil {
+			t.Fatalf("git.GetGitDir() failed: %v", err)
+		}
+		gitDir := filepath.Join(gitDirPath, "hooks")
+		if err := os.MkdirAll(gitDir, 0750); err != nil {
+			t.Fatalf("Failed to create hooks directory: %v", err)
+		}
+
+		// Create a .old hook that IS a bd shim (simulating the problematic state)
+		oldHook := filepath.Join(gitDir, "pre-commit.old")
+		shimContent := "#!/bin/sh\n# bd-shim v1\nexec bd hooks run pre-commit \"$@\"\n"
+		if err := os.WriteFile(oldHook, []byte(shimContent), 0755); err != nil {
+			t.Fatalf("Failed to create .old shim hook: %v", err)
+		}
+
+		// runChainedHook should return 0 (skip the shim) instead of executing it
+		exitCode := runChainedHook("pre-commit", nil)
+		if exitCode != 0 {
+			t.Errorf("runChainedHook() = %d, want 0 (should skip bd shim)", exitCode)
+		}
+	})
+}
+
+// TestGetHookVersionRecognizesInlineHooks verifies that getHookVersion()
+// correctly identifies inline bd hooks created by bd init.
+// See: https://github.com/steveyegge/beads/issues/1120
+func TestGetHookVersionRecognizesInlineHooks(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Test inline hook from bd init
+	inlineHook := filepath.Join(tmpDir, "pre-commit")
+	inlineContent := `#!/bin/sh
+#
+# bd (beads) pre-commit hook (chained)
+#
+# This hook chains bd functionality with your existing pre-commit hook.
+
+if ! command -v bd >/dev/null 2>&1; then
+    echo "Warning: bd command not found" >&2
+    exit 0
+fi
+
+bd sync --flush-only
+`
+	if err := os.WriteFile(inlineHook, []byte(inlineContent), 0755); err != nil {
+		t.Fatalf("Failed to create inline hook: %v", err)
+	}
+
+	info, err := getHookVersion(inlineHook)
+	if err != nil {
+		t.Fatalf("getHookVersion() failed: %v", err)
+	}
+
+	if !info.IsBdHook {
+		t.Error("getHookVersion() IsBdHook = false, want true for inline bd hook")
+	}
+	if info.IsShim {
+		t.Error("getHookVersion() IsShim = true, want false for inline bd hook")
+	}
+
+	// Test shim hook (should also be recognized as IsBdHook)
+	shimHook := filepath.Join(tmpDir, "pre-commit-shim")
+	shimContent := "#!/bin/sh\n# bd-shim v1\nexec bd hooks run pre-commit \"$@\"\n"
+	if err := os.WriteFile(shimHook, []byte(shimContent), 0755); err != nil {
+		t.Fatalf("Failed to create shim hook: %v", err)
+	}
+
+	info, err = getHookVersion(shimHook)
+	if err != nil {
+		t.Fatalf("getHookVersion() failed: %v", err)
+	}
+
+	if !info.IsBdHook {
+		t.Error("getHookVersion() IsBdHook = false, want true for shim")
+	}
+	if !info.IsShim {
+		t.Error("getHookVersion() IsShim = false, want true for shim")
+	}
+
+	// Test non-bd hook
+	userHook := filepath.Join(tmpDir, "pre-commit-user")
+	userContent := "#!/bin/sh\necho 'User hook'\n"
+	if err := os.WriteFile(userHook, []byte(userContent), 0755); err != nil {
+		t.Fatalf("Failed to create user hook: %v", err)
+	}
+
+	info, err = getHookVersion(userHook)
+	if err != nil {
+		t.Fatalf("getHookVersion() failed: %v", err)
+	}
+
+	if info.IsBdHook {
+		t.Error("getHookVersion() IsBdHook = true, want false for user hook")
+	}
+}
+
+// TestInstallHooksChainingSkipsInlineHook verifies that bd hooks install --chain
+// does NOT rename existing inline bd hooks to .old (which would destroy user's original).
+// See: https://github.com/steveyegge/beads/issues/1120
+func TestInstallHooksChainingSkipsInlineHook(t *testing.T) {
+	tmpDir := newGitRepo(t)
+	runInDir(t, tmpDir, func() {
+
+		gitDirPath, err := git.GetGitDir()
+		if err != nil {
+			t.Fatalf("git.GetGitDir() failed: %v", err)
+		}
+		gitDir := filepath.Join(gitDirPath, "hooks")
+		if err := os.MkdirAll(gitDir, 0750); err != nil {
+			t.Fatalf("Failed to create hooks directory: %v", err)
+		}
+
+		// Create an existing hook that IS an inline bd hook (from bd init)
+		existingHook := filepath.Join(gitDir, "pre-commit")
+		inlineContent := `#!/bin/sh
+#
+# bd (beads) pre-commit hook (chained)
+#
+bd sync --flush-only
+`
+		if err := os.WriteFile(existingHook, []byte(inlineContent), 0755); err != nil {
+			t.Fatalf("Failed to create existing inline hook: %v", err)
+		}
+
+		hooks, err := getEmbeddedHooks()
+		if err != nil {
+			t.Fatalf("getEmbeddedHooks() failed: %v", err)
+		}
+
+		// Install with chain=true
+		if err := installHooks(hooks, false, false, true); err != nil {
+			t.Fatalf("installHooks() with chain=true failed: %v", err)
+		}
+
+		// Verify the inline hook was NOT renamed to .old (would destroy user's original)
+		oldPath := existingHook + ".old"
+		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+			t.Errorf("inline bd hook was renamed to .old - this would destroy user's original hook!")
+		}
+
+		// Verify new hook was installed (overwrote the inline hook)
+		if _, err := os.Stat(existingHook); os.IsNotExist(err) {
+			t.Errorf("New pre-commit hook was not installed")
+		}
+	})
+}
+
+// TestInstallHooksChainingPreservesExistingOld verifies that bd hooks install --chain
+// does NOT overwrite an existing .old file (which would destroy user's original hook).
+// See: https://github.com/steveyegge/beads/issues/1120
+func TestInstallHooksChainingPreservesExistingOld(t *testing.T) {
+	tmpDir := newGitRepo(t)
+	runInDir(t, tmpDir, func() {
+
+		gitDirPath, err := git.GetGitDir()
+		if err != nil {
+			t.Fatalf("git.GetGitDir() failed: %v", err)
+		}
+		gitDir := filepath.Join(gitDirPath, "hooks")
+		if err := os.MkdirAll(gitDir, 0750); err != nil {
+			t.Fatalf("Failed to create hooks directory: %v", err)
+		}
+
+		// Create the user's original hook as .old (simulating bd init already ran)
+		originalHook := filepath.Join(gitDir, "pre-commit.old")
+		originalContent := "#!/bin/sh\necho 'User original hook'\n"
+		if err := os.WriteFile(originalHook, []byte(originalContent), 0755); err != nil {
+			t.Fatalf("Failed to create original .old hook: %v", err)
+		}
+
+		// Create a current hook that is NOT a bd hook (e.g., user modified it)
+		currentHook := filepath.Join(gitDir, "pre-commit")
+		currentContent := "#!/bin/sh\necho 'Some other hook'\n"
+		if err := os.WriteFile(currentHook, []byte(currentContent), 0755); err != nil {
+			t.Fatalf("Failed to create current hook: %v", err)
+		}
+
+		hooks, err := getEmbeddedHooks()
+		if err != nil {
+			t.Fatalf("getEmbeddedHooks() failed: %v", err)
+		}
+
+		// Install with chain=true
+		if err := installHooks(hooks, false, false, true); err != nil {
+			t.Fatalf("installHooks() with chain=true failed: %v", err)
+		}
+
+		// Verify the original .old was preserved (not overwritten)
+		preservedContent, err := os.ReadFile(originalHook)
+		if err != nil {
+			t.Fatalf("Failed to read preserved .old hook: %v", err)
+		}
+		if string(preservedContent) != originalContent {
+			t.Errorf(".old hook was overwritten! got %q, want %q", string(preservedContent), originalContent)
+		}
+
+		// Verify new hook was installed
+		if _, err := os.Stat(currentHook); os.IsNotExist(err) {
+			t.Errorf("New pre-commit hook was not installed")
+		}
+	})
+}
+
+// TestRunChainedHookSkipsInlineHook verifies that runChainedHook() skips
+// .old hooks that are inline bd hooks (to prevent recursion).
+// See: https://github.com/steveyegge/beads/issues/1120
+func TestRunChainedHookSkipsInlineHook(t *testing.T) {
+	tmpDir := newGitRepo(t)
+	runInDir(t, tmpDir, func() {
+
+		gitDirPath, err := git.GetGitDir()
+		if err != nil {
+			t.Fatalf("git.GetGitDir() failed: %v", err)
+		}
+		gitDir := filepath.Join(gitDirPath, "hooks")
+		if err := os.MkdirAll(gitDir, 0750); err != nil {
+			t.Fatalf("Failed to create hooks directory: %v", err)
+		}
+
+		// Create a .old hook that IS an inline bd hook
+		oldHook := filepath.Join(gitDir, "pre-commit.old")
+		inlineContent := `#!/bin/sh
+#
+# bd (beads) pre-commit hook (chained)
+#
+bd sync --flush-only
+`
+		if err := os.WriteFile(oldHook, []byte(inlineContent), 0755); err != nil {
+			t.Fatalf("Failed to create .old inline hook: %v", err)
+		}
+
+		// runChainedHook should return 0 (skip the inline hook) instead of executing it
+		exitCode := runChainedHook("pre-commit", nil)
+		if exitCode != 0 {
+			t.Errorf("runChainedHook() = %d, want 0 (should skip inline bd hook)", exitCode)
+		}
+	})
 }

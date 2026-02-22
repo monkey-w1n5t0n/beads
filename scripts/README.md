@@ -47,7 +47,7 @@ This master script automates the **entire release process**:
 - All changes committed
 - golangci-lint installed
 - Homebrew installed (for local upgrade)
-- Push access to steveyegge/beads and steveyegge/homebrew-beads
+- Push access to steveyegge/beads
 
 ### Output
 
@@ -62,7 +62,7 @@ The script provides colorful, step-by-step progress output:
 After the script finishes:
 - GitHub Actions builds binaries for all platforms (~5 minutes)
 - PyPI package is published automatically
-- Users can `brew upgrade bd` to get the new version
+- Users can `brew upgrade beads` to get the new version
 - GitHub Release is created with binaries and changelog
 
 ---
@@ -88,7 +88,7 @@ Bumps the version number across all beads components in a single command.
 
 Updates version in all these files:
 - `cmd/bd/version.go` - bd CLI version constant
-- `.claude-plugin/plugin.json` - Plugin version
+- `claude-plugin/.claude-plugin/plugin.json` - Plugin version
 - `.claude-plugin/marketplace.json` - Marketplace plugin version
 - `integrations/beads-mcp/pyproject.toml` - MCP server version
 - `README.md` - Alpha status version
@@ -125,65 +125,6 @@ Previously, version bumps only updated `cmd/bd/version.go`, leaving other compon
 - Validates version format before making any changes
 - Verifies all versions match after update
 - Shows diff for review before commit
-
----
-
-## update-homebrew.sh
-
-Automatically updates the Homebrew formula with GoReleaser release artifacts.
-
-### Usage
-
-```bash
-# Update formula after pushing git tag
-./scripts/update-homebrew.sh 0.9.3
-
-# Use custom tap directory
-TAP_DIR=~/homebrew-beads ./scripts/update-homebrew.sh 0.9.3
-```
-
-### What It Does
-
-This script automates the Homebrew formula update process:
-
-1. **Waits** for GitHub Actions release build (~5 minutes, checks every 30s)
-2. **Downloads** checksums.txt from the GitHub release
-3. **Extracts** SHA256s for all platform-specific binaries:
-   - macOS ARM64 (Apple Silicon)
-   - macOS AMD64 (Intel)
-   - Linux AMD64
-   - Linux ARM64
-4. **Clones/updates** the homebrew-beads tap repository
-5. **Updates** Formula/bd.rb with new version and all SHA256s
-6. **Commits and pushes** the changes
-
-### Important Notes
-
-- **Run AFTER pushing the git tag** - the script waits for GitHub Actions to finish
-- **Uses GoReleaser artifacts**, not source tarballs (fixed in v0.23.0)
-- **Automatically waits** up to 7.5 minutes for release build to complete
-- **Updates all platforms** in a single operation
-
-### Examples
-
-```bash
-# Standard usage (after git tag push)
-git tag v0.9.3 && git push origin v0.9.3
-./scripts/update-homebrew.sh 0.9.3
-
-# Custom tap directory
-TAP_DIR=/path/to/homebrew-beads ./scripts/update-homebrew.sh 0.9.3
-```
-
-### Why This Script Exists
-
-Previously, the Homebrew formula update was manual and error-prone:
-- Used source tarball SHA256 instead of GoReleaser artifacts (wrong!)
-- Required manually computing 4 separate SHA256s
-- Easy to forget updating all platforms
-- No automation for waiting on GitHub Actions
-
-This script fixes all those issues and is now used by `release.sh`.
 
 ---
 

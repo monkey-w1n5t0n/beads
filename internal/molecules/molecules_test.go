@@ -1,3 +1,5 @@
+//go:build cgo
+
 package molecules
 
 import (
@@ -6,7 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -69,8 +72,7 @@ func TestLoader_LoadAll(t *testing.T) {
 	}
 
 	// Create a test database
-	dbPath := filepath.Join(beadsDir, "test.db")
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: t.TempDir()})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -79,6 +81,11 @@ func TestLoader_LoadAll(t *testing.T) {
 	// Set issue prefix (required by storage)
 	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
 		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Configure custom types for Gas Town types (bd-find4)
+	if err := store.SetConfig(ctx, "types.custom", "molecule"); err != nil {
+		t.Fatalf("Failed to set types.custom: %v", err)
 	}
 
 	// Create a project-level molecules.jsonl
@@ -138,8 +145,7 @@ func TestLoader_SkipExistingMolecules(t *testing.T) {
 	}
 
 	// Create a test database
-	dbPath := filepath.Join(beadsDir, "test.db")
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: t.TempDir()})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -150,15 +156,20 @@ func TestLoader_SkipExistingMolecules(t *testing.T) {
 		t.Fatalf("Failed to set prefix: %v", err)
 	}
 
+	// Configure custom types for Gas Town types (bd-find4)
+	if err := store.SetConfig(ctx, "types.custom", "molecule"); err != nil {
+		t.Fatalf("Failed to set types.custom: %v", err)
+	}
+
 	// Pre-create a molecule in the database (skip prefix validation for mol-* IDs)
 	existingMol := &types.Issue{
 		ID:         "mol-existing",
 		Title:      "Existing Molecule",
-		IssueType:  types.TypeMolecule,
+		IssueType:  "molecule",
 		Status:     types.StatusOpen,
 		IsTemplate: true,
 	}
-	opts := sqlite.BatchCreateOptions{SkipPrefixValidation: true}
+	opts := storage.BatchCreateOptions{SkipPrefixValidation: true, OrphanHandling: storage.OrphanAllow}
 	if err := store.CreateIssuesWithFullOptions(ctx, []*types.Issue{existingMol}, "test", opts); err != nil {
 		t.Fatalf("Failed to create existing molecule: %v", err)
 	}

@@ -3,13 +3,20 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/syncbranch"
 )
+
+// gitSSHRemotePattern matches standard git SSH remote URLs (user@host:path)
+var gitSSHRemotePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+@[a-zA-Z0-9][a-zA-Z0-9._-]*:.+$`)
 
 var configCmd = &cobra.Command{
 	Use:     "config",
@@ -53,7 +60,7 @@ var configSetCmd = &cobra.Command{
 		key := args[0]
 		value := args[1]
 
-		// Check if this is a yaml-only key (startup settings like no-db, no-daemon, etc.)
+		// Check if this is a yaml-only key (startup settings like no-db, etc.)
 		// These must be written to config.yaml, not SQLite, because they're read
 		// before the database is opened. (GH#536)
 		if config.IsYamlOnlyKey(key) {
@@ -74,6 +81,31 @@ var configSetCmd = &cobra.Command{
 			return
 		}
 
+		// beads.role is stored in git config, not SQLite (GH#1531).
+		// bd doctor reads it from git config, so we write there for consistency.
+		if key == "beads.role" {
+			validRoles := map[string]bool{"maintainer": true, "contributor": true}
+			if !validRoles[value] {
+				fmt.Fprintf(os.Stderr, "Error: invalid role %q (valid values: maintainer, contributor)\n", value)
+				os.Exit(1)
+			}
+			cmd := exec.Command("git", "config", "beads.role", value) //nolint:gosec // value is validated against allowlist above
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error setting beads.role in git config: %v\n", err)
+				os.Exit(1)
+			}
+			if jsonOutput {
+				outputJSON(map[string]interface{}{
+					"key":      key,
+					"value":    value,
+					"location": "git config",
+				})
+			} else {
+				fmt.Printf("Set %s = %s (in git config)\n", key, value)
+			}
+			return
+		}
+
 		// Database-stored config requires direct mode
 		if err := ensureDirectMode("config set requires direct database access"); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -82,17 +114,9 @@ var configSetCmd = &cobra.Command{
 
 		ctx := rootCtx
 
-		// Special handling for sync.branch to apply validation
-		if strings.TrimSpace(key) == syncbranch.ConfigKey {
-			if err := syncbranch.Set(ctx, store, value); err != nil {
-				fmt.Fprintf(os.Stderr, "Error setting config: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			if err := store.SetConfig(ctx, key, value); err != nil {
-				fmt.Fprintf(os.Stderr, "Error setting config: %v\n", err)
-				os.Exit(1)
-			}
+		if err := store.SetConfig(ctx, key, value); err != nil {
+			fmt.Fprintf(os.Stderr, "Error setting config: %v\n", err)
+			os.Exit(1)
 		}
 
 		if jsonOutput {
@@ -134,6 +158,30 @@ var configGetCmd = &cobra.Command{
 			return
 		}
 
+		// beads.role is stored in git config, not SQLite (GH#1531).
+		if key == "beads.role" {
+			cmd := exec.Command("git", "config", "--get", "beads.role")
+			output, err := cmd.Output()
+			value := strings.TrimSpace(string(output))
+			if err != nil {
+				value = ""
+			}
+			if jsonOutput {
+				outputJSON(map[string]interface{}{
+					"key":      key,
+					"value":    value,
+					"location": "git config",
+				})
+			} else {
+				if value == "" {
+					fmt.Printf("%s (not set in git config)\n", key)
+				} else {
+					fmt.Printf("%s\n", value)
+				}
+			}
+			return
+		}
+
 		// Database-stored config requires direct mode
 		if err := ensureDirectMode("config get requires direct database access"); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -144,12 +192,7 @@ var configGetCmd = &cobra.Command{
 		var value string
 		var err error
 
-		// Special handling for sync.branch to support env var override
-		if strings.TrimSpace(key) == syncbranch.ConfigKey {
-			value, err = syncbranch.Get(ctx, store)
-		} else {
-			value, err = store.GetConfig(ctx, key)
-		}
+		value, err = store.GetConfig(ctx, key)
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error getting config: %v\n", err)
@@ -222,14 +265,6 @@ var configListCmd = &cobra.Command{
 func showConfigYAMLOverrides(dbConfig map[string]string) {
 	var overrides []string
 
-	// Check sync.branch - can be overridden by BEADS_SYNC_BRANCH env var or config.yaml sync-branch
-	if dbSyncBranch, ok := dbConfig[syncbranch.ConfigKey]; ok && dbSyncBranch != "" {
-		effectiveBranch := syncbranch.GetFromYAML()
-		if effectiveBranch != "" && effectiveBranch != dbSyncBranch {
-			overrides = append(overrides, fmt.Sprintf("  sync.branch: database has '%s' but effective value is '%s' (from config.yaml or env)", dbSyncBranch, effectiveBranch))
-		}
-	}
-
 	if len(overrides) > 0 {
 		fmt.Println("\n⚠️  Config overrides (higher priority sources):")
 		for _, o := range overrides {
@@ -268,10 +303,192 @@ var configUnsetCmd = &cobra.Command{
 	},
 }
 
+var configValidateCmd = &cobra.Command{
+	Use:   "validate",
+	Short: "Validate sync-related configuration",
+	Long: `Validate sync-related configuration settings.
+
+Checks:
+  - sync.mode is a valid value (local, git-branch, external)
+  - conflict.strategy is valid (lww, manual, ours, theirs)
+  - federation.sovereignty is valid (if set)
+  - federation.remote is set when sync.mode requires it
+  - Remote URL format is valid (dolthub://, gs://, s3://, file://)
+  - sync.branch is a valid git branch name
+  - routing.mode is valid (auto, maintainer, contributor, explicit)
+
+Examples:
+  bd config validate
+  bd config validate --json`,
+	Run: func(cmd *cobra.Command, args []string) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Find repo root by walking up to find .beads directory
+		repoPath := findBeadsRepoRoot(cwd)
+		if repoPath == "" {
+			fmt.Fprintf(os.Stderr, "Error: not in a beads repository (no .beads directory found)\n")
+			os.Exit(1)
+		}
+
+		// Run the existing doctor config values check
+		doctorCheck := doctor.CheckConfigValues(repoPath)
+
+		// Run additional sync-related validations
+		syncIssues := validateSyncConfig(repoPath)
+
+		// Combine results
+		allIssues := []string{}
+		if doctorCheck.Detail != "" {
+			allIssues = append(allIssues, strings.Split(doctorCheck.Detail, "\n")...)
+		}
+		allIssues = append(allIssues, syncIssues...)
+
+		// Output results
+		if jsonOutput {
+			result := map[string]interface{}{
+				"valid":  len(allIssues) == 0,
+				"issues": allIssues,
+			}
+			outputJSON(result)
+			return
+		}
+
+		if len(allIssues) == 0 {
+			fmt.Println("✓ All sync-related configuration is valid")
+			return
+		}
+
+		fmt.Println("Configuration validation found issues:")
+		for _, issue := range allIssues {
+			if issue != "" {
+				fmt.Printf("  • %s\n", issue)
+			}
+		}
+		fmt.Println("\nRun 'bd config set <key> <value>' to fix configuration issues.")
+		os.Exit(1)
+	},
+}
+
+// validateSyncConfig performs additional sync-related config validation
+// beyond what doctor.CheckConfigValues covers.
+func validateSyncConfig(repoPath string) []string {
+	var issues []string
+
+	// Load config.yaml directly from the repo path
+	configPath := filepath.Join(repoPath, ".beads", "config.yaml")
+	v := viper.New()
+	v.SetConfigType("yaml")
+	v.SetConfigFile(configPath)
+
+	// Try to read config, but don't error if it doesn't exist
+	if err := v.ReadInConfig(); err != nil {
+		// Config file doesn't exist or is unreadable - nothing to validate
+		return issues
+	}
+
+	// Get config from yaml
+	syncMode := v.GetString("sync.mode")
+	conflictStrategy := v.GetString("conflict.strategy")
+	federationSov := v.GetString("federation.sovereignty")
+	federationRemote := v.GetString("federation.remote")
+
+	// Validate sync.mode
+	validSyncModes := map[string]bool{
+		"":           true, // not set is valid (uses default)
+		"local":      true,
+		"git-branch": true,
+		"external":   true,
+	}
+	if syncMode != "" && !validSyncModes[syncMode] {
+		issues = append(issues, fmt.Sprintf("sync.mode: %q is invalid (valid values: local, git-branch, external)", syncMode))
+	}
+
+	// Validate conflict.strategy
+	validConflictStrategies := map[string]bool{
+		"":       true, // not set is valid (uses default lww)
+		"lww":    true, // last-write-wins (default)
+		"manual": true, // require manual resolution
+		"ours":   true, // prefer local changes
+		"theirs": true, // prefer remote changes
+	}
+	if conflictStrategy != "" && !validConflictStrategies[conflictStrategy] {
+		issues = append(issues, fmt.Sprintf("conflict.strategy: %q is invalid (valid values: lww, manual, ours, theirs)", conflictStrategy))
+	}
+
+	// Validate federation.sovereignty
+	validSovereignties := map[string]bool{
+		"":          true, // not set is valid
+		"none":      true, // no sovereignty restrictions
+		"isolated":  true, // fully isolated, no federation
+		"federated": true, // participates in federation
+	}
+	if federationSov != "" && !validSovereignties[federationSov] {
+		issues = append(issues, fmt.Sprintf("federation.sovereignty: %q is invalid (valid values: none, isolated, federated)", federationSov))
+	}
+
+	// Validate federation.remote when required
+	if syncMode == "external" && federationRemote == "" {
+		issues = append(issues, "federation.remote: required when sync.mode is 'external'")
+	}
+
+	// Validate remote URL format
+	if federationRemote != "" {
+		if !isValidRemoteURL(federationRemote) {
+			issues = append(issues, fmt.Sprintf("federation.remote: %q is not a valid remote URL (expected dolthub://, gs://, s3://, file://, or standard git URL)", federationRemote))
+		}
+	}
+
+	return issues
+}
+
+// isValidRemoteURL validates remote URL formats for sync configuration
+func isValidRemoteURL(url string) bool {
+	// Valid URL schemes for beads remotes
+	validSchemes := []string{
+		"dolthub://",
+		"gs://",
+		"s3://",
+		"file://",
+		"https://",
+		"http://",
+		"ssh://",
+	}
+
+	for _, scheme := range validSchemes {
+		if strings.HasPrefix(url, scheme) {
+			return true
+		}
+	}
+
+	// Also allow standard git remote patterns (user@host:path)
+	return gitSSHRemotePattern.MatchString(url)
+}
+
+// findBeadsRepoRoot walks up from the given path to find the repo root (containing .beads)
+func findBeadsRepoRoot(startPath string) string {
+	path := startPath
+	for {
+		beadsDir := filepath.Join(path, ".beads")
+		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+			return path
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return ""
+		}
+		path = parent
+	}
+}
+
 func init() {
 	configCmd.AddCommand(configSetCmd)
 	configCmd.AddCommand(configGetCmd)
 	configCmd.AddCommand(configListCmd)
 	configCmd.AddCommand(configUnsetCmd)
+	configCmd.AddCommand(configValidateCmd)
 	rootCmd.AddCommand(configCmd)
 }

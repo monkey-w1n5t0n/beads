@@ -55,12 +55,7 @@ func runPour(cmd *cobra.Command, args []string) {
 
 	// Pour requires direct store access for cloning
 	if store == nil {
-		if daemonClient != nil {
-			fmt.Fprintf(os.Stderr, "Error: pour requires direct database access\n")
-			fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon pour %s ...\n", args[0])
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		}
+		fmt.Fprintf(os.Stderr, "Error: no database connection\n")
 		os.Exit(1)
 	}
 
@@ -226,8 +221,8 @@ func runPour(cmd *cobra.Command, args []string) {
 	}
 
 	// Spawn as persistent mol (ephemeral=false)
-	// Use "mol" prefix for distinct visual recognition
-	result, err := spawnMolecule(ctx, store, subgraph, vars, assignee, actor, false, "mol")
+	// Use mol prefix for distinct visual recognition (see types.IDPrefixMol)
+	result, err := spawnMolecule(ctx, store, subgraph, vars, assignee, actor, false, types.IDPrefixMol)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error pouring proto: %v\n", err)
 		os.Exit(1)
@@ -252,9 +247,6 @@ func runPour(cmd *cobra.Command, args []string) {
 			totalAttached += bondResult.Spawned
 		}
 	}
-
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
 
 	if jsonOutput {
 		type pourResult struct {

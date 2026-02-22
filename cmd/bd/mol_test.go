@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -5,7 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/formula"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -213,7 +216,7 @@ func TestMinPriority(t *testing.T) {
 func TestBondProtoProto(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -289,7 +292,7 @@ func TestBondProtoProto(t *testing.T) {
 func TestBondProtoMol(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -362,7 +365,7 @@ func TestBondProtoMol(t *testing.T) {
 func TestBondMolMol(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -462,7 +465,7 @@ func TestBondMolMol(t *testing.T) {
 func TestSquashMolecule(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -489,7 +492,7 @@ func TestSquashMolecule(t *testing.T) {
 		Status:      types.StatusClosed,
 		Priority:    2,
 		IssueType:   types.TypeTask,
-		Ephemeral:        true,
+		Ephemeral:   true,
 		CloseReason: "Completed design",
 	}
 	child2 := &types.Issue{
@@ -498,7 +501,7 @@ func TestSquashMolecule(t *testing.T) {
 		Status:      types.StatusClosed,
 		Priority:    2,
 		IssueType:   types.TypeTask,
-		Ephemeral:        true,
+		Ephemeral:   true,
 		CloseReason: "Code merged",
 	}
 
@@ -570,7 +573,7 @@ func TestSquashMolecule(t *testing.T) {
 func TestSquashMoleculeWithDelete(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -595,7 +598,7 @@ func TestSquashMoleculeWithDelete(t *testing.T) {
 		Status:    types.StatusClosed,
 		Priority:  2,
 		IssueType: types.TypeTask,
-		Ephemeral:      true,
+		Ephemeral: true,
 	}
 	if err := s.CreateIssue(ctx, child, "test"); err != nil {
 		t.Fatalf("Failed to create child: %v", err)
@@ -679,7 +682,7 @@ func TestGenerateDigest(t *testing.T) {
 func TestSquashMoleculeWithAgentSummary(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -705,7 +708,7 @@ func TestSquashMoleculeWithAgentSummary(t *testing.T) {
 		Status:      types.StatusClosed,
 		Priority:    2,
 		IssueType:   types.TypeTask,
-		Ephemeral:        true,
+		Ephemeral:   true,
 		CloseReason: "Done",
 	}
 	if err := s.CreateIssue(ctx, child, "test"); err != nil {
@@ -750,7 +753,7 @@ func TestSquashMoleculeWithAgentSummary(t *testing.T) {
 func TestSpawnWithBasicAttach(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -883,7 +886,7 @@ func TestSpawnWithBasicAttach(t *testing.T) {
 func TestSpawnWithMultipleAttachments(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -1001,7 +1004,7 @@ func TestSpawnWithMultipleAttachments(t *testing.T) {
 func TestSpawnAttachTypes(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -1121,7 +1124,7 @@ func TestSpawnAttachNonProtoError(t *testing.T) {
 func TestSpawnVariableAggregation(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -1289,7 +1292,7 @@ func TestSpawnAttachDryRunOutput(t *testing.T) {
 func TestWispFilteringFromExport(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -1304,14 +1307,14 @@ func TestWispFilteringFromExport(t *testing.T) {
 		Status:    types.StatusOpen,
 		Priority:  1,
 		IssueType: types.TypeTask,
-		Ephemeral:      false,
+		Ephemeral: false,
 	}
 	wispIssue := &types.Issue{
 		Title:     "Wisp Issue",
 		Status:    types.StatusOpen,
 		Priority:  2,
 		IssueType: types.TypeTask,
-		Ephemeral:      true,
+		Ephemeral: true,
 	}
 
 	if err := s.CreateIssue(ctx, normalIssue, "test"); err != nil {
@@ -1355,7 +1358,7 @@ func TestWispFilteringFromExport(t *testing.T) {
 func TestGetMoleculeProgress(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -1456,7 +1459,7 @@ func TestGetMoleculeProgress(t *testing.T) {
 func TestFindParentMolecule(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -1549,11 +1552,94 @@ func TestFindParentMolecule(t *testing.T) {
 	}
 }
 
+// TestFindHookedMolecules tests finding molecules bonded to hooked issues
+func TestFindHookedMolecules(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir() + "/test.db"
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer s.Close()
+	if err := s.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set config: %v", err)
+	}
+
+	// Create molecule root (epic)
+	molecule := &types.Issue{
+		Title:     "Test Molecule",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeEpic,
+	}
+	if err := s.CreateIssue(ctx, molecule, "test"); err != nil {
+		t.Fatalf("Failed to create molecule: %v", err)
+	}
+
+	// Create step as child of molecule
+	step := &types.Issue{
+		Title:     "Step 1",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	if err := s.CreateIssue(ctx, step, "test"); err != nil {
+		t.Fatalf("Failed to create step: %v", err)
+	}
+	if err := s.AddDependency(ctx, &types.Dependency{
+		IssueID:     step.ID,
+		DependsOnID: molecule.ID,
+		Type:        types.DepParentChild,
+	}, "test"); err != nil {
+		t.Fatalf("Failed to add parent-child: %v", err)
+	}
+
+	// Create hooked issue with blocks dependency on molecule
+	hookedIssue := &types.Issue{
+		Title:     "Hooked Work",
+		Status:    types.StatusHooked,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Assignee:  "test-agent",
+	}
+	if err := s.CreateIssue(ctx, hookedIssue, "test"); err != nil {
+		t.Fatalf("Failed to create hooked issue: %v", err)
+	}
+	if err := s.AddDependency(ctx, &types.Dependency{
+		IssueID:     hookedIssue.ID,
+		DependsOnID: molecule.ID,
+		Type:        types.DepBlocks,
+	}, "test"); err != nil {
+		t.Fatalf("Failed to add blocks dependency: %v", err)
+	}
+
+	// Test: findHookedMolecules should find the molecule for this agent
+	molecules := findHookedMolecules(ctx, s, "test-agent")
+	if len(molecules) != 1 {
+		t.Fatalf("findHookedMolecules() got %d molecules, want 1", len(molecules))
+	}
+	if molecules[0].MoleculeID != molecule.ID {
+		t.Errorf("findHookedMolecules() got molecule %q, want %q", molecules[0].MoleculeID, molecule.ID)
+	}
+
+	// Test: different agent should not find the molecule
+	molecules = findHookedMolecules(ctx, s, "other-agent")
+	if len(molecules) != 0 {
+		t.Errorf("findHookedMolecules(other-agent) got %d molecules, want 0", len(molecules))
+	}
+
+	// Test: no agent filter should find the molecule
+	molecules = findHookedMolecules(ctx, s, "")
+	if len(molecules) != 1 {
+		t.Errorf("findHookedMolecules('') got %d molecules, want 1", len(molecules))
+	}
+}
+
 // TestAdvanceToNextStep tests auto-advancing to next step
 func TestAdvanceToNextStep(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -1655,7 +1741,7 @@ func TestAdvanceToNextStep(t *testing.T) {
 func TestAdvanceToNextStepMoleculeComplete(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -1713,7 +1799,7 @@ func TestAdvanceToNextStepMoleculeComplete(t *testing.T) {
 func TestAdvanceToNextStepOrphanIssue(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -1903,7 +1989,7 @@ func TestGetRelativeID(t *testing.T) {
 func TestBondProtoMolWithRef(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -1993,7 +2079,7 @@ func TestBondProtoMolWithRef(t *testing.T) {
 func TestBondProtoMolMultipleArms(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -2370,7 +2456,7 @@ func TestCalculateBlockingDepths(t *testing.T) {
 func TestSpawnMoleculeEphemeralFlag(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -2381,17 +2467,17 @@ func TestSpawnMoleculeEphemeralFlag(t *testing.T) {
 
 	// Create a template with a child (IDs will be auto-generated)
 	root := &types.Issue{
-		Title:      "Template Epic",
-		Status:     types.StatusOpen,
-		Priority:   2,
-		IssueType:  types.TypeEpic,
-		Labels:     []string{MoleculeLabel}, // Required for loadTemplateSubgraph
+		Title:     "Template Epic",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeEpic,
+		Labels:    []string{MoleculeLabel}, // Required for loadTemplateSubgraph
 	}
 	child := &types.Issue{
-		Title:      "Template Task",
-		Status:     types.StatusOpen,
-		Priority:   2,
-		IssueType:  types.TypeTask,
+		Title:     "Template Task",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
 	}
 
 	if err := s.CreateIssue(ctx, root, "test"); err != nil {
@@ -2417,7 +2503,7 @@ func TestSpawnMoleculeEphemeralFlag(t *testing.T) {
 	}
 
 	// Spawn with ephemeral=true
-	result, err := spawnMolecule(ctx, s, subgraph, nil, "", "test", true, "eph")
+	result, err := spawnMolecule(ctx, s, subgraph, nil, "", "test", true, "wisp")
 	if err != nil {
 		t.Fatalf("spawnMolecule failed: %v", err)
 	}
@@ -2435,8 +2521,8 @@ func TestSpawnMoleculeEphemeralFlag(t *testing.T) {
 
 	// Verify spawned issues have the correct prefix
 	for _, newID := range result.IDMapping {
-		if !strings.HasPrefix(newID, "test-eph-") {
-			t.Errorf("Spawned issue ID %s should have prefix 'test-eph-'", newID)
+		if !strings.HasPrefix(newID, "test-wisp-") {
+			t.Errorf("Spawned issue ID %s should have prefix 'test-wisp-'", newID)
 		}
 	}
 }
@@ -2446,7 +2532,7 @@ func TestSpawnMoleculeEphemeralFlag(t *testing.T) {
 func TestSpawnMoleculeFromFormulaEphemeral(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
-	s, err := sqlite.New(ctx, dbPath)
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -2457,22 +2543,22 @@ func TestSpawnMoleculeFromFormulaEphemeral(t *testing.T) {
 
 	// Create a minimal in-memory subgraph (simulating cookFormulaToSubgraph output)
 	root := &types.Issue{
-		ID:          "test-formula",
-		Title:       "Test Formula",
-		Status:      types.StatusOpen,
-		Priority:    2,
-		IssueType:   types.TypeEpic,
-		IsTemplate:  true,
+		ID:         "test-formula",
+		Title:      "Test Formula",
+		Status:     types.StatusOpen,
+		Priority:   2,
+		IssueType:  types.TypeEpic,
+		IsTemplate: true,
 	}
 	step := &types.Issue{
-		ID:          "test-formula.step1",
-		Title:       "Step 1",
-		Status:      types.StatusOpen,
-		Priority:    2,
-		IssueType:   types.TypeTask,
-		IsTemplate:  true,
+		ID:         "test-formula.step1",
+		Title:      "Step 1",
+		Status:     types.StatusOpen,
+		Priority:   2,
+		IssueType:  types.TypeTask,
+		IsTemplate: true,
 	}
-	
+
 	subgraph := &TemplateSubgraph{
 		Root:   root,
 		Issues: []*types.Issue{root, step},
@@ -2490,7 +2576,7 @@ func TestSpawnMoleculeFromFormulaEphemeral(t *testing.T) {
 	}
 
 	// Spawn with ephemeral=true (simulating bd mol wisp <formula>)
-	result, err := spawnMolecule(ctx, s, subgraph, nil, "", "test", true, "eph")
+	result, err := spawnMolecule(ctx, s, subgraph, nil, "", "test", true, "wisp")
 	if err != nil {
 		t.Fatalf("spawnMolecule failed: %v", err)
 	}
@@ -2509,8 +2595,8 @@ func TestSpawnMoleculeFromFormulaEphemeral(t *testing.T) {
 
 	// Verify they have the correct prefix
 	for _, newID := range result.IDMapping {
-		if !strings.HasPrefix(newID, "test-eph-") {
-			t.Errorf("Spawned issue ID %s should have prefix 'test-eph-'", newID)
+		if !strings.HasPrefix(newID, "test-wisp-") {
+			t.Errorf("Spawned issue ID %s should have prefix 'test-wisp-'", newID)
 		}
 	}
 
@@ -2525,5 +2611,308 @@ func TestSpawnMoleculeFromFormulaEphemeral(t *testing.T) {
 				t.Errorf("Ephemeral issue %s should not appear in ready work", spawnedID)
 			}
 		}
+	}
+}
+
+// TestCompoundMoleculeVisualization tests the compound molecule display in mol show
+func TestCompoundMoleculeVisualization(t *testing.T) {
+	// Test IsCompound() and GetConstituents()
+	tests := []struct {
+		name          string
+		bondedFrom    []types.BondRef
+		isCompound    bool
+		expectedCount int
+	}{
+		{
+			name:          "not a compound - no BondedFrom",
+			bondedFrom:    nil,
+			isCompound:    false,
+			expectedCount: 0,
+		},
+		{
+			name:          "not a compound - empty BondedFrom",
+			bondedFrom:    []types.BondRef{},
+			isCompound:    false,
+			expectedCount: 0,
+		},
+		{
+			name: "compound with one constituent",
+			bondedFrom: []types.BondRef{
+				{SourceID: "proto-a", BondType: types.BondTypeSequential},
+			},
+			isCompound:    true,
+			expectedCount: 1,
+		},
+		{
+			name: "compound with two constituents - sequential bond",
+			bondedFrom: []types.BondRef{
+				{SourceID: "proto-a", BondType: types.BondTypeSequential},
+				{SourceID: "proto-b", BondType: types.BondTypeSequential},
+			},
+			isCompound:    true,
+			expectedCount: 2,
+		},
+		{
+			name: "compound with parallel bond",
+			bondedFrom: []types.BondRef{
+				{SourceID: "proto-a", BondType: types.BondTypeParallel},
+				{SourceID: "proto-b", BondType: types.BondTypeParallel},
+			},
+			isCompound:    true,
+			expectedCount: 2,
+		},
+		{
+			name: "compound with bond point",
+			bondedFrom: []types.BondRef{
+				{SourceID: "proto-a", BondType: types.BondTypeSequential, BondPoint: "step-2"},
+			},
+			isCompound:    true,
+			expectedCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issue := &types.Issue{
+				ID:         "test-compound",
+				Title:      "Test Compound Molecule",
+				BondedFrom: tt.bondedFrom,
+			}
+
+			if got := issue.IsCompound(); got != tt.isCompound {
+				t.Errorf("IsCompound() = %v, want %v", got, tt.isCompound)
+			}
+
+			constituents := issue.GetConstituents()
+			if len(constituents) != tt.expectedCount {
+				t.Errorf("GetConstituents() returned %d items, want %d", len(constituents), tt.expectedCount)
+			}
+		})
+	}
+}
+
+// TestFormatBondType tests the formatBondType helper function
+func TestFormatBondType(t *testing.T) {
+	tests := []struct {
+		bondType string
+		expected string
+	}{
+		{types.BondTypeSequential, "sequential"},
+		{types.BondTypeParallel, "parallel"},
+		{types.BondTypeConditional, "on-failure"},
+		{types.BondTypeRoot, "root"},
+		{"", "default"},
+		{"custom-type", "custom-type"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.bondType, func(t *testing.T) {
+			if got := formatBondType(tt.bondType); got != tt.expected {
+				t.Errorf("formatBondType(%q) = %q, want %q", tt.bondType, got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestPourRootTitleDescSubstitution verifies that the root molecule's title and description
+// are substituted with {{title}} and {{desc}} variables when pouring a formula.
+// This is a tracer bullet test for GitHub issue #852:
+// https://github.com/steveyegge/beads/issues/852
+func TestPourRootTitleDescSubstitution(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir() + "/test.db"
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer s.Close()
+	if err := s.SetConfig(ctx, "issue_prefix", "mol"); err != nil {
+		t.Fatalf("Failed to set config: %v", err)
+	}
+
+	// Create a formula that has title and desc variables
+	f := &formula.Formula{
+		Formula:     "mol-task",
+		Description: "Standard task workflow for 2-8 hour work...",
+		Version:     1,
+		Type:        formula.TypeWorkflow,
+		Vars: map[string]*formula.VarDef{
+			"title": {
+				Description: "Task title",
+				Required:    true,
+			},
+			"desc": {
+				Description: "Task description",
+				Required:    false,
+				Default:     formula.StringPtr("No description provided"),
+			},
+		},
+		Steps: []*formula.Step{
+			{ID: "plan", Title: "Plan: {{title}}", Type: "task"},
+			{ID: "implement", Title: "Implement: {{title}}", Type: "task", DependsOn: []string{"plan"}},
+			{ID: "verify", Title: "Verify: {{title}}", Type: "task", DependsOn: []string{"implement"}},
+			{ID: "review", Title: "Review: {{title}}", Type: "task", DependsOn: []string{"verify"}},
+		},
+	}
+
+	// Cook the formula to a subgraph (in-memory, no DB)
+	subgraph, err := cookFormulaToSubgraphWithVars(f, f.Formula, f.Vars)
+	if err != nil {
+		t.Fatalf("Failed to cook formula: %v", err)
+	}
+
+	// Spawn with title and desc variables
+	vars := map[string]string{
+		"title": "My Task",
+		"desc":  "My description",
+	}
+
+	result, err := spawnMolecule(ctx, s, subgraph, vars, "", "test", false, types.IDPrefixMol)
+	if err != nil {
+		t.Fatalf("spawnMolecule failed: %v", err)
+	}
+
+	// Get the spawned root issue
+	spawnedRoot, err := s.GetIssue(ctx, result.NewEpicID)
+	if err != nil {
+		t.Fatalf("Failed to get spawned root: %v", err)
+	}
+
+	// BUG: The root title should contain "My Task" but currently contains "mol-task"
+	// because cookFormulaToSubgraph sets root.Title = f.Formula instead of using
+	// a template that includes {{title}}.
+	if !strings.Contains(spawnedRoot.Title, "My Task") {
+		t.Errorf("Root title should contain 'My Task' from variable substitution, got: %q", spawnedRoot.Title)
+	}
+
+	// BUG: The root description should contain "My description" but currently
+	// contains the formula's static description.
+	if !strings.Contains(spawnedRoot.Description, "My description") {
+		t.Errorf("Root description should contain 'My description' from variable substitution, got: %q", spawnedRoot.Description)
+	}
+
+	// Verify child beads DO have correct substitution (this should pass)
+	for oldID, newID := range result.IDMapping {
+		if oldID == f.Formula {
+			continue // Skip root
+		}
+		spawned, err := s.GetIssue(ctx, newID)
+		if err != nil {
+			t.Fatalf("Failed to get spawned issue %s: %v", newID, err)
+		}
+		if !strings.Contains(spawned.Title, "My Task") {
+			t.Errorf("Child issue %s (from %s) title should contain 'My Task', got: %q", newID, oldID, spawned.Title)
+		}
+	}
+}
+
+// TestPourRootTitleOnly verifies edge case: only title var defined, no desc.
+// Root should use {{title}} for title, but keep formula description.
+func TestPourRootTitleOnly(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir() + "/test.db"
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer s.Close()
+	if err := s.SetConfig(ctx, "issue_prefix", "mol"); err != nil {
+		t.Fatalf("Failed to set config: %v", err)
+	}
+
+	// Formula with only title var (no desc)
+	f := &formula.Formula{
+		Formula:     "mol-simple",
+		Description: "Static description that should be preserved",
+		Version:     1,
+		Type:        formula.TypeWorkflow,
+		Vars: map[string]*formula.VarDef{
+			"title": {Description: "Task title", Required: true},
+		},
+		Steps: []*formula.Step{
+			{ID: "work", Title: "Do: {{title}}", Type: "task"},
+		},
+	}
+
+	subgraph, err := cookFormulaToSubgraphWithVars(f, f.Formula, f.Vars)
+	if err != nil {
+		t.Fatalf("Failed to cook formula: %v", err)
+	}
+
+	vars := map[string]string{"title": "Custom Title"}
+	result, err := spawnMolecule(ctx, s, subgraph, vars, "", "test", false, types.IDPrefixMol)
+	if err != nil {
+		t.Fatalf("spawnMolecule failed: %v", err)
+	}
+
+	spawnedRoot, err := s.GetIssue(ctx, result.NewEpicID)
+	if err != nil {
+		t.Fatalf("Failed to get spawned root: %v", err)
+	}
+
+	// Title should be substituted
+	if !strings.Contains(spawnedRoot.Title, "Custom Title") {
+		t.Errorf("Root title should contain 'Custom Title', got: %q", spawnedRoot.Title)
+	}
+
+	// Description should be the static formula description (no desc var)
+	if spawnedRoot.Description != "Static description that should be preserved" {
+		t.Errorf("Root description should be static formula desc, got: %q", spawnedRoot.Description)
+	}
+}
+
+// TestPourRootNoVars verifies backward compatibility: no title/desc vars defined.
+// Root should use formula name and formula description (original behavior).
+func TestPourRootNoVars(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir() + "/test.db"
+	s, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer s.Close()
+	if err := s.SetConfig(ctx, "issue_prefix", "mol"); err != nil {
+		t.Fatalf("Failed to set config: %v", err)
+	}
+
+	// Formula with no title/desc vars (uses different var names)
+	f := &formula.Formula{
+		Formula:     "mol-release",
+		Description: "Release workflow for version bumps",
+		Version:     1,
+		Type:        formula.TypeWorkflow,
+		Vars: map[string]*formula.VarDef{
+			"version": {Description: "Version number", Required: true},
+		},
+		Steps: []*formula.Step{
+			{ID: "bump", Title: "Bump to {{version}}", Type: "task"},
+			{ID: "tag", Title: "Tag {{version}}", Type: "task", DependsOn: []string{"bump"}},
+		},
+	}
+
+	subgraph, err := cookFormulaToSubgraphWithVars(f, f.Formula, f.Vars)
+	if err != nil {
+		t.Fatalf("Failed to cook formula: %v", err)
+	}
+
+	vars := map[string]string{"version": "1.2.3"}
+	result, err := spawnMolecule(ctx, s, subgraph, vars, "", "test", false, types.IDPrefixMol)
+	if err != nil {
+		t.Fatalf("spawnMolecule failed: %v", err)
+	}
+
+	spawnedRoot, err := s.GetIssue(ctx, result.NewEpicID)
+	if err != nil {
+		t.Fatalf("Failed to get spawned root: %v", err)
+	}
+
+	// Title should be formula name (no title var defined)
+	if spawnedRoot.Title != "mol-release" {
+		t.Errorf("Root title should be formula name 'mol-release', got: %q", spawnedRoot.Title)
+	}
+
+	// Description should be formula description (no desc var defined)
+	if spawnedRoot.Description != "Release workflow for version bumps" {
+		t.Errorf("Root description should be formula desc, got: %q", spawnedRoot.Description)
 	}
 }

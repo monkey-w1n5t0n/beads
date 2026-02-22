@@ -2,16 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
-	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -19,77 +16,123 @@ import (
 
 // GraphNode represents a node in the rendered graph
 type GraphNode struct {
-	Issue    *types.Issue
-	Layer    int      // Horizontal layer (topological order)
-	Position int      // Vertical position within layer
+	Issue     *types.Issue
+	Layer     int      // Horizontal layer (topological order)
+	Position  int      // Vertical position within layer
 	DependsOn []string // IDs this node depends on (blocks dependencies only)
 }
 
 // GraphLayout holds the computed graph layout
 type GraphLayout struct {
-	Nodes      map[string]*GraphNode
-	Layers     [][]string // Layer index -> node IDs in that layer
-	MaxLayer   int
-	RootID     string
+	Nodes    map[string]*GraphNode
+	Layers   [][]string // Layer index -> node IDs in that layer
+	MaxLayer int
+	RootID   string
 }
 
+var (
+	graphCompact bool
+	graphBox     bool
+	graphAll     bool
+	graphDOT     bool
+	graphHTML    bool
+)
+
 var graphCmd = &cobra.Command{
-	Use:     "graph <issue-id>",
+	Use:     "graph [issue-id]",
 	GroupID: "deps",
 	Short:   "Display issue dependency graph",
-	Long: `Display an ASCII visualization of an issue's dependency graph.
+	Long: `Display a visualization of an issue's dependency graph.
 
 For epics, shows all children and their dependencies.
 For regular issues, shows the issue and its direct dependencies.
 
-The graph shows execution order left-to-right:
-- Leftmost nodes have no dependencies (can start immediately)
-- Rightmost nodes depend on everything to their left
-- Nodes in the same column can run in parallel
+With --all, shows all open issues grouped by connected component.
 
-Colors indicate status:
-- White: open (ready to work)
-- Yellow: in progress
-- Red: blocked
-- Green: closed`,
-	Args: cobra.ExactArgs(1),
+Display formats:
+  (default)        DAG with columns and box-drawing edges (terminal-native)
+  --box            ASCII boxes showing layers, more detailed
+  --compact        Tree format, one line per issue, more scannable
+  --dot            Graphviz DOT format (pipe to dot -Tsvg > graph.svg)
+  --html           Self-contained interactive HTML with D3.js visualization
+
+The graph shows execution order:
+- Layer 0 / leftmost = no dependencies (can start immediately)
+- Higher layers depend on lower layers
+- Nodes in the same layer can run in parallel
+
+Status icons: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred
+
+Examples:
+  bd graph issue-id              # Terminal DAG visualization (default)
+  bd graph --box issue-id        # ASCII boxes with layer grouping
+  bd graph --dot issue-id | dot -Tsvg > graph.svg  # SVG via Graphviz
+  bd graph --dot issue-id | dot -Tpng > graph.png  # PNG via Graphviz
+  bd graph --html issue-id > graph.html  # Interactive browser view
+  bd graph --all --html > all.html       # All issues, interactive`,
+	Args: cobra.RangeArgs(0, 1),
 	Run: func(cmd *cobra.Command, args []string) {
 		ctx := rootCtx
-		var issueID string
 
-		// Resolve the issue ID
-		if daemonClient != nil {
-			resolveArgs := &rpc.ResolveIDArgs{ID: args[0]}
-			resp, err := daemonClient.ResolveID(resolveArgs)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: issue '%s' not found\n", args[0])
-				os.Exit(1)
-			}
-			if err := json.Unmarshal(resp.Data, &issueID); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		} else if store != nil {
-			var err error
-			issueID, err = utils.ResolvePartialID(ctx, store, args[0])
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: issue '%s' not found\n", args[0])
-				os.Exit(1)
-			}
-		} else {
+		// Validate args
+		if graphAll && len(args) > 0 {
+			fmt.Fprintf(os.Stderr, "Error: cannot specify issue ID with --all flag\n")
+			os.Exit(1)
+		}
+		if !graphAll && len(args) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: issue ID required (or use --all for all open issues)\n")
+			os.Exit(1)
+		}
+
+		if store == nil {
 			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
 			os.Exit(1)
 		}
 
-		// If daemon is running but doesn't support this command, use direct storage
-		if daemonClient != nil && store == nil {
-			var err error
-			store, err = sqlite.New(ctx, dbPath)
+		// Handle --all flag: show graph for all open issues
+		if graphAll {
+			subgraphs, err := loadAllGraphSubgraphs(ctx, store)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to open database: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error loading all issues: %v\n", err)
 				os.Exit(1)
 			}
-			defer func() { _ = store.Close() }()
+
+			if len(subgraphs) == 0 {
+				fmt.Println("No open issues found")
+				return
+			}
+
+			if jsonOutput {
+				outputJSON(subgraphs)
+				return
+			}
+
+			// Render all subgraphs
+			for i, subgraph := range subgraphs {
+				layout := computeLayout(subgraph)
+				if graphDOT {
+					renderGraphDOT(layout, subgraph)
+				} else if graphHTML {
+					renderGraphHTML(layout, subgraph)
+				} else if graphCompact {
+					renderGraphCompact(layout, subgraph)
+				} else if graphBox {
+					renderGraph(layout, subgraph)
+				} else {
+					renderGraphVisual(layout, subgraph)
+				}
+				if !graphDOT && !graphHTML && i < len(subgraphs)-1 {
+					fmt.Println(strings.Repeat("─", 60))
+				}
+			}
+			return
+		}
+
+		// Single issue mode
+		issueID, err := utils.ResolvePartialID(ctx, store, args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: issue '%s' not found\n", args[0])
+			os.Exit(1)
 		}
 
 		// Load the subgraph
@@ -104,25 +147,41 @@ Colors indicate status:
 
 		if jsonOutput {
 			outputJSON(map[string]interface{}{
-				"root":    subgraph.Root,
-				"issues":  subgraph.Issues,
-				"layout":  layout,
+				"root":   subgraph.Root,
+				"issues": subgraph.Issues,
+				"layout": layout,
 			})
 			return
 		}
 
-		// Render ASCII graph
-		renderGraph(layout, subgraph)
+		// Render graph in selected format
+		if graphDOT {
+			renderGraphDOT(layout, subgraph)
+		} else if graphHTML {
+			renderGraphHTML(layout, subgraph)
+		} else if graphCompact {
+			renderGraphCompact(layout, subgraph)
+		} else if graphBox {
+			renderGraph(layout, subgraph)
+		} else {
+			renderGraphVisual(layout, subgraph)
+		}
 	},
 }
 
 func init() {
+	graphCmd.Flags().BoolVar(&graphAll, "all", false, "Show graph for all open issues")
+	graphCmd.Flags().BoolVar(&graphCompact, "compact", false, "Tree format, one line per issue, more scannable")
+	graphCmd.Flags().BoolVar(&graphBox, "box", false, "ASCII boxes showing layers")
+	graphCmd.Flags().BoolVar(&graphDOT, "dot", false, "Output Graphviz DOT format (pipe to: dot -Tsvg > graph.svg)")
+	graphCmd.Flags().BoolVar(&graphHTML, "html", false, "Output self-contained interactive HTML (redirect to file)")
+	graphCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(graphCmd)
 }
 
 // loadGraphSubgraph loads an issue and its subgraph for visualization
 // Unlike template loading, this includes ALL dependency types (not just parent-child)
-func loadGraphSubgraph(ctx context.Context, s storage.Storage, issueID string) (*TemplateSubgraph, error) {
+func loadGraphSubgraph(ctx context.Context, s *dolt.DoltStore, issueID string) (*TemplateSubgraph, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -180,6 +239,30 @@ func loadGraphSubgraph(ctx context.Context, s storage.Storage, issueID string) (
 			continue
 		}
 		for _, dep := range deps {
+			// Resolve external deps via routing (bd-k0pfm)
+			if strings.HasPrefix(dep.DependsOnID, "external:") {
+				parts := strings.SplitN(dep.DependsOnID, ":", 3)
+				if len(parts) == 3 && parts[2] != "" {
+					targetID := parts[2]
+					if _, exists := subgraph.IssueMap[targetID]; !exists {
+						result, routeErr := resolveAndGetIssueWithRouting(ctx, store, targetID)
+						if routeErr == nil && result != nil && result.Issue != nil {
+							subgraph.Issues = append(subgraph.Issues, result.Issue)
+							subgraph.IssueMap[result.Issue.ID] = result.Issue
+							// Rewrite dep to use the resolved issue ID
+							dep.DependsOnID = result.Issue.ID
+							result.Close()
+						} else {
+							if result != nil {
+								result.Close()
+							}
+							continue
+						}
+					} else {
+						dep.DependsOnID = targetID
+					}
+				}
+			}
 			// Only include dependencies where both ends are in the subgraph
 			if _, ok := subgraph.IssueMap[dep.DependsOnID]; ok {
 				subgraph.Dependencies = append(subgraph.Dependencies, dep)
@@ -188,6 +271,180 @@ func loadGraphSubgraph(ctx context.Context, s storage.Storage, issueID string) (
 	}
 
 	return subgraph, nil
+}
+
+// loadAllGraphSubgraphs loads all open issues and groups them by connected component
+// Each component is a subgraph of issues that share dependencies
+func loadAllGraphSubgraphs(ctx context.Context, s *dolt.DoltStore) ([]*TemplateSubgraph, error) {
+	if s == nil {
+		return nil, fmt.Errorf("no database connection")
+	}
+
+	// Get all open issues (open, in_progress, blocked)
+	// We need to make multiple calls since IssueFilter takes a single status
+	var allIssues []*types.Issue
+	for _, status := range []types.Status{types.StatusOpen, types.StatusInProgress, types.StatusBlocked} {
+		statusCopy := status
+		issues, err := s.SearchIssues(ctx, "", types.IssueFilter{
+			Status: &statusCopy,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to search issues: %w", err)
+		}
+		allIssues = append(allIssues, issues...)
+	}
+
+	if len(allIssues) == 0 {
+		return nil, nil
+	}
+
+	// Build issue map
+	issueMap := make(map[string]*types.Issue)
+	for _, issue := range allIssues {
+		issueMap[issue.ID] = issue
+	}
+
+	// Load all dependencies between these issues
+	allDeps := make([]*types.Dependency, 0)
+	for _, issue := range allIssues {
+		deps, err := s.GetDependencyRecords(ctx, issue.ID)
+		if err != nil {
+			continue
+		}
+		for _, dep := range deps {
+			// Resolve external deps via routing (bd-k0pfm)
+			if strings.HasPrefix(dep.DependsOnID, "external:") {
+				parts := strings.SplitN(dep.DependsOnID, ":", 3)
+				if len(parts) == 3 && parts[2] != "" {
+					targetID := parts[2]
+					if _, exists := issueMap[targetID]; !exists {
+						result, routeErr := resolveAndGetIssueWithRouting(ctx, store, targetID)
+						if routeErr == nil && result != nil && result.Issue != nil {
+							allIssues = append(allIssues, result.Issue)
+							issueMap[result.Issue.ID] = result.Issue
+							dep.DependsOnID = result.Issue.ID
+							result.Close()
+						} else {
+							if result != nil {
+								result.Close()
+							}
+							continue
+						}
+					} else {
+						dep.DependsOnID = targetID
+					}
+				}
+			}
+			// Only include deps where both ends are in our issue set
+			if _, ok := issueMap[dep.DependsOnID]; ok {
+				allDeps = append(allDeps, dep)
+			}
+		}
+	}
+
+	// Build adjacency list for union-find
+	adj := make(map[string][]string)
+	for _, dep := range allDeps {
+		adj[dep.IssueID] = append(adj[dep.IssueID], dep.DependsOnID)
+		adj[dep.DependsOnID] = append(adj[dep.DependsOnID], dep.IssueID)
+	}
+
+	// Find connected components using BFS
+	visited := make(map[string]bool)
+	var components [][]string
+
+	for _, issue := range allIssues {
+		if visited[issue.ID] {
+			continue
+		}
+
+		// BFS to find all connected issues
+		var component []string
+		queue := []string{issue.ID}
+		visited[issue.ID] = true
+
+		for len(queue) > 0 {
+			current := queue[0]
+			queue = queue[1:]
+			component = append(component, current)
+
+			for _, neighbor := range adj[current] {
+				if !visited[neighbor] {
+					visited[neighbor] = true
+					queue = append(queue, neighbor)
+				}
+			}
+		}
+
+		components = append(components, component)
+	}
+
+	// Sort components by size (largest first) and then by priority of first issue
+	sort.Slice(components, func(i, j int) bool {
+		// First by size (descending)
+		if len(components[i]) != len(components[j]) {
+			return len(components[i]) > len(components[j])
+		}
+		// Then by priority of first issue (ascending = higher priority first)
+		issueI := issueMap[components[i][0]]
+		issueJ := issueMap[components[j][0]]
+		return issueI.Priority < issueJ.Priority
+	})
+
+	// Create subgraph for each component
+	var subgraphs []*TemplateSubgraph
+	for _, component := range components {
+		if len(component) == 0 {
+			continue
+		}
+
+		// Find the best "root" for this component
+		// Prefer: epics > highest priority > oldest
+		var root *types.Issue
+		for _, id := range component {
+			issue := issueMap[id]
+			if root == nil {
+				root = issue
+				continue
+			}
+			// Prefer epics
+			if issue.IssueType == types.TypeEpic && root.IssueType != types.TypeEpic {
+				root = issue
+				continue
+			}
+			if root.IssueType == types.TypeEpic && issue.IssueType != types.TypeEpic {
+				continue
+			}
+			// Prefer higher priority (lower number)
+			if issue.Priority < root.Priority {
+				root = issue
+			}
+		}
+
+		subgraph := &TemplateSubgraph{
+			Root:     root,
+			IssueMap: make(map[string]*types.Issue),
+		}
+
+		for _, id := range component {
+			issue := issueMap[id]
+			subgraph.Issues = append(subgraph.Issues, issue)
+			subgraph.IssueMap[id] = issue
+		}
+
+		// Add dependencies for this component
+		for _, dep := range allDeps {
+			if _, inComponent := subgraph.IssueMap[dep.IssueID]; inComponent {
+				if _, depInComponent := subgraph.IssueMap[dep.DependsOnID]; depInComponent {
+					subgraph.Dependencies = append(subgraph.Dependencies, dep)
+				}
+			}
+		}
+
+		subgraphs = append(subgraphs, subgraph)
+	}
+
+	return subgraphs, nil
 }
 
 // computeLayout assigns layers to nodes using topological sort
@@ -378,33 +635,155 @@ func renderGraph(layout *GraphLayout, subgraph *TemplateSubgraph) {
 	fmt.Printf("  Total: %d issues across %d layers\n\n", len(layout.Nodes), len(layout.Layers))
 }
 
+// renderGraphCompact renders the graph in compact tree format
+// One line per issue, more scannable, uses tree connectors (├──, └──, │)
+func renderGraphCompact(layout *GraphLayout, subgraph *TemplateSubgraph) {
+	if len(layout.Nodes) == 0 {
+		fmt.Println("Empty graph")
+		return
+	}
+
+	fmt.Printf("\n%s Dependency graph for %s (%d issues, %d layers)\n\n",
+		ui.RenderAccent("📊"), layout.RootID, len(layout.Nodes), len(layout.Layers))
+
+	// Legend
+	fmt.Println("  Status: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred")
+	fmt.Println()
+
+	// Build parent-child map from subgraph dependencies
+	children := make(map[string][]string) // parent -> children
+	childSet := make(map[string]bool)     // track which issues are children
+
+	for _, dep := range subgraph.Dependencies {
+		if dep.Type == types.DepParentChild {
+			children[dep.DependsOnID] = append(children[dep.DependsOnID], dep.IssueID)
+			childSet[dep.IssueID] = true
+		}
+	}
+
+	// Sort children by priority then ID for consistent output
+	for parentID := range children {
+		sort.Slice(children[parentID], func(i, j int) bool {
+			nodeI := layout.Nodes[children[parentID][i]]
+			nodeJ := layout.Nodes[children[parentID][j]]
+			if nodeI.Issue.Priority != nodeJ.Issue.Priority {
+				return nodeI.Issue.Priority < nodeJ.Issue.Priority
+			}
+			return nodeI.Issue.ID < nodeJ.Issue.ID
+		})
+	}
+
+	// Render by layer with tree structure
+	for layerIdx, layer := range layout.Layers {
+		// Layer header
+		layerHeader := fmt.Sprintf("LAYER %d", layerIdx)
+		if layerIdx == 0 {
+			layerHeader += " (ready)"
+		}
+		fmt.Printf("  %s\n", ui.RenderAccent(layerHeader))
+
+		for i, id := range layer {
+			node := layout.Nodes[id]
+			isLast := i == len(layer)-1
+
+			// Format node line
+			line := formatCompactNode(node)
+
+			// Tree connector
+			connector := "├── "
+			if isLast {
+				connector = "└── "
+			}
+
+			fmt.Printf("  %s%s\n", connector, line)
+
+			// Render children (if this issue has children in the subgraph)
+			if childIDs, ok := children[id]; ok && len(childIDs) > 0 {
+				childPrefix := "│   "
+				if isLast {
+					childPrefix = "    "
+				}
+				renderCompactChildren(layout, childIDs, children, childPrefix, 1)
+			}
+		}
+		fmt.Println()
+	}
+}
+
+// renderCompactChildren recursively renders children in tree format
+func renderCompactChildren(layout *GraphLayout, childIDs []string, children map[string][]string, prefix string, depth int) {
+	for i, childID := range childIDs {
+		node := layout.Nodes[childID]
+		if node == nil {
+			continue
+		}
+
+		isLast := i == len(childIDs)-1
+		connector := "├── "
+		if isLast {
+			connector = "└── "
+		}
+
+		line := formatCompactNode(node)
+		fmt.Printf("  %s%s%s\n", prefix, connector, line)
+
+		// Recurse for nested children
+		if grandchildren, ok := children[childID]; ok && len(grandchildren) > 0 {
+			childPrefix := prefix
+			if isLast {
+				childPrefix += "    "
+			} else {
+				childPrefix += "│   "
+			}
+			renderCompactChildren(layout, grandchildren, children, childPrefix, depth+1)
+		}
+	}
+}
+
+// formatCompactNode formats a single node for compact output
+// Format: STATUS_ICON ID PRIORITY Title
+func formatCompactNode(node *GraphNode) string {
+	status := string(node.Issue.Status)
+
+	// Use shared status icon with semantic color
+	statusIcon := ui.RenderStatusIcon(status)
+
+	// Priority with icon
+	priorityTag := ui.RenderPriority(node.Issue.Priority)
+
+	// Title - truncate if too long
+	title := truncateTitle(node.Issue.Title, 50)
+
+	// Build line - apply status style to entire line for closed issues
+	style := ui.GetStatusStyle(status)
+	if node.Issue.Status == types.StatusClosed {
+		return fmt.Sprintf("%s %s %s %s",
+			statusIcon,
+			style.Render(node.Issue.ID),
+			style.Render(fmt.Sprintf("● P%d", node.Issue.Priority)),
+			style.Render(title))
+	}
+
+	return fmt.Sprintf("%s %s %s %s", statusIcon, node.Issue.ID, priorityTag, title)
+}
+
 // renderNodeBox renders a single node as an ASCII box
+// Uses semantic status styles from ui package for consistency
 func renderNodeBox(node *GraphNode, width int) string {
-	// Status indicator
-	var statusIcon string
-	var titleStr string
-
 	title := truncateTitle(node.Issue.Title, width-4)
+	paddedTitle := padRight(title, width-4)
+	status := string(node.Issue.Status)
 
-	switch node.Issue.Status {
-	case types.StatusOpen:
-		statusIcon = "○"
-		titleStr = padRight(title, width-4)
-	case types.StatusInProgress:
-		statusIcon = "◐"
-		titleStr = ui.RenderWarn(padRight(title, width-4))
-	case types.StatusBlocked:
-		statusIcon = "●"
-		titleStr = ui.RenderFail(padRight(title, width-4))
-	case types.StatusDeferred:
-		statusIcon = "❄"
-		titleStr = ui.RenderAccent(padRight(title, width-4))
-	case types.StatusClosed:
-		statusIcon = "✓"
-		titleStr = ui.RenderPass(padRight(title, width-4))
-	default:
-		statusIcon = "?"
-		titleStr = padRight(title, width-4)
+	// Use shared status icon and style
+	statusIcon := ui.RenderStatusIcon(status)
+	style := ui.GetStatusStyle(status)
+
+	// Apply style to title for actionable statuses
+	var titleStr string
+	if node.Issue.Status == types.StatusOpen {
+		titleStr = paddedTitle // no color for open - available but not urgent
+	} else {
+		titleStr = style.Render(paddedTitle)
 	}
 
 	id := node.Issue.ID
@@ -437,6 +816,7 @@ func padRight(s string, width int) string {
 }
 
 // computeDependencyCounts calculates how many issues each issue blocks and is blocked by
+// Excludes parent-child relationships and the root issue from counts to reduce cognitive noise
 func computeDependencyCounts(subgraph *TemplateSubgraph) (blocks map[string]int, blockedBy map[string]int) {
 	blocks = make(map[string]int)
 	blockedBy = make(map[string]int)
@@ -445,61 +825,76 @@ func computeDependencyCounts(subgraph *TemplateSubgraph) (blocks map[string]int,
 		return blocks, blockedBy
 	}
 
+	rootID := ""
+	if subgraph.Root != nil {
+		rootID = subgraph.Root.ID
+	}
+
 	for _, dep := range subgraph.Dependencies {
-		if dep.Type == types.DepBlocks {
-			// dep.DependsOnID blocks dep.IssueID
-			// So dep.DependsOnID "blocks" count increases
-			blocks[dep.DependsOnID]++
-			// And dep.IssueID "blocked by" count increases
-			blockedBy[dep.IssueID]++
+		// Only count "blocks" dependencies (not parent-child, related, etc.)
+		if dep.Type != types.DepBlocks {
+			continue
 		}
+
+		// Skip if the blocker is the root issue - this is obvious from graph structure
+		// and showing "needs:1" when it's just the parent epic is cognitive noise
+		if dep.DependsOnID == rootID {
+			continue
+		}
+
+		// dep.DependsOnID blocks dep.IssueID
+		// So dep.DependsOnID "blocks" count increases
+		blocks[dep.DependsOnID]++
+		// And dep.IssueID "blocked by" count increases
+		blockedBy[dep.IssueID]++
 	}
 
 	return blocks, blockedBy
 }
 
 // renderNodeBoxWithDeps renders a node box with dependency information
+// Uses semantic status styles from ui package for consistency across commands
+// Design principle: only actionable states get color, closed items fade
 func renderNodeBoxWithDeps(node *GraphNode, width int, blocksCount int, blockedByCount int) string {
-	// Status indicator
-	var statusIcon string
-	var titleStr string
-
 	title := truncateTitle(node.Issue.Title, width-4)
+	paddedTitle := padRight(title, width-4)
+	status := string(node.Issue.Status)
 
-	switch node.Issue.Status {
-	case types.StatusOpen:
-		statusIcon = "○"
-		titleStr = padRight(title, width-4)
-	case types.StatusInProgress:
-		statusIcon = "◐"
-		titleStr = ui.RenderWarn(padRight(title, width-4))
-	case types.StatusBlocked:
-		statusIcon = "●"
-		titleStr = ui.RenderFail(padRight(title, width-4))
-	case types.StatusDeferred:
-		statusIcon = "❄"
-		titleStr = ui.RenderAccent(padRight(title, width-4))
-	case types.StatusClosed:
-		statusIcon = "✓"
-		titleStr = ui.RenderPass(padRight(title, width-4))
-	default:
-		statusIcon = "?"
-		titleStr = padRight(title, width-4)
+	// Use shared status icon and style from ui package
+	statusIcon := ui.RenderStatusIcon(status)
+	style := ui.GetStatusStyle(status)
+
+	// Apply style to title for actionable statuses
+	var titleStr string
+	if node.Issue.Status == types.StatusOpen {
+		titleStr = paddedTitle // no color for open - available but not urgent
+	} else {
+		titleStr = style.Render(paddedTitle)
 	}
 
 	id := node.Issue.ID
 
-	// Build dependency info string
-	var depInfo string
+	// Build dependency info string - only show if meaningful counts exist
+	// Note: we build the plain text version first for padding, then apply colors
+	var depInfoPlain string
+	var depInfoStyled string
 	if blocksCount > 0 || blockedByCount > 0 {
-		parts := []string{}
+		plainParts := []string{}
+		styledParts := []string{}
 		if blocksCount > 0 {
-			parts = append(parts, fmt.Sprintf("blocks:%d", blocksCount))
+			plainText := fmt.Sprintf("blocks:%d", blocksCount)
+			plainParts = append(plainParts, plainText)
+			// Use semantic color for blocks indicator - attention-grabbing
+			styledParts = append(styledParts, ui.StatusBlockedStyle.Render(plainText))
 		}
 		if blockedByCount > 0 {
-			parts = append(parts, fmt.Sprintf("needs:%d", blockedByCount))
+			plainText := fmt.Sprintf("needs:%d", blockedByCount)
+			plainParts = append(plainParts, plainText)
+			// Use muted color for needs indicator - informational
+			styledParts = append(styledParts, ui.MutedStyle.Render(plainText))
 		}
-		depInfo = strings.Join(parts, " ")
+		depInfoPlain = strings.Join(plainParts, " ")
+		depInfoStyled = strings.Join(styledParts, " ")
 	}
 
 	// Build the box
@@ -508,8 +903,13 @@ func renderNodeBoxWithDeps(node *GraphNode, width int, blocksCount int, blockedB
 	idLine := fmt.Sprintf("  │ %s │", ui.RenderMuted(padRight(id, width-2)))
 
 	var result string
-	if depInfo != "" {
-		depLine := fmt.Sprintf("  │ %s │", ui.RenderAccent(padRight(depInfo, width-2)))
+	if depInfoPlain != "" {
+		// Pad based on plain text length, then render with styled version
+		padding := width - 2 - len([]rune(depInfoPlain))
+		if padding < 0 {
+			padding = 0
+		}
+		depLine := fmt.Sprintf("  │ %s%s │", depInfoStyled, strings.Repeat(" ", padding))
 		bottom := "  └" + strings.Repeat("─", width) + "┘"
 		result = topBottom + "\n" + middle + "\n" + idLine + "\n" + depLine + "\n" + bottom
 	} else {

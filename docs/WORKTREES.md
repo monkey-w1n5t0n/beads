@@ -77,7 +77,7 @@ bd config set sync.branch ""
 
 # Stop and restart daemon
 bd daemon stop
-bd daemon --start
+bd daemon start
 
 # Clean up existing worktrees
 rm -rf .git/beads-worktrees
@@ -112,7 +112,7 @@ For complete sync-branch documentation, see [PROTECTED_BRANCHES.md](PROTECTED_BR
 Main Repository
 ├── .git/                    # Shared git directory
 ├── .beads/                  # Shared database (main repo)
-│   ├── beads.db            # SQLite database
+│   ├── dolt/               # Dolt database directory
 │   ├── issues.jsonl        # Issue data (git-tracked)
 │   └── config.yaml         # Configuration
 ├── feature-branch/         # Worktree 1
@@ -124,7 +124,7 @@ Main Repository
 **Key points:**
 - ✅ **One database** - All worktrees share the same `.beads` directory in main repo
 - ✅ **Automatic discovery** - Database found regardless of which worktree you're in
-- ✅ **Concurrent access** - SQLite locking prevents corruption
+- ✅ **Concurrent access** - Database locking prevents corruption
 - ✅ **Git integration** - Issues sync via JSONL in main repo
 
 ### Worktree Detection & Daemon Safety
@@ -350,7 +350,7 @@ export BEADS_NO_DAEMON=1
 export BEADS_AUTO_START_DAEMON=false
 
 # Force specific database location
-export BEADS_DB=/path/to/specific/.beads/beads.db
+export BEADS_DB=/path/to/specific/.beads/dolt
 ```
 
 ### Configuration Options
@@ -358,8 +358,9 @@ export BEADS_DB=/path/to/specific/.beads/beads.db
 ```bash
 # Configure sync behavior
 bd config set sync.branch beads-sync  # Use separate sync branch
-bd config set sync.auto_commit true       # Auto-commit changes
-bd config set sync.auto_push true         # Auto-push changes
+
+# For git-portable workflows:
+bd daemon start --auto-commit --auto-push
 ```
 
 ## Performance Considerations
@@ -368,12 +369,12 @@ bd config set sync.auto_push true         # Auto-push changes
 
 - **Reduced overhead**: One database instead of per-worktree copies
 - **Instant sync**: Changes visible across all worktrees immediately
-- **Memory efficient**: Single SQLite instance vs multiple
+- **Memory efficient**: Single database instance vs multiple
 - **Git efficient**: One JSONL file to track vs multiple
 
 ### Concurrent Access
 
-- **SQLite locking**: Prevents corruption during simultaneous access
+- **Database locking**: Prevents corruption during simultaneous access (use Dolt server mode for multi-writer)
 - **Git operations**: Safe concurrent commits from different worktrees
 - **Sync coordination**: JSONL-based sync prevents conflicts
 
@@ -447,6 +448,20 @@ For users who want complete separation between code history and issue tracking, 
 
 ### Setup
 
+**Option A: Initialize with BEADS_DIR (simplest)**
+```bash
+# 1. Create the directory structure
+mkdir -p ~/my-project-beads/.beads
+
+# 2. Set BEADS_DIR and initialize from anywhere
+export BEADS_DIR=~/my-project-beads/.beads
+bd init --prefix myproj    # Creates database at $BEADS_DIR
+
+# 3. Initialize git in the beads repo (optional, for sync)
+cd ~/my-project-beads && git init
+```
+
+**Option B: Traditional approach**
 ```bash
 # 1. Create a dedicated beads repository (one-time)
 mkdir ~/my-project-beads
@@ -521,6 +536,7 @@ No daemon conflicts, no branch confusion - all worktrees see the same issues bec
 
 ## See Also
 
+- [REPO_CONTEXT.md](REPO_CONTEXT.md) - RepoContext API for contributors
 - [GIT_INTEGRATION.md](GIT_INTEGRATION.md) - General git integration guide
 - [AGENTS.md](../AGENTS.md) - Agent usage instructions
 - [README.md](../README.md) - Main project documentation
