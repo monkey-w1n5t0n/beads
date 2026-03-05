@@ -18,7 +18,7 @@ func createConfigYaml(beadsDir string, noDbMode bool, prefix string) error {
 
 	noDbLine := "# no-db: false"
 	if noDbMode {
-		noDbLine = "no-db: true  # JSONL-only mode, no SQLite database"
+		noDbLine = "no-db: true  # JSONL-only mode, no database"
 	}
 
 	// In no-db mode, we need to persist the prefix in config.yaml
@@ -37,13 +37,17 @@ func createConfigYaml(beadsDir string, noDbMode bool, prefix string) error {
 # Example: issue-prefix: "myproject" creates issues like "myproject-1", "myproject-2", etc.
 %s
 
-# Use no-db mode: load from JSONL, write back after each command
+# Use no-db mode: JSONL-only, no Dolt database
 # When true, bd will use .beads/issues.jsonl as the source of truth
-# instead of the Dolt database
 %s
 
 # Enable JSON output by default
 # json: false
+
+# Feedback title formatting for mutating commands (create/update/close/dep/edit)
+# 0 = hide titles, N > 0 = truncate to N characters
+# output:
+#   title-length: 255
 
 # Default actor for audit trails (overridden by BD_ACTOR or --actor)
 # actor: ""
@@ -54,12 +58,20 @@ func createConfigYaml(beadsDir string, noDbMode bool, prefix string) error {
 # events-export: false
 
 # Multi-repo configuration (experimental - bd-307)
-# Allows hydrating from multiple repositories and routing writes to the correct JSONL
+# Allows hydrating from multiple repositories and routing writes to the correct database
 # repos:
 #   primary: "."  # Primary repo (where this database lives)
 #   additional:   # Additional repos to hydrate from (read-only)
 #     - ~/beads-planning  # Personal planning repo
 #     - ~/work-planning   # Work planning repo
+
+# JSONL backup (periodic export for off-machine recovery)
+# Auto-enabled when a git remote exists. Override explicitly:
+# backup:
+#   enabled: false     # Disable auto-backup entirely
+#   interval: 15m      # Minimum time between auto-exports
+#   git-push: false    # Disable git push (export locally only)
+#   git-repo: ""       # Separate git repo for backups (default: project repo)
 
 # Integration settings (access with 'bd config get/set')
 # These are stored in the database, not in this file:
@@ -112,17 +124,17 @@ bd list
 bd show <issue-id>
 
 # Update issue status
-bd update <issue-id> --status in_progress
+bd update <issue-id> --claim
 bd update <issue-id> --status done
 
-# Sync with git remote
-bd sync
+# Sync with Dolt remote
+bd dolt push
 ` + "```" + `
 
 ### Working with Issues
 
 Issues in Beads are:
-- **Git-native**: Stored in ` + "`.beads/issues.jsonl`" + ` and synced like code
+- **Git-native**: Stored in Dolt database with version control and branching
 - **AI-friendly**: CLI-first design works perfectly with AI coding agents
 - **Branch-aware**: Issues can follow your branch workflow
 - **Always in sync**: Auto-syncs with your commits
@@ -142,7 +154,7 @@ Issues in Beads are:
 🔧 **Git Integration**
 - Automatic sync with git commits
 - Branch-aware issue tracking
-- Intelligent JSONL merge resolution
+- Dolt-native three-way merge resolution
 
 ## Get Started with Beads
 

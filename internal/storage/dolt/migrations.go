@@ -21,6 +21,12 @@ type Migration struct {
 var migrationsList = []Migration{
 	{"wisp_type_column", migrations.MigrateWispTypeColumn},
 	{"spec_id_column", migrations.MigrateSpecIDColumn},
+	{"orphan_detection", migrations.DetectOrphanedChildren},
+	{"wisps_table", migrations.MigrateWispsTable},
+	{"wisp_auxiliary_tables", migrations.MigrateWispAuxiliaryTables},
+	{"issue_counter_table", migrations.MigrateIssueCounterTable},
+	{"infra_to_wisps", migrations.MigrateInfraToWisps},
+	{"wisp_dep_type_index", migrations.MigrateWispDepTypeIndex},
 }
 
 // RunMigrations executes all registered Dolt migrations in order.
@@ -42,6 +48,25 @@ func RunMigrations(db *sql.DB) error {
 		}
 	}
 
+	return nil
+}
+
+// CreateIgnoredTables re-creates dolt_ignore'd tables (wisps, wisp_*)
+// on the current branch. These tables only exist in the working set and
+// are not inherited when branching. Safe to call repeatedly (idempotent).
+// Exported for use by test helpers in other packages.
+func CreateIgnoredTables(db *sql.DB) error {
+	return createIgnoredTables(db)
+}
+
+// createIgnoredTables is the internal implementation.
+func createIgnoredTables(db *sql.DB) error {
+	if err := migrations.MigrateWispsTable(db); err != nil {
+		return fmt.Errorf("wisps table: %w", err)
+	}
+	if err := migrations.MigrateWispAuxiliaryTables(db); err != nil {
+		return fmt.Errorf("wisp auxiliary tables: %w", err)
+	}
 	return nil
 }
 

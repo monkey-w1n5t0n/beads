@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 )
@@ -71,10 +73,10 @@ Examples:
 		// Get the current issue
 		issue, err := store.GetIssue(ctx, id)
 		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				FatalErrorRespectJSON("issue %s not found", id)
+			}
 			FatalErrorRespectJSON("fetching issue %s: %v", id, err)
-		}
-		if issue == nil {
-			FatalErrorRespectJSON("issue %s not found", id)
 		}
 
 		// Get the current field value
@@ -98,7 +100,12 @@ Examples:
 			FatalErrorRespectJSON("creating temp file: %v", err)
 		}
 		tmpPath := tmpFile.Name()
-		defer func() { _ = os.Remove(tmpPath) }()
+		editSaved := false
+		defer func() {
+			if editSaved {
+				_ = os.Remove(tmpPath)
+			}
+		}()
 
 		// Write current value to temp file
 		if _, err := tmpFile.WriteString(currentValue); err != nil {
@@ -126,30 +133,50 @@ Examples:
 			FatalErrorRespectJSON("reading edited file: %v", err)
 		}
 
-		newValue := string(editedContent)
+		newValue := strings.TrimSpace(string(editedContent))
 
 		// Check if the value changed
 		if newValue == currentValue {
+			editSaved = true // no changes — safe to remove temp file
 			fmt.Println("No changes made")
 			return
 		}
 
 		// Validate title if editing title
-		if fieldToEdit == "title" && strings.TrimSpace(newValue) == "" {
+		if fieldToEdit == "title" && newValue == "" {
 			FatalErrorRespectJSON("title cannot be empty")
 		}
 
-		// Update the issue
+		// Update the issue — retry once if the DB connection went stale
+		// during a long editor session (GH-2267).
 		updates := map[string]interface{}{
 			fieldToEdit: newValue,
 		}
 
-		if err := store.UpdateIssue(ctx, id, updates, actor); err != nil {
+		err = store.UpdateIssue(ctx, id, updates, actor)
+		if err != nil {
+			// Connection may have gone stale while the editor was open.
+			// Ping to force the pool to discard dead connections, then retry.
+			if pingErr := store.DB().PingContext(ctx); pingErr != nil {
+				// Ping failed — try to force a fresh connection via sql.DB pool reset.
+				store.DB().SetConnMaxIdleTime(0)
+				_ = store.DB().PingContext(ctx)
+			}
+			err = store.UpdateIssue(ctx, id, updates, actor)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Your edits are preserved in: %s\n", tmpPath)
 			FatalErrorRespectJSON("updating issue: %v", err)
+		}
+		editSaved = true
+
+		displayTitle := issue.Title
+		if fieldToEdit == "title" {
+			displayTitle = newValue
 		}
 
 		fieldName := strings.ReplaceAll(fieldToEdit, "_", " ")
-		fmt.Printf("%s Updated %s for issue: %s\n", ui.RenderPass("✓"), fieldName, id)
+		fmt.Printf("%s Updated %s for issue: %s\n", ui.RenderPass("✓"), fieldName, formatFeedbackID(id, displayTitle))
 	},
 }
 

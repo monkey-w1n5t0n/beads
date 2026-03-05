@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -71,8 +71,7 @@ Use --limit or --range to view specific steps:
 		}
 
 		if store == nil {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
+			FatalError("no database connection")
 		}
 
 		// Parse range flag if provided
@@ -81,8 +80,7 @@ Use --limit or --range to view specific steps:
 			var err error
 			rangeStart, rangeEnd, err = parseRange(rangeStr)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid range '%s': %v\n", rangeStr, err)
-				os.Exit(1)
+				FatalError("invalid range '%s': %v", rangeStr, err)
 			}
 		}
 
@@ -95,15 +93,13 @@ Use --limit or --range to view specific steps:
 			// Explicit molecule ID given
 			moleculeID, err := utils.ResolvePartialID(ctx, store, args[0])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: molecule '%s' not found\n", args[0])
-				os.Exit(1)
+				FatalError("molecule '%s' not found", args[0])
 			}
 
 			// Check child count first for large molecule detection
 			stats, err := store.GetMoleculeProgress(ctx, moleculeID)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-				os.Exit(1)
+				FatalError("loading molecule: %v", err)
 			}
 
 			// If large molecule and no explicit flags, show summary
@@ -114,8 +110,7 @@ Use --limit or --range to view specific steps:
 
 			progress, err := getMoleculeProgress(ctx, store, moleculeID)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-				os.Exit(1)
+				FatalError("loading molecule: %v", err)
 			}
 
 			// Apply limit or range filtering
@@ -146,8 +141,8 @@ Use --limit or --range to view specific steps:
 				}
 				fmt.Println(".")
 				fmt.Println("\nTo start work on a molecule:")
-				fmt.Println("  bd mol pour <proto-id>      # Instantiate a molecule from template")
-				fmt.Println("  bd update <step-id> --status in_progress  # Claim a step")
+				fmt.Println("  bd mol wisp create <proto-id>  # Instantiate as ephemeral wisp")
+				fmt.Println("  bd update <step-id> --claim  # Claim a step")
 				return
 			}
 		}
@@ -264,12 +259,17 @@ func findInProgressMolecules(ctx context.Context, s *dolt.DoltStore, agent strin
 		return nil
 	}
 
-	// For each in_progress issue, find its parent molecule
+	// Batch-find parent molecules for all in_progress issues (bd-hn4q)
+	issueIDs := make([]string, len(inProgressIssues))
+	for i, issue := range inProgressIssues {
+		issueIDs[i] = issue.ID
+	}
+	moleculeRoots := findParentMolecules(ctx, s, issueIDs)
+
 	moleculeMap := make(map[string]*MoleculeProgress)
 	for _, issue := range inProgressIssues {
-		moleculeID := findParentMolecule(ctx, s, issue.ID)
+		moleculeID := moleculeRoots[issue.ID]
 		if moleculeID == "" {
-			// Not part of a molecule, skip
 			continue
 		}
 
@@ -310,9 +310,21 @@ func findHookedMolecules(ctx context.Context, s *dolt.DoltStore, agent string) [
 		return nil
 	}
 
-	// For each hooked issue, check for blocks dependencies on molecules
+	// For each hooked issue, check if it IS a molecule or has blocks deps on one
 	moleculeMap := make(map[string]*MoleculeProgress)
 	for _, issue := range hookedIssues {
+		// Check if the hooked issue itself is a molecule (e.g., patrol wisps
+		// are directly hooked without a separate handoff bead). hq-3paz0m
+		if issue.IssueType == types.TypeEpic {
+			if _, exists := moleculeMap[issue.ID]; !exists {
+				progress, err := getMoleculeProgress(ctx, s, issue.ID)
+				if err == nil {
+					moleculeMap[issue.ID] = progress
+					continue
+				}
+			}
+		}
+
 		deps, err := s.GetDependencyRecords(ctx, issue.ID)
 		if err != nil {
 			continue
@@ -365,52 +377,119 @@ func findHookedMolecules(ctx context.Context, s *dolt.DoltStore, agent string) [
 	return molecules
 }
 
-// findParentMolecule walks up parent-child chain to find the root molecule
-func findParentMolecule(ctx context.Context, s *dolt.DoltStore, issueID string) string {
-	visited := make(map[string]bool)
-	currentID := issueID
+// findParentMolecules batch-finds the root molecule for multiple issue IDs.
+// Returns a map of issueID → moleculeRootID for issues that belong to a molecule.
+// Issues not part of a molecule are omitted from the result.
+//
+// This replaces the previous N+1 pattern where findParentMolecule was called
+// in a loop, issuing GetDependencyRecords + GetIssue per level per issue.
+// Instead, this walks parent-child chains level-by-level using batch queries,
+// reducing O(N * depth) round-trips to O(depth). (bd-hn4q)
+func findParentMolecules(ctx context.Context, s *dolt.DoltStore, issueIDs []string) map[string]string {
+	if len(issueIDs) == 0 {
+		return nil
+	}
 
-	for !visited[currentID] {
-		visited[currentID] = true
+	// rootOf accumulates: startID -> rootID for chains that terminated
+	rootOf := make(map[string]string, len(issueIDs))
 
-		// Get dependencies for current issue
-		deps, err := s.GetDependencyRecords(ctx, currentID)
-		if err != nil {
-			return ""
+	// current tracks: startID -> currentAncestorID (still walking up)
+	current := make(map[string]string, len(issueIDs))
+	for _, id := range issueIDs {
+		current[id] = id
+	}
+
+	// Walk up parent-child chains in batch, level by level
+	for depth := 0; depth < 50 && len(current) > 0; depth++ {
+		// Collect unique IDs at current level
+		seen := make(map[string]bool, len(current))
+		toCheck := make([]string, 0, len(current))
+		for _, curID := range current {
+			if !seen[curID] {
+				seen[curID] = true
+				toCheck = append(toCheck, curID)
+			}
 		}
 
-		// Find parent-child dependency where current is the child
-		var parentID string
-		for _, dep := range deps {
-			if dep.Type == types.DepParentChild && dep.IssueID == currentID {
-				parentID = dep.DependsOnID
+		// Batch fetch parent-child deps for all current ancestors
+		allDeps, err := s.GetDependencyRecordsForIssues(ctx, toCheck)
+		if err != nil {
+			return nil
+		}
+
+		// Build parent lookup: childID -> parentID
+		parentOf := make(map[string]string, len(allDeps))
+		for childID, deps := range allDeps {
+			for _, dep := range deps {
+				if dep.Type == types.DepParentChild {
+					parentOf[childID] = dep.DependsOnID
+					break
+				}
+			}
+		}
+
+		// Advance chains that have parents, finalize those that don't
+		nextCurrent := make(map[string]string)
+		for startID, curID := range current {
+			if parent, ok := parentOf[curID]; ok {
+				nextCurrent[startID] = parent
+			} else {
+				rootOf[startID] = curID
+			}
+		}
+		current = nextCurrent
+	}
+
+	// Anything still walking after max depth — treat as root
+	for startID, curID := range current {
+		rootOf[startID] = curID
+	}
+
+	// Batch fetch root issues to check if they're molecules
+	uniqueRoots := make(map[string]bool, len(rootOf))
+	for _, rootID := range rootOf {
+		uniqueRoots[rootID] = true
+	}
+	rootIDs := make([]string, 0, len(uniqueRoots))
+	for id := range uniqueRoots {
+		rootIDs = append(rootIDs, id)
+	}
+
+	rootIssues, err := s.GetIssuesByIDs(ctx, rootIDs)
+	if err != nil {
+		return nil
+	}
+
+	isMolecule := make(map[string]bool, len(rootIssues))
+	for _, issue := range rootIssues {
+		if issue.IssueType == types.TypeEpic {
+			isMolecule[issue.ID] = true
+			continue
+		}
+		for _, label := range issue.Labels {
+			if label == BeadsTemplateLabel {
+				isMolecule[issue.ID] = true
 				break
 			}
 		}
-
-		if parentID == "" {
-			// No parent - check if current issue is a molecule root
-			issue, err := s.GetIssue(ctx, currentID)
-			if err != nil || issue == nil {
-				return ""
-			}
-			// Check if it has the template label (molecules are spawned from templates)
-			for _, label := range issue.Labels {
-				if label == BeadsTemplateLabel {
-					return currentID
-				}
-			}
-			// Also check if it's an epic with children (ad-hoc molecule)
-			if issue.IssueType == types.TypeEpic {
-				return currentID
-			}
-			return ""
-		}
-
-		currentID = parentID
 	}
 
-	return ""
+	// Filter to only molecule roots
+	result := make(map[string]string, len(rootOf))
+	for startID, rootID := range rootOf {
+		if isMolecule[rootID] {
+			result[startID] = rootID
+		}
+	}
+
+	return result
+}
+
+// findParentMolecule walks up the parent-child chain to find the root molecule
+// for a single issue. Returns "" if the issue is not part of a molecule.
+func findParentMolecule(ctx context.Context, s *dolt.DoltStore, issueID string) string {
+	roots := findParentMolecules(ctx, s, []string{issueID})
+	return roots[issueID]
 }
 
 // sortStepsByDependencyOrder sorts steps by their dependency order
@@ -462,7 +541,7 @@ func printMoleculeProgress(mol *MoleculeProgress) {
 
 	if mol.NextStep != nil && mol.CurrentStep == nil {
 		fmt.Printf("\nNext ready: %s - %s\n", mol.NextStep.ID, mol.NextStep.Title)
-		fmt.Printf("  Start with: bd update %s --status in_progress\n", mol.NextStep.ID)
+		fmt.Printf("  Start with: bd update %s --claim\n", mol.NextStep.ID)
 	}
 
 	// Show hint about viewing step instructions
@@ -502,9 +581,12 @@ type ContinueResult struct {
 	MoleculeID   string       `json:"molecule_id,omitempty"`
 }
 
-// AdvanceToNextStep finds the next ready step in a molecule after closing a step
-// If autoClaim is true, it marks the next step as in_progress
-// Returns nil if the issue is not part of a molecule
+// AdvanceToNextStep finds the next ready step in a molecule after closing a step.
+// If autoClaim is true, it marks the next step as in_progress using optimistic
+// concurrency control: the step's status is re-verified inside a transaction to
+// guard against TOCTOU races where multiple agents identify and try to claim the
+// same step concurrently.
+// Returns nil if the issue is not part of a molecule.
 func AdvanceToNextStep(ctx context.Context, s *dolt.DoltStore, closedStepID string, autoClaim bool, actorName string) (*ContinueResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
@@ -540,31 +622,52 @@ func AdvanceToNextStep(ctx context.Context, s *dolt.DoltStore, closedStepID stri
 		return result, nil
 	}
 
-	// Find next ready step
-	var nextStep *types.Issue
+	// Collect all ready steps (not just the first) so we can fall back
+	// if a concurrent agent claims one before us.
+	var readySteps []*types.Issue
 	for _, step := range progress.Steps {
 		if step.Status == "ready" {
-			nextStep = step.Issue
-			break
+			readySteps = append(readySteps, step.Issue)
 		}
 	}
 
-	if nextStep == nil {
+	if len(readySteps) == 0 {
 		// No ready steps - might be blocked
 		return result, nil
 	}
 
-	result.NextStep = nextStep
+	result.NextStep = readySteps[0]
 
-	// Auto-claim if requested
+	// Auto-claim if requested, using optimistic concurrency control.
+	// Re-read the step inside a transaction to verify it hasn't been claimed
+	// by another agent between our read and write (TOCTOU guard).
 	if autoClaim {
-		updates := map[string]interface{}{
-			"status": types.StatusInProgress,
+		for _, candidate := range readySteps {
+			err := s.RunInTransaction(ctx, fmt.Sprintf("bd: advance to step %s", candidate.ID), func(tx storage.Transaction) error {
+				// Re-read inside transaction to check current status
+				current, txErr := tx.GetIssue(ctx, candidate.ID)
+				if txErr != nil {
+					return txErr
+				}
+				if current == nil {
+					return fmt.Errorf("step %s not found", candidate.ID)
+				}
+				// Only claim if still in open status (not already claimed)
+				if current.Status != types.StatusOpen {
+					return fmt.Errorf("step %s already claimed (status: %s)", candidate.ID, current.Status)
+				}
+				updates := map[string]interface{}{
+					"status": types.StatusInProgress,
+				}
+				return tx.UpdateIssue(ctx, candidate.ID, updates, actorName)
+			})
+			if err == nil {
+				result.NextStep = candidate
+				result.AutoAdvanced = true
+				break
+			}
+			// This candidate was already claimed; try the next ready step
 		}
-		if err := s.UpdateIssue(ctx, nextStep.ID, updates, actorName); err != nil {
-			return result, fmt.Errorf("could not claim next step: %w", err)
-		}
-		result.AutoAdvanced = true
 	}
 
 	return result, nil
@@ -593,7 +696,7 @@ func PrintContinueResult(result *ContinueResult) {
 	if result.AutoAdvanced {
 		fmt.Printf("\n%s Marked in_progress (use --no-auto to skip)\n", ui.RenderWarn("→"))
 	} else {
-		fmt.Printf("\nStart with: bd update %s --status in_progress\n", result.NextStep.ID)
+		fmt.Printf("\nStart with: bd update %s --claim\n", result.NextStep.ID)
 	}
 }
 

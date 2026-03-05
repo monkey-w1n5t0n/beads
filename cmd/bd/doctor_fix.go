@@ -202,18 +202,17 @@ func applyFixesInteractive(path string, issues []doctorCheck) {
 func applyFixList(path string, fixes []doctorCheck) {
 	// Apply fixes in a dependency-aware order.
 	// Rough dependency chain:
-	// permissions/lock cleanup → config sanity → DB integrity/migrations → DB↔JSONL sync.
+	// permissions/lock cleanup → config sanity → DB integrity/migrations.
 	order := []string{
 		"Lock Files",
 		"Permissions",
 		"Daemon Health",
 		"Database Config",
-		"JSONL Config",
+		"Config Values",
 		"Database Integrity",
 		"Database",
+		"Fresh Clone",
 		"Schema Compatibility",
-		"JSONL Integrity",
-		"Sync Divergence",
 	}
 	priority := make(map[string]int, len(order))
 	for i, name := range order {
@@ -246,15 +245,18 @@ func applyFixList(path string, fixes []doctorCheck) {
 		var err error
 		switch check.Name {
 		case "Gitignore":
-			err = doctor.FixGitignore()
+			err = doctor.FixGitignore(path)
+		case "Project Gitignore":
+			err = doctor.FixProjectGitignore(path)
 		case "Redirect Tracking":
-			err = doctor.FixRedirectTracking()
+			err = doctor.FixRedirectTracking(path)
 		case "Last-Touched Tracking":
-			err = doctor.FixLastTouchedTracking()
+			err = doctor.FixLastTouchedTracking(path)
 		case "Git Hooks":
 			err = fix.GitHooks(path)
 		case "Sync Divergence":
-			err = fix.SyncDivergence(path)
+			fmt.Printf("  ⚠ Sync divergence fix removed (Dolt-native sync)\n")
+			continue
 		case "Permissions":
 			err = fix.Permissions(path)
 		case "Database":
@@ -264,9 +266,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 				err = mErr
 			}
 		case "Database Integrity":
-			// Corruption detected - try recovery from JSONL
-			// Pass force and source flags for enhanced recovery
-			err = fix.DatabaseCorruptionRecoveryWithOptions(path, doctorForce, doctorSource)
+			// Corruption detected - backup and reinitialize
+			err = fix.DatabaseIntegrity(path)
 		case "Schema Compatibility":
 			err = fix.SchemaCompatibility(path)
 		case "Repo Fingerprint":
@@ -278,11 +279,11 @@ func applyFixList(path string, fixes []doctorCheck) {
 		case "Database Config":
 			err = fix.DatabaseConfig(path)
 		case "JSONL Config":
-			err = fix.LegacyJSONLConfig(path)
-		case "JSONL Integrity":
-			err = fix.JSONLIntegrity(path)
+			fmt.Printf("  ⚠ JSONL config migration removed (Dolt-native sync)\n")
+			continue
 		case "Untracked Files":
-			err = fix.UntrackedJSONL(path)
+			fmt.Printf("  ⚠ Untracked JSONL fix removed (Dolt-native storage)\n")
+			continue
 		case "Merge Artifacts":
 			err = fix.MergeArtifacts(path)
 		case "Orphaned Dependencies":
@@ -304,7 +305,7 @@ func applyFixList(path string, fixes []doctorCheck) {
 			continue
 		case "Git Conflicts":
 			// No auto-fix: git conflicts require manual resolution
-			fmt.Printf("  ⚠ Resolve conflicts manually: git checkout --ours or --theirs .beads/issues.jsonl\n")
+			fmt.Printf("  ⚠ Resolve conflicts manually\n")
 			continue
 		case "Stale Closed Issues":
 			// consolidate cleanup into doctor --fix
@@ -323,8 +324,22 @@ func applyFixList(path string, fixes []doctorCheck) {
 			err = fix.PatrolPollution(path)
 		case "Lock Files":
 			err = fix.StaleLockFiles(path)
+		case "Fresh Clone":
+			err = fix.FreshCloneImport(path, Version)
+		case "Pending Migrations":
+			err = fixPendingMigrations(path)
+		case "Config Values":
+			err = fix.ConfigValues(path)
 		case "Classic Artifacts":
 			err = fix.ClassicArtifacts(path)
+		case "Remote Consistency":
+			err = fix.RemoteConsistency(path)
+		case "Dolt Schema":
+			// GH#2160: Pre-#2142 migrations may have wrong database configured.
+			// Probe the server and backfill dolt_database in metadata.json.
+			err = fix.FixMissingDoltDatabase(path)
+		case "Git Merge Driver":
+			err = doctor.FixMergeDriver()
 		default:
 			fmt.Printf("  ⚠ No automatic fix available for %s\n", check.Name)
 			fmt.Printf("  Manual fix: %s\n", check.Fix)
@@ -346,4 +361,42 @@ func applyFixList(path string, fixes []doctorCheck) {
 	if errorCount > 0 {
 		fmt.Println("\nSome fixes failed. Please review the errors above and apply manual fixes as needed.")
 	}
+}
+
+func fixPendingMigrations(path string) error {
+	pending := doctor.DetectPendingMigrations(path)
+	if len(pending) == 0 {
+		return nil
+	}
+
+	for _, migration := range pending {
+		switch migration.Name {
+		case "hooks":
+			plan, err := doctor.PlanHookMigration(path)
+			if err != nil {
+				return fmt.Errorf("building hook migration plan: %w", err)
+			}
+
+			execPlan := buildHookMigrationExecutionPlan(plan)
+			if len(execPlan.BlockingErrors) > 0 {
+				return fmt.Errorf("hook migration is blocked:\n- %s", strings.Join(execPlan.BlockingErrors, "\n- "))
+			}
+
+			summary, err := applyHookMigrationExecution(execPlan)
+			if err != nil {
+				return fmt.Errorf("applying hook migration: %w", err)
+			}
+
+			fmt.Printf(
+				"  Hook migration applied: %d hook(s) written, %d artifact(s) retired, %d artifact(s) skipped\n",
+				summary.WrittenHookCount,
+				summary.RetiredCount,
+				summary.SkippedCount,
+			)
+		default:
+			return fmt.Errorf("no automatic fix available for pending migration %q", migration.Name)
+		}
+	}
+
+	return nil
 }

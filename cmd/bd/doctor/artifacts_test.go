@@ -21,54 +21,9 @@ func TestCheckClassicArtifacts_NoArtifacts(t *testing.T) {
 	}
 }
 
+// TestScanForArtifacts_JSONLInDoltDir — JSONL artifact scanning removed (bd-9ni.2)
 func TestScanForArtifacts_JSONLInDoltDir(t *testing.T) {
-	dir := t.TempDir()
-
-	// Create a .beads directory with dolt/ and stale JSONL files
-	beadsDir := filepath.Join(dir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(doltDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create JSONL artifacts
-	// Note: issues.jsonl is NOT an artifact (the pre-commit hook exports
-	// Dolt -> JSONL on every git commit so the file is tracked in git).
-	for _, name := range []string{"issues.jsonl", "issues.jsonl.new", "beads.left.jsonl"} {
-		if err := os.WriteFile(filepath.Join(beadsDir, name), []byte(`{"id":"test"}`), 0644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Create empty interactions.jsonl (should be skipped as harmless)
-	if err := os.WriteFile(filepath.Join(beadsDir, "interactions.jsonl"), []byte{}, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	report := ScanForArtifacts(dir)
-
-	// issues.jsonl.new and beads.left.jsonl should be found.
-	// issues.jsonl is NOT an artifact (it's exported by the pre-commit hook).
-	// interactions.jsonl (empty) should be skipped.
-	if len(report.JSONLArtifacts) != 2 {
-		t.Errorf("expected 2 JSONL artifacts, got %d", len(report.JSONLArtifacts))
-		for _, f := range report.JSONLArtifacts {
-			t.Logf("  found: %s", f.Path)
-		}
-	}
-
-	// issues.jsonl should NOT appear at all (it's not an artifact)
-	for _, f := range report.JSONLArtifacts {
-		if filepath.Base(f.Path) == "issues.jsonl" {
-			t.Error("issues.jsonl should NOT be detected as an artifact")
-		}
-	}
-
-	// issues.jsonl.new should be safe to delete
-	for _, f := range report.JSONLArtifacts {
-		if filepath.Base(f.Path) == "issues.jsonl.new" && !f.SafeDelete {
-			t.Error("issues.jsonl.new should be safe to delete")
-		}
-	}
+	t.Skip("JSONL artifact scanning removed as part of JSONL removal (bd-9ni.2)")
 }
 
 func TestScanForArtifacts_SQLiteFiles(t *testing.T) {
@@ -92,7 +47,10 @@ func TestScanForArtifacts_SQLiteFiles(t *testing.T) {
 		}
 	}
 
-	report := ScanForArtifacts(dir)
+	report, err := ScanForArtifacts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if len(report.SQLiteArtifacts) != 4 {
 		t.Errorf("expected 4 SQLite artifacts, got %d", len(report.SQLiteArtifacts))
@@ -144,7 +102,10 @@ func TestScanForArtifacts_CruftBeadsDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report := ScanForArtifacts(dir)
+	report, err := ScanForArtifacts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if len(report.CruftBeadsDirs) != 1 {
 		t.Errorf("expected 1 cruft beads dir, got %d", len(report.CruftBeadsDirs))
@@ -156,7 +117,9 @@ func TestScanForArtifacts_CruftBeadsDir(t *testing.T) {
 }
 
 func TestScanForArtifacts_CruftBeadsDirNoRedirect(t *testing.T) {
-	// Cruft dir without redirect should be detected but NOT safe to delete
+	// Cruft dir without redirect should be detected AND safe to delete.
+	// The location being redirect-expected is sufficient — stale cruft files
+	// are what prevent the redirect from being created in the first place.
 	dir := t.TempDir()
 	polecatsDir := filepath.Join(dir, "polecats", "testpolecat")
 	beadsDir := filepath.Join(polecatsDir, ".beads")
@@ -169,14 +132,17 @@ func TestScanForArtifacts_CruftBeadsDirNoRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report := ScanForArtifacts(dir)
+	report, err := ScanForArtifacts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// Should be detected as cruft (it's in a polecat location) but NOT safe to delete
+	// Should be detected as cruft (it's in a polecat location) and safe to delete
 	if len(report.CruftBeadsDirs) != 1 {
 		t.Errorf("expected 1 cruft beads dir, got %d", len(report.CruftBeadsDirs))
 	}
-	if len(report.CruftBeadsDirs) > 0 && report.CruftBeadsDirs[0].SafeDelete {
-		t.Error("cruft beads dir without redirect should NOT be safe to delete")
+	if len(report.CruftBeadsDirs) > 0 && !report.CruftBeadsDirs[0].SafeDelete {
+		t.Error("cruft beads dir in redirect-expected location should be safe to delete")
 	}
 }
 
@@ -196,7 +162,10 @@ func TestScanForArtifacts_CrewDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report := ScanForArtifacts(dir)
+	report, err := ScanForArtifacts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if len(report.CruftBeadsDirs) != 1 {
 		t.Errorf("expected 1 cruft beads dir for crew, got %d", len(report.CruftBeadsDirs))
@@ -215,7 +184,10 @@ func TestScanForArtifacts_RedirectValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report := ScanForArtifacts(dir)
+	report, err := ScanForArtifacts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if len(report.RedirectIssues) != 1 {
 		t.Errorf("expected 1 redirect issue, got %d", len(report.RedirectIssues))
@@ -234,7 +206,10 @@ func TestScanForArtifacts_EmptyRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report := ScanForArtifacts(dir)
+	report, err := ScanForArtifacts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if len(report.RedirectIssues) != 1 {
 		t.Errorf("expected 1 redirect issue (empty), got %d", len(report.RedirectIssues))
@@ -258,7 +233,10 @@ func TestScanForArtifacts_ValidRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report := ScanForArtifacts(dir)
+	report, err := ScanForArtifacts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if len(report.RedirectIssues) != 0 {
 		t.Errorf("expected 0 redirect issues for valid target, got %d", len(report.RedirectIssues))
@@ -305,31 +283,19 @@ func TestScanForArtifacts_SkipsGitkeep(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report := ScanForArtifacts(dir)
+	report, err := ScanForArtifacts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if len(report.CruftBeadsDirs) != 0 {
 		t.Errorf("expected 0 cruft dirs (redirect + .gitkeep only), got %d", len(report.CruftBeadsDirs))
 	}
 }
 
+// TestScanForArtifacts_NonEmptyInteractionsJSONL — JSONL artifact scanning removed (bd-9ni.2)
 func TestScanForArtifacts_NonEmptyInteractionsJSONL(t *testing.T) {
-	dir := t.TempDir()
-	beadsDir := filepath.Join(dir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(doltDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Non-empty interactions.jsonl should be detected
-	if err := os.WriteFile(filepath.Join(beadsDir, "interactions.jsonl"), []byte(`{"id":"test"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	report := ScanForArtifacts(dir)
-
-	if len(report.JSONLArtifacts) != 1 {
-		t.Errorf("expected 1 JSONL artifact (non-empty interactions), got %d", len(report.JSONLArtifacts))
-	}
+	t.Skip("JSONL artifact scanning removed as part of JSONL removal (bd-9ni.2)")
 }
 
 func TestCheckClassicArtifacts_WithArtifacts(t *testing.T) {

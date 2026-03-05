@@ -4,7 +4,10 @@ package utils
 
 import (
 	"context"
-	"path/filepath"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"os/exec"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/storage/dolt"
@@ -13,8 +16,20 @@ import (
 
 func newTestStore(t *testing.T) *dolt.DoltStore {
 	t.Helper()
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("Dolt not installed, skipping test")
+	}
+	if testServerPort == 0 {
+		t.Skip("Test Dolt server not running, skipping test")
+	}
 	ctx := context.Background()
-	store, err := dolt.New(ctx, &dolt.Config{Path: filepath.Join(t.TempDir(), "test.db")})
+	dbName := uniqueTestDBName(t)
+	store, err := dolt.New(ctx, &dolt.Config{
+		Path:            t.TempDir(),
+		Database:        dbName,
+		ServerPort:      testServerPort,
+		CreateIfMissing: true, // test creates fresh database
+	})
 	if err != nil {
 		t.Fatalf("Failed to create dolt store: %v", err)
 	}
@@ -24,6 +39,15 @@ func newTestStore(t *testing.T) *dolt.DoltStore {
 	}
 	t.Cleanup(func() { store.Close() })
 	return store
+}
+
+func uniqueTestDBName(t *testing.T) string {
+	t.Helper()
+	buf := make([]byte, 6)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("failed to generate random bytes: %v", err)
+	}
+	return fmt.Sprintf("testdb_%s", hex.EncodeToString(buf))
 }
 
 func TestParseIssueID(t *testing.T) {
@@ -665,6 +689,63 @@ func TestResolvePartialID_CrossPrefix(t *testing.T) {
 				if result != tt.expected {
 					t.Errorf("ResolvePartialID(%q) = %q; want %q", tt.input, result, tt.expected)
 				}
+			}
+		})
+	}
+}
+
+// TestResolvePartialID_Wisp verifies that wisps (ephemeral issues) are resolvable
+// by partial ID. This exercises the explicit wisp fallback in ResolvePartialID.
+func TestResolvePartialID_Wisp(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	// Create a wisp (ephemeral issue) with a wisp-prefixed ID
+	wisp := &types.Issue{
+		ID:        "bd-wisp-t3st",
+		Title:     "Test wisp",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, wisp, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetConfig(ctx, "issue_prefix", "bd"); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "full wisp ID",
+			input:    "bd-wisp-t3st",
+			expected: "bd-wisp-t3st",
+		},
+		{
+			name:     "partial hash",
+			input:    "t3st",
+			expected: "bd-wisp-t3st",
+		},
+		{
+			name:     "wisp prefix with hash",
+			input:    "wisp-t3st",
+			expected: "bd-wisp-t3st",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ResolvePartialID(ctx, store, tt.input)
+			if err != nil {
+				t.Errorf("ResolvePartialID(%q) unexpected error: %v", tt.input, err)
+			}
+			if result != tt.expected {
+				t.Errorf("ResolvePartialID(%q) = %q; want %q", tt.input, result, tt.expected)
 			}
 		})
 	}

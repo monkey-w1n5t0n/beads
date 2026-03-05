@@ -44,14 +44,14 @@ func CheckLegacyBeadsSlashCommands(repoPath string) DoctorCheck {
 	if len(filesWithLegacyCommands) == 0 {
 		return DoctorCheck{
 			Name:    "Legacy Commands",
-			Status:  "ok",
+			Status:  StatusOK,
 			Message: "No legacy beads slash commands detected",
 		}
 	}
 
 	return DoctorCheck{
 		Name:    "Legacy Commands",
-		Status:  "warning",
+		Status:  StatusWarning,
 		Message: fmt.Sprintf("Old beads integration detected in %s", strings.Join(filesWithLegacyCommands, ", ")),
 		Detail: "Found: /beads:* slash command references (deprecated)\n" +
 			"  These commands are token-inefficient (~10.5k tokens per session)",
@@ -113,14 +113,14 @@ func CheckLegacyMCPToolReferences(repoPath string) DoctorCheck {
 	if len(filesWithMCPRefs) == 0 {
 		return DoctorCheck{
 			Name:    "MCP Tool References",
-			Status:  "ok",
+			Status:  StatusOK,
 			Message: "No MCP tool references in documentation",
 		}
 	}
 
 	return DoctorCheck{
 		Name:    "MCP Tool References",
-		Status:  "warning",
+		Status:  StatusWarning,
 		Message: fmt.Sprintf("MCP tool references found in %s", strings.Join(filesWithMCPRefs, ", ")),
 		Detail: "Found: Direct MCP tool name references (e.g., mcp__beads_beads__list)\n" +
 			"  MCP tool calls consume ~10.5k tokens per session for tool scanning",
@@ -165,14 +165,14 @@ func CheckAgentDocumentation(repoPath string) DoctorCheck {
 	if len(foundDocs) > 0 {
 		return DoctorCheck{
 			Name:    "Agent Documentation",
-			Status:  "ok",
+			Status:  StatusOK,
 			Message: fmt.Sprintf("Documentation found: %s", strings.Join(foundDocs, ", ")),
 		}
 	}
 
 	return DoctorCheck{
 		Name:    "Agent Documentation",
-		Status:  "warning",
+		Status:  StatusWarning,
 		Message: "No agent documentation found",
 		Detail: "Missing: AGENTS.md or CLAUDE.md\n" +
 			"  Documenting workflow helps AI agents work more effectively",
@@ -189,8 +189,9 @@ func CheckAgentDocumentation(repoPath string) DoctorCheck {
 	}
 }
 
-// CheckDatabaseConfig verifies that the configured database and JSONL paths
-// match what actually exists on disk.
+// CheckDatabaseConfig verifies that the configured database path matches what
+// actually exists on disk. For Dolt backends, data is on the server. For legacy
+// backends, this checks that .db files match the configuration.
 func CheckDatabaseConfig(repoPath string) DoctorCheck {
 	beadsDir := filepath.Join(repoPath, ".beads")
 
@@ -200,7 +201,7 @@ func CheckDatabaseConfig(repoPath string) DoctorCheck {
 		// No config or error reading - use defaults
 		return DoctorCheck{
 			Name:    "Database Config",
-			Status:  "ok",
+			Status:  StatusOK,
 			Message: "Using default configuration",
 		}
 	}
@@ -209,7 +210,7 @@ func CheckDatabaseConfig(repoPath string) DoctorCheck {
 	if cfg.GetBackend() == configfile.BackendDolt {
 		return DoctorCheck{
 			Name:    "Database Config",
-			Status:  "ok",
+			Status:  StatusOK,
 			Message: "Dolt backend (data on server)",
 		}
 	}
@@ -235,61 +236,17 @@ func CheckDatabaseConfig(repoPath string) DoctorCheck {
 		}
 	}
 
-	// Check if configured JSONL exists
-	if cfg.JSONLExport != "" {
-		if cfg.JSONLExport == "deletions.jsonl" || cfg.JSONLExport == "interactions.jsonl" || cfg.JSONLExport == "molecules.jsonl" {
-			return DoctorCheck{
-				Name:    "Database Config",
-				Status:  "error",
-				Message: fmt.Sprintf("Invalid jsonl_export %q (system file)", cfg.JSONLExport),
-				Detail:  "metadata.json jsonl_export must reference the git-tracked issues export (typically issues.jsonl), not a system log file.",
-				Fix:     "Run 'bd doctor --fix' to reset metadata.json jsonl_export to issues.jsonl, then commit the change.",
-			}
-		}
-
-		jsonlPath := cfg.JSONLPath(beadsDir)
-		if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
-			// Check if other .jsonl files exist
-			entries, _ := os.ReadDir(beadsDir) // Best effort: nil entries means no legacy files to check
-			var otherJSONLs []string
-			for _, entry := range entries {
-				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jsonl") {
-					name := entry.Name()
-					// Skip backups
-					lowerName := strings.ToLower(name)
-					if !strings.Contains(lowerName, "backup") &&
-						!strings.Contains(lowerName, ".orig") &&
-						!strings.Contains(lowerName, ".bak") &&
-						!strings.Contains(lowerName, "~") &&
-						!strings.HasPrefix(lowerName, "backup_") &&
-						name != "deletions.jsonl" &&
-						name != "interactions.jsonl" &&
-						name != "molecules.jsonl" &&
-						!strings.Contains(lowerName, ".base.jsonl") &&
-						!strings.Contains(lowerName, ".left.jsonl") &&
-						!strings.Contains(lowerName, ".right.jsonl") {
-						otherJSONLs = append(otherJSONLs, name)
-					}
-				}
-			}
-			if len(otherJSONLs) > 0 {
-				issues = append(issues, fmt.Sprintf("Configured JSONL '%s' not found, but found: %s",
-					cfg.JSONLExport, strings.Join(otherJSONLs, ", ")))
-			}
-		}
-	}
-
 	if len(issues) == 0 {
 		return DoctorCheck{
 			Name:    "Database Config",
-			Status:  "ok",
+			Status:  StatusOK,
 			Message: "Configuration matches existing files",
 		}
 	}
 
 	return DoctorCheck{
 		Name:    "Database Config",
-		Status:  "warning",
+		Status:  StatusWarning,
 		Message: "Configuration mismatch detected",
 		Detail:  strings.Join(issues, "\n  "),
 		Fix: "Run 'bd doctor --fix' to auto-detect and fix mismatches, or manually:\n" +
@@ -300,7 +257,7 @@ func CheckDatabaseConfig(repoPath string) DoctorCheck {
 }
 
 // CheckFreshClone detects if this is a fresh clone that needs 'bd init'.
-// A fresh clone has JSONL with issues but no database file.
+// A fresh clone has legacy JSONL with issues but no database (Dolt or SQLite).
 func CheckFreshClone(repoPath string) DoctorCheck {
 	backend, beadsDir := getBackendAndBeadsDir(repoPath)
 
@@ -308,7 +265,7 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		return DoctorCheck{
 			Name:    "Fresh Clone",
-			Status:  "ok",
+			Status:  StatusOK,
 			Message: "N/A (no .beads directory)",
 		}
 	}
@@ -329,7 +286,7 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 	if jsonlPath == "" {
 		return DoctorCheck{
 			Name:    "Fresh Clone",
-			Status:  "ok",
+			Status:  StatusOK,
 			Message: "N/A (no JSONL file)",
 		}
 	}
@@ -338,10 +295,10 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 	switch backend {
 	case configfile.BackendDolt:
 		// Dolt is directory-backed: treat .beads/dolt as the DB existence signal.
-		if info, err := os.Stat(filepath.Join(beadsDir, "dolt")); err == nil && info.IsDir() {
+		if info, err := os.Stat(getDatabasePath(beadsDir)); err == nil && info.IsDir() {
 			return DoctorCheck{
 				Name:    "Fresh Clone",
-				Status:  "ok",
+				Status:  StatusOK,
 				Message: "Database exists",
 			}
 		}
@@ -357,7 +314,7 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 		if _, err := os.Stat(dbPath); err == nil {
 			return DoctorCheck{
 				Name:    "Fresh Clone",
-				Status:  "ok",
+				Status:  StatusOK,
 				Message: "Database exists",
 			}
 		}
@@ -368,7 +325,7 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 	if issueCount == 0 {
 		return DoctorCheck{
 			Name:    "Fresh Clone",
-			Status:  "ok",
+			Status:  StatusOK,
 			Message: fmt.Sprintf("JSONL exists but is empty (%s)", jsonlName),
 		}
 	}
@@ -381,7 +338,7 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 
 	return DoctorCheck{
 		Name:    "Fresh Clone",
-		Status:  "warning",
+		Status:  StatusWarning,
 		Message: fmt.Sprintf("Fresh clone detected (%d issues in %s, no database)", issueCount, jsonlName),
 		Detail: "This appears to be a freshly cloned repository.\n" +
 			"  The JSONL file contains issues but no local database exists.\n" +
@@ -390,7 +347,7 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 	}
 }
 
-// countJSONLIssuesAndPrefix counts issues in a JSONL file and detects the most common prefix.
+// countJSONLIssuesAndPrefix counts issues in a legacy JSONL file and detects the most common prefix.
 func countJSONLIssuesAndPrefix(jsonlPath string) (int, string) {
 	file, err := os.Open(jsonlPath) //nolint:gosec
 	if err != nil {
@@ -402,6 +359,7 @@ func countJSONLIssuesAndPrefix(jsonlPath string) (int, string) {
 	prefixCounts := make(map[string]int)
 
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 1024), 2*1024*1024) // 2MB buffer for large lines
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {

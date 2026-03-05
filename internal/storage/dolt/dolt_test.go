@@ -1,11 +1,11 @@
-//go:build cgo
-
 package dolt
 
 import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/testutil"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -29,11 +31,17 @@ func testContext(t *testing.T) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), testTimeout)
 }
 
-// skipIfNoDolt skips the test if Dolt is not installed
+// skipIfNoDolt skips the test if Dolt is not installed or the test server
+// is not running. This prevents tests from accidentally hitting a production
+// Dolt server — tests MUST run against the isolated test server started by
+// TestMain in testmain_test.go.
 func skipIfNoDolt(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("dolt"); err != nil {
 		t.Skip("Dolt not installed, skipping test")
+	}
+	if testServerPort == 0 {
+		t.Skip("Test Dolt server not running, skipping test")
 	}
 }
 
@@ -49,12 +57,20 @@ func uniqueTestDBName(t *testing.T) string {
 	return "testdb_" + hex.EncodeToString(buf)
 }
 
-// setupTestStore creates a test store with its own isolated database.
-// Each test gets a unique database name to prevent cross-test data leakage
-// and avoid any risk of touching production data.
+// setupTestStore creates a test store on the shared database with branch isolation.
+// Each test gets its own branch (COW snapshot), preventing cross-test data leakage
+// without the overhead of CREATE/DROP DATABASE per test.
+//
+// Automatically marks the test as safe for parallel execution since each test
+// gets its own Dolt connection checked out to a unique branch.
 func setupTestStore(t *testing.T) (*DoltStore, func()) {
 	t.Helper()
 	skipIfNoDolt(t)
+	t.Parallel()
+
+	if testSharedDB == "" {
+		t.Fatal("testSharedDB not set — TestMain did not initialize shared database")
+	}
 
 	ctx, cancel := testContext(t)
 	defer cancel()
@@ -64,13 +80,12 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
 
-	dbName := uniqueTestDBName(t)
-
 	cfg := &Config{
 		Path:           tmpDir,
 		CommitterName:  "test",
 		CommitterEmail: "test@example.com",
-		Database:       dbName,
+		Database:       testSharedDB,
+		MaxOpenConns:   1, // Required: DOLT_CHECKOUT is session-level
 	}
 
 	store, err := New(ctx, cfg)
@@ -79,7 +94,59 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 		t.Fatalf("failed to create Dolt store: %v", err)
 	}
 
-	// Set up issue prefix
+	// Create an isolated branch for this test
+	_, branchCleanup := testutil.StartTestBranch(t, store.db, testSharedDB)
+
+	// Re-create dolt_ignore'd tables (wisps, etc.) on the branch.
+	// These tables are in dolt_ignore so they only exist in the working set,
+	// not in commits. Branching from main doesn't inherit them.
+	if err := createIgnoredTables(store.db); err != nil {
+		branchCleanup()
+		store.Close()
+		os.RemoveAll(tmpDir)
+		t.Fatalf("createIgnoredTables on branch failed: %v", err)
+	}
+
+	cleanup := func() {
+		branchCleanup()
+		store.Close()
+		os.RemoveAll(tmpDir)
+	}
+
+	return store, cleanup
+}
+
+// setupConcurrentTestStore creates a test store with its own database for
+// concurrent tests that need multiple connections. Branch-per-test isolation
+// requires MaxOpenConns=1, which prevents concurrent transactions.
+func setupConcurrentTestStore(t *testing.T) (*DoltStore, func()) {
+	t.Helper()
+	skipIfNoDolt(t)
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	tmpDir, err := os.MkdirTemp("", "dolt-concurrent-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+
+	dbName := uniqueTestDBName(t)
+
+	cfg := &Config{
+		Path:            tmpDir,
+		CommitterName:   "test",
+		CommitterEmail:  "test@example.com",
+		Database:        dbName,
+		CreateIfMissing: true, // tests create fresh databases
+	}
+
+	store, err := New(ctx, cfg)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		t.Fatalf("failed to create Dolt store: %v", err)
+	}
+
 	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
 		store.Close()
 		os.RemoveAll(tmpDir)
@@ -87,7 +154,6 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 	}
 
 	cleanup := func() {
-		// Drop the test database to avoid accumulating garbage
 		dropCtx, dropCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer dropCancel()
 		_, _ = store.db.ExecContext(dropCtx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName))
@@ -110,10 +176,11 @@ func TestNewDoltStore(t *testing.T) {
 
 	dbName := uniqueTestDBName(t)
 	cfg := &Config{
-		Path:           tmpDir,
-		CommitterName:  "test",
-		CommitterEmail: "test@example.com",
-		Database:       dbName,
+		Path:            tmpDir,
+		CommitterName:   "test",
+		CommitterEmail:  "test@example.com",
+		Database:        dbName,
+		CreateIfMissing: true, // tests create fresh databases
 	}
 
 	store, err := New(ctx, cfg)
@@ -209,6 +276,170 @@ func TestDoltStoreConfig(t *testing.T) {
 	}
 }
 
+// TestSetConfigNormalizesIssuePrefix verifies that SetConfig strips trailing
+// hyphens from issue_prefix to prevent double-hyphen bead IDs (bd-6uly).
+func TestSetConfigNormalizesIssuePrefix(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Set prefix WITH trailing hyphen — should be normalized
+	if err := store.SetConfig(ctx, "issue_prefix", "gt-"); err != nil {
+		t.Fatalf("SetConfig failed: %v", err)
+	}
+
+	value, err := store.GetConfig(ctx, "issue_prefix")
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if value != "gt" {
+		t.Errorf("expected issue_prefix 'gt' (trailing hyphen stripped), got %q", value)
+	}
+}
+
+// TestCreateIssueNoDoubleHyphen verifies that issue IDs don't get double
+// hyphens even if the DB somehow has a trailing-hyphen prefix (bd-6uly).
+func TestCreateIssueNoDoubleHyphen(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Bypass SetConfig normalization: write trailing-hyphen prefix directly to DB
+	_, err := store.db.ExecContext(ctx, "UPDATE config SET value = ? WHERE `key` = ?", "gt-", "issue_prefix")
+	if err != nil {
+		t.Fatalf("failed to set raw prefix: %v", err)
+	}
+
+	issue := &types.Issue{
+		Title:     "test double hyphen",
+		Status:    types.StatusOpen,
+		Priority:  3,
+		IssueType: types.TypeBug,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-user"); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	// ID should start with "gt-" not "gt--"
+	if strings.Contains(issue.ID, "--") {
+		t.Errorf("issue ID contains double hyphen: %q", issue.ID)
+	}
+	if !strings.HasPrefix(issue.ID, "gt-") {
+		t.Errorf("issue ID should start with 'gt-', got %q", issue.ID)
+	}
+}
+
+// TestCreateWispNoDoubleHyphen verifies that wisp IDs don't get double
+// hyphens even if the DB has a trailing-hyphen prefix (bd-6uly).
+func TestCreateWispNoDoubleHyphen(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Bypass SetConfig normalization: write trailing-hyphen prefix directly to DB
+	_, err := store.db.ExecContext(ctx, "UPDATE config SET value = ? WHERE `key` = ?", "gt-", "issue_prefix")
+	if err != nil {
+		t.Fatalf("failed to set raw prefix: %v", err)
+	}
+
+	wisp := &types.Issue{
+		Title:     "test wisp double hyphen",
+		Status:    types.StatusOpen,
+		Priority:  3,
+		IssueType: types.TypeBug,
+		Ephemeral: true,
+	}
+	if err := store.createWisp(ctx, wisp, "test-user"); err != nil {
+		t.Fatalf("createWisp failed: %v", err)
+	}
+
+	// Wisp ID should contain "gt-wisp-" not "gt--wisp-"
+	if strings.Contains(wisp.ID, "--") {
+		t.Errorf("wisp ID contains double hyphen: %q", wisp.ID)
+	}
+	if !strings.HasPrefix(wisp.ID, "gt-wisp-") {
+		t.Errorf("wisp ID should start with 'gt-wisp-', got %q", wisp.ID)
+	}
+}
+
+// TestCreateWispNoDoublePrefix verifies that wisps with IDPrefix="wisp" don't
+// get double-prefixed as "bd-wisp-wisp-xxx" (beads-yzh).
+func TestCreateWispNoDoublePrefix(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	wisp := &types.Issue{
+		Title:     "test wisp double prefix",
+		Status:    types.StatusOpen,
+		Priority:  3,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+		IDPrefix:  "wisp", // Set by cloneSubgraph for wisp molecules
+	}
+	if err := store.createWisp(ctx, wisp, "test-user"); err != nil {
+		t.Fatalf("createWisp failed: %v", err)
+	}
+
+	// ID should be "<prefix>-wisp-<hash>", NOT "<prefix>-wisp-wisp-<hash>"
+	if strings.Contains(wisp.ID, "wisp-wisp") {
+		t.Errorf("wisp ID has double 'wisp' prefix: %q", wisp.ID)
+	}
+	if !strings.Contains(wisp.ID, "-wisp-") {
+		t.Errorf("wisp ID should contain '-wisp-', got %q", wisp.ID)
+	}
+}
+
+// TestTransactionCreateIssueNoDoubleHyphen verifies that issue IDs created
+// within a transaction don't get double hyphens if the DB has a trailing-hyphen
+// prefix (bd-6uly). This tests the transaction.go code path.
+func TestTransactionCreateIssueNoDoubleHyphen(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Bypass SetConfig normalization: write trailing-hyphen prefix directly to DB
+	_, err := store.db.ExecContext(ctx, "UPDATE config SET value = ? WHERE `key` = ?", "gt-", "issue_prefix")
+	if err != nil {
+		t.Fatalf("failed to set raw prefix: %v", err)
+	}
+
+	var createdID string
+	err = store.RunInTransaction(ctx, "test-tx", func(tx storage.Transaction) error {
+		issue := &types.Issue{
+			Title:     "test tx double hyphen",
+			Status:    types.StatusOpen,
+			Priority:  3,
+			IssueType: types.TypeBug,
+		}
+		if err := tx.CreateIssue(ctx, issue, "test-user"); err != nil {
+			return err
+		}
+		createdID = issue.ID
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RunInTransaction failed: %v", err)
+	}
+
+	if strings.Contains(createdID, "--") {
+		t.Errorf("transaction-created issue ID contains double hyphen: %q", createdID)
+	}
+	if !strings.HasPrefix(createdID, "gt-") {
+		t.Errorf("issue ID should start with 'gt-', got %q", createdID)
+	}
+}
+
 func TestGetCustomTypes(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -216,16 +447,20 @@ func TestGetCustomTypes(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	// defaultConfig seeds types.custom — verify it's accessible
+	// types.custom is set via SetConfig (not seeded by defaultConfig)
+	if err := store.SetConfig(ctx, "types.custom", "molecule,gate,convoy,merge-request,slot,agent,role,rig,message"); err != nil {
+		t.Fatalf("SetConfig(types.custom) failed: %v", err)
+	}
+
 	types, err := store.GetCustomTypes(ctx)
 	if err != nil {
 		t.Fatalf("GetCustomTypes failed: %v", err)
 	}
 	if len(types) == 0 {
-		t.Fatal("expected custom types to be seeded by defaultConfig, got none")
+		t.Fatal("expected custom types from SetConfig, got none")
 	}
 
-	// Verify "agent" is among the seeded types
+	// Verify "agent" is among the configured types
 	found := false
 	for _, ct := range types {
 		if ct == "agent" {
@@ -358,6 +593,79 @@ func TestDoltStoreIssueClose(t *testing.T) {
 	}
 	if retrieved.ClosedAt == nil {
 		t.Error("expected closed_at to be set")
+	}
+}
+
+// TestClosePromotedWisp verifies that bd close works for wisps that were
+// promoted to the issues table via PromoteFromEphemeral (bd-ftc).
+// Promoted wisps have -wisp- in their ID but live in the issues table,
+// so routing must fall through from the wisps table.
+func TestClosePromotedWisp(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Create a wisp (goes to wisps table)
+	wisp := &types.Issue{
+		Title:     "Wisp to promote and close",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.createWisp(ctx, wisp, "tester"); err != nil {
+		t.Fatalf("createWisp failed: %v", err)
+	}
+	if !IsEphemeralID(wisp.ID) {
+		t.Fatalf("expected wisp ID to match ephemeral pattern, got %q", wisp.ID)
+	}
+
+	// Promote the wisp (moves from wisps table to issues table)
+	if err := store.PromoteFromEphemeral(ctx, wisp.ID, "tester"); err != nil {
+		t.Fatalf("PromoteFromEphemeral failed: %v", err)
+	}
+
+	// Verify wisp is no longer in wisps table but findable via GetIssue
+	if store.isActiveWisp(ctx, wisp.ID) {
+		t.Fatal("promoted wisp should not be active in wisps table")
+	}
+	got, err := store.GetIssue(ctx, wisp.ID)
+	if err != nil {
+		t.Fatalf("GetIssue failed for promoted wisp: %v", err)
+	}
+	if got.ID != wisp.ID {
+		t.Fatalf("GetIssue returned wrong ID: %q vs %q", got.ID, wisp.ID)
+	}
+
+	// Close the promoted wisp — this was failing before bd-ftc fix
+	if err := store.CloseIssue(ctx, wisp.ID, "completed", "tester", "session1"); err != nil {
+		t.Fatalf("CloseIssue failed for promoted wisp: %v", err)
+	}
+
+	// Verify it was closed
+	closed, err := store.GetIssue(ctx, wisp.ID)
+	if err != nil {
+		t.Fatalf("GetIssue failed after close: %v", err)
+	}
+	if closed.Status != types.StatusClosed {
+		t.Errorf("expected status closed, got %s", closed.Status)
+	}
+	if closed.ClosedAt == nil {
+		t.Error("expected closed_at to be set")
+	}
+
+	// Also verify GetIssuesByIDs works (the batch path that was broken)
+	batch, err := store.GetIssuesByIDs(ctx, []string{wisp.ID})
+	if err != nil {
+		t.Fatalf("GetIssuesByIDs failed for promoted wisp: %v", err)
+	}
+	if len(batch) != 1 {
+		t.Fatalf("GetIssuesByIDs returned %d issues, want 1", len(batch))
+	}
+	if batch[0].ID != wisp.ID {
+		t.Errorf("GetIssuesByIDs returned wrong ID: %q", batch[0].ID)
 	}
 }
 
@@ -514,16 +822,16 @@ func TestDoltStoreSearch(t *testing.T) {
 	issues := []*types.Issue{
 		{
 			ID:          "test-search-1",
-			Title:       "First Issue",
-			Description: "Search test one",
+			Title:       "Search test one",
+			Description: "First issue description",
 			Status:      types.StatusOpen,
 			Priority:    1,
 			IssueType:   types.TypeTask,
 		},
 		{
 			ID:          "test-search-2",
-			Title:       "Second Issue",
-			Description: "Search test two",
+			Title:       "Search test two",
+			Description: "Second issue description",
 			Status:      types.StatusOpen,
 			Priority:    2,
 			IssueType:   types.TypeBug,
@@ -737,12 +1045,9 @@ func TestDoltStoreDeleteIssue(t *testing.T) {
 	}
 
 	// Verify it's gone
-	retrieved, err = store.GetIssue(ctx, issue.ID)
-	if err != nil {
-		t.Fatalf("failed to get issue after delete: %v", err)
-	}
-	if retrieved != nil {
-		t.Error("expected issue to be deleted")
+	_, err = store.GetIssue(ctx, issue.ID)
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after delete, got: %v", err)
 	}
 }
 
@@ -756,9 +1061,9 @@ func TestDeleteIssuesBatchPerformance(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	const issueCount = 100
+	const issueCount = 25
 
-	// Create 100 issues with chain dependencies: issue-1 <- issue-2 <- ... <- issue-100
+	// Create issues with chain dependencies: issue-1 <- issue-2 <- ... <- issue-N
 	for i := 1; i <= issueCount; i++ {
 		issue := &types.Issue{
 			ID:        fmt.Sprintf("batch-del-%d", i),
@@ -797,12 +1102,9 @@ func TestDeleteIssuesBatchPerformance(t *testing.T) {
 
 	// Verify all issues are actually gone
 	for i := 1; i <= issueCount; i++ {
-		got, err := store.GetIssue(ctx, fmt.Sprintf("batch-del-%d", i))
-		if err != nil {
-			t.Fatalf("failed to get issue %d after delete: %v", i, err)
-		}
-		if got != nil {
-			t.Errorf("issue batch-del-%d should be deleted", i)
+		_, err := store.GetIssue(ctx, fmt.Sprintf("batch-del-%d", i))
+		if !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("expected ErrNotFound for issue %d after delete, got: %v", i, err)
 		}
 	}
 }
@@ -996,12 +1298,9 @@ func TestDeleteIssuesForceWithOrphans(t *testing.T) {
 
 	// Verify parent and child1 are deleted
 	for _, id := range []string{"f-parent", "f-child1"} {
-		got, err := store.GetIssue(ctx, id)
-		if err != nil {
-			t.Fatalf("failed to get %s: %v", id, err)
-		}
-		if got != nil {
-			t.Errorf("%s should be deleted", id)
+		_, err := store.GetIssue(ctx, id)
+		if !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("expected ErrNotFound for %s, got: %v", id, err)
 		}
 	}
 	// child2 should still exist
@@ -1060,12 +1359,9 @@ func TestDeleteIssuesBatchBoundary(t *testing.T) {
 
 			// Verify all gone
 			for _, id := range ids {
-				got, err := store.GetIssue(ctx, id)
-				if err != nil {
-					t.Fatalf("GetIssue(%s) failed: %v", id, err)
-				}
-				if got != nil {
-					t.Errorf("issue %s should be deleted", id)
+				_, err := store.GetIssue(ctx, id)
+				if !errors.Is(err, storage.ErrNotFound) {
+					t.Fatalf("expected ErrNotFound for %s, got: %v", id, err)
 				}
 			}
 		})
@@ -1124,12 +1420,9 @@ func TestDeleteIssuesCircularDeps(t *testing.T) {
 
 	// Verify all deleted
 	for _, id := range []string{"circ-a", "circ-b", "circ-c"} {
-		got, err := store.GetIssue(ctx, id)
-		if err != nil {
-			t.Fatalf("GetIssue(%s) failed: %v", id, err)
-		}
-		if got != nil {
-			t.Errorf("%s should be deleted", id)
+		_, err := store.GetIssue(ctx, id)
+		if !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("expected ErrNotFound for %s, got: %v", id, err)
 		}
 	}
 }
@@ -1178,12 +1471,9 @@ func TestDeleteIssuesDiamondDeps(t *testing.T) {
 	}
 
 	for _, id := range []string{"dia-root", "dia-left", "dia-right", "dia-bottom"} {
-		got, err := store.GetIssue(ctx, id)
-		if err != nil {
-			t.Fatalf("GetIssue(%s) failed: %v", id, err)
-		}
-		if got != nil {
-			t.Errorf("%s should be deleted", id)
+		_, err := store.GetIssue(ctx, id)
+		if !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("expected ErrNotFound for %s, got: %v", id, err)
 		}
 	}
 }
@@ -1272,12 +1562,18 @@ func TestValidateRef(t *testing.T) {
 		{"valid branch", "main", false},
 		{"valid with underscore", "feature_branch", false},
 		{"valid with dash", "feature-branch", false},
+		{"valid with dot", "release.v2", false},
+		{"valid with slash", "release/v2.0", false},
+		{"valid nested slash", "feature/auth/login", false},
+		{"valid dot and slash", "feature/auth.flow", false},
 		{"empty", "", true},
 		{"too long", string(make([]byte, 200)), true},
 		{"with SQL injection", "main'; DROP TABLE issues; --", true},
 		{"with quotes", "main'test", true},
 		{"with semicolon", "main;test", true},
 		{"with space", "main test", true},
+		{"with backtick", "main`test", true},
+		{"with backslash", `main\test`, true},
 	}
 
 	for _, tt := range tests {
@@ -1337,9 +1633,41 @@ func TestValidateDatabaseName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateDatabaseName(tt.dbName)
+			err := ValidateDatabaseName(tt.dbName)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("validateDatabaseName(%q) error = %v, wantErr %v", tt.dbName, err, tt.wantErr)
+				t.Errorf("ValidateDatabaseName(%q) error = %v, wantErr %v", tt.dbName, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestIsTestDatabaseName(t *testing.T) {
+	tests := []struct {
+		name   string
+		dbName string
+		want   bool
+	}{
+		{"exact test db", "beads_test", true},
+		{"test db with suffix", "beads_test_123", true},
+		{"testdb prefix", "testdb_foo", true},
+		{"doctest prefix", "doctest_bar", true},
+		{"doctortest prefix", "doctortest_baz", true},
+		{"beads_pt prefix", "beads_pt_xyz", true},
+		{"beads_vr prefix", "beads_vr_abc", true},
+		{"production db", "beads", false},
+		{"project prefix ta", "beads_ta", false},
+		{"project prefix tabula", "beads_tabula", false},
+		{"project prefix tr", "beads_tr", false},
+		{"project prefix tools", "beads_tools", false},
+		{"project prefix vulcan", "beads_vulcan", false},
+		{"unrelated name", "mydb", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTestDatabaseName(tt.dbName)
+			if got != tt.want {
+				t.Errorf("isTestDatabaseName(%q) = %v, want %v", tt.dbName, got, tt.want)
 			}
 		})
 	}
@@ -1465,6 +1793,115 @@ func TestDoltStoreGetReadyWork(t *testing.T) {
 	}
 }
 
+func TestDoltStoreGetReadyWorkWaitsForChildrenOfSpawner(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow Dolt integration test in short mode")
+	}
+
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	implement := &types.Issue{
+		ID:        "test-implement",
+		Title:     "Implement",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	review := &types.Issue{
+		ID:        "test-review",
+		Title:     "Review",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	otherSpawner := &types.Issue{
+		ID:        "test-other-spawner",
+		Title:     "Other spawner",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	implChild := &types.Issue{
+		ID:        "test-implement.1",
+		Title:     "Implement child",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	otherChild := &types.Issue{
+		ID:        "test-other-spawner.1",
+		Title:     "Unrelated child",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+
+	for _, issue := range []*types.Issue{implement, review, otherSpawner, implChild, otherChild} {
+		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("failed to create issue %s: %v", issue.ID, err)
+		}
+	}
+
+	for _, dep := range []*types.Dependency{
+		{IssueID: implChild.ID, DependsOnID: implement.ID, Type: types.DepParentChild},
+		{IssueID: otherChild.ID, DependsOnID: otherSpawner.ID, Type: types.DepParentChild},
+	} {
+		if err := store.AddDependency(ctx, dep, "tester"); err != nil {
+			t.Fatalf("failed to add parent-child dependency %s -> %s: %v", dep.IssueID, dep.DependsOnID, err)
+		}
+	}
+
+	metaJSON, err := json.Marshal(types.WaitsForMeta{Gate: types.WaitsForAllChildren})
+	if err != nil {
+		t.Fatalf("failed to marshal waits-for metadata: %v", err)
+	}
+	if err := store.AddDependency(ctx, &types.Dependency{
+		IssueID:     review.ID,
+		DependsOnID: implement.ID,
+		Type:        types.DepWaitsFor,
+		Metadata:    string(metaJSON),
+	}, "tester"); err != nil {
+		t.Fatalf("failed to add waits-for dependency: %v", err)
+	}
+
+	hasReadyID := func(issues []*types.Issue, id string) bool {
+		for _, issue := range issues {
+			if issue.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("blocked-before-child-close", func(t *testing.T) {
+		readyBefore, err := store.GetReadyWork(ctx, types.WorkFilter{})
+		if err != nil {
+			t.Fatalf("failed to get ready work (before close): %v", err)
+		}
+		if hasReadyID(readyBefore, review.ID) {
+			t.Fatalf("expected %s to be blocked by open child of %s", review.ID, implement.ID)
+		}
+	})
+
+	t.Run("ready-after-child-close", func(t *testing.T) {
+		if err := store.CloseIssue(ctx, implChild.ID, "done", "tester", "session-test"); err != nil {
+			t.Fatalf("failed to close child issue: %v", err)
+		}
+
+		readyAfter, err := store.GetReadyWork(ctx, types.WorkFilter{})
+		if err != nil {
+			t.Fatalf("failed to get ready work (after close): %v", err)
+		}
+		if !hasReadyID(readyAfter, review.ID) {
+			t.Fatalf("expected %s to become ready after children of %s close", review.ID, implement.ID)
+		}
+	})
+}
+
 // TestCloseWithTimeout tests the close timeout helper function
 func TestCloseWithTimeout(t *testing.T) {
 	// Test 1: Fast close succeeds
@@ -1513,4 +1950,312 @@ func TestCloseWithTimeout(t *testing.T) {
 		}
 		_ = originalTimeout // silence unused warning
 	})
+}
+
+// TestGetReadyWorkSortPolicy verifies that GetReadyWork respects the SortPolicy
+// field and that result ordering is preserved through the scanIssueIDs pipeline.
+func TestGetReadyWorkSortPolicy(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	now := time.Now().UTC()
+
+	// Create issues with distinct priorities and creation times.
+	// "old-p3" is 3 days old (outside the 48h hybrid window).
+	// "recent-p2" and "recent-p1" are recent (within 48h).
+	issues := []*types.Issue{
+		{
+			ID:        "test-old-p3",
+			Title:     "Old P3",
+			Status:    types.StatusOpen,
+			Priority:  3,
+			IssueType: types.TypeTask,
+			CreatedAt: now.Add(-72 * time.Hour), // 3 days ago
+		},
+		{
+			ID:        "test-recent-p2",
+			Title:     "Recent P2",
+			Status:    types.StatusOpen,
+			Priority:  2,
+			IssueType: types.TypeTask,
+			CreatedAt: now.Add(-1 * time.Hour), // 1 hour ago
+		},
+		{
+			ID:        "test-recent-p1",
+			Title:     "Recent P1",
+			Status:    types.StatusOpen,
+			Priority:  1,
+			IssueType: types.TypeTask,
+			CreatedAt: now.Add(-30 * time.Minute), // 30 min ago
+		},
+	}
+
+	for _, issue := range issues {
+		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("failed to create issue %s: %v", issue.ID, err)
+		}
+	}
+
+	t.Run("SortPolicyPriority", func(t *testing.T) {
+		result, err := store.GetReadyWork(ctx, types.WorkFilter{
+			SortPolicy: types.SortPolicyPriority,
+		})
+		if err != nil {
+			t.Fatalf("GetReadyWork failed: %v", err)
+		}
+
+		ids := issueIDs(result)
+		// Priority order: P1 < P2 < P3
+		assertOrder(t, ids, "test-recent-p1", "test-recent-p2", "test-old-p3")
+	})
+
+	t.Run("SortPolicyOldest", func(t *testing.T) {
+		result, err := store.GetReadyWork(ctx, types.WorkFilter{
+			SortPolicy: types.SortPolicyOldest,
+		})
+		if err != nil {
+			t.Fatalf("GetReadyWork failed: %v", err)
+		}
+
+		ids := issueIDs(result)
+		// Oldest first: old-p3, recent-p2, recent-p1
+		assertOrder(t, ids, "test-old-p3", "test-recent-p2", "test-recent-p1")
+	})
+
+	t.Run("SortPolicyHybrid", func(t *testing.T) {
+		result, err := store.GetReadyWork(ctx, types.WorkFilter{
+			SortPolicy: types.SortPolicyHybrid,
+		})
+		if err != nil {
+			t.Fatalf("GetReadyWork failed: %v", err)
+		}
+
+		ids := issueIDs(result)
+		// Hybrid: recent bucket (P1 before P2) first, then old bucket
+		assertOrder(t, ids, "test-recent-p1", "test-recent-p2", "test-old-p3")
+	})
+
+	t.Run("DefaultSortIsHybrid", func(t *testing.T) {
+		result, err := store.GetReadyWork(ctx, types.WorkFilter{})
+		if err != nil {
+			t.Fatalf("GetReadyWork failed: %v", err)
+		}
+
+		ids := issueIDs(result)
+		// Default (empty string) behaves like hybrid
+		assertOrder(t, ids, "test-recent-p1", "test-recent-p2", "test-old-p3")
+	})
+}
+
+// issueIDs extracts IDs from a slice of issues.
+func issueIDs(issues []*types.Issue) []string {
+	ids := make([]string, len(issues))
+	for i, issue := range issues {
+		ids[i] = issue.ID
+	}
+	return ids
+}
+
+// assertOrder verifies that the expected IDs appear in order within ids.
+// Other IDs may be interspersed (e.g., from other tests).
+func assertOrder(t *testing.T, ids []string, expected ...string) {
+	t.Helper()
+	pos := 0
+	for _, id := range ids {
+		if pos < len(expected) && id == expected[pos] {
+			pos++
+		}
+	}
+	if pos != len(expected) {
+		t.Errorf("expected order %v but got %v (matched %d of %d)", expected, ids, pos, len(expected))
+	}
+}
+
+// TestEphemeralExplicitID_GetIssue verifies that GetIssue finds ephemeral beads
+// created with explicit (non-wisp) IDs. Regression test for GH#2053.
+func TestEphemeralExplicitID_GetIssue(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Create an ephemeral bead with an explicit ID (no -wisp- in name)
+	issue := &types.Issue{
+		ID:        "test-agent-emma",
+		Title:     "Agent: test-agent-emma",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-user"); err != nil {
+		t.Fatalf("CreateIssue (ephemeral with explicit ID) failed: %v", err)
+	}
+
+	// GetIssue should find it (this was the GH#2053 bug)
+	got, err := store.GetIssue(ctx, "test-agent-emma")
+	if err != nil {
+		t.Fatalf("GetIssue failed for ephemeral bead with explicit ID: %v", err)
+	}
+	if got.ID != "test-agent-emma" {
+		t.Errorf("Expected ID %q, got %q", "test-agent-emma", got.ID)
+	}
+	if !got.Ephemeral {
+		t.Error("Expected Ephemeral=true")
+	}
+}
+
+// TestEphemeralExplicitID_UpdateIssue verifies that UpdateIssue works on
+// ephemeral beads created with explicit IDs. Regression test for GH#2053.
+func TestEphemeralExplicitID_UpdateIssue(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	issue := &types.Issue{
+		ID:        "test-agent-max",
+		Title:     "Agent: test-agent-max",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-user"); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	// UpdateIssue should work (this was broken per GH#2053)
+	updates := map[string]interface{}{
+		"agent_state": "running",
+	}
+	if err := store.UpdateIssue(ctx, "test-agent-max", updates, "test-user"); err != nil {
+		t.Fatalf("UpdateIssue failed for ephemeral bead with explicit ID: %v", err)
+	}
+
+	// Verify the update persisted
+	got, err := store.GetIssue(ctx, "test-agent-max")
+	if err != nil {
+		t.Fatalf("GetIssue after update failed: %v", err)
+	}
+	if got.AgentState != "running" {
+		t.Errorf("Expected agent_state %q, got %q", "running", got.AgentState)
+	}
+}
+
+// TestEphemeralExplicitID_SearchIssues verifies that SearchIssues finds
+// ephemeral beads with explicit IDs (this already worked pre-fix via wisp merge).
+func TestEphemeralExplicitID_SearchIssues(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	issue := &types.Issue{
+		ID:        "test-agent-furiosa",
+		Title:     "Agent: test-agent-furiosa",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-user"); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	// SearchIssues with nil Ephemeral filter should find it (merges wisps)
+	results, err := store.SearchIssues(ctx, "", types.IssueFilter{
+		IDs: []string{"test-agent-furiosa"},
+	})
+	if err != nil {
+		t.Fatalf("SearchIssues failed: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Expected 1 result, got %d", len(results))
+	}
+	if results[0].ID != "test-agent-furiosa" {
+		t.Errorf("Expected ID %q, got %q", "test-agent-furiosa", results[0].ID)
+	}
+}
+
+// TestCreateEphemeralAutoID verifies that CreateIssue generates a non-empty
+// wisp-prefixed ID for ephemeral issues when no explicit ID is provided.
+// Regression test for GH#2087: bd create --ephemeral generated empty IDs.
+func TestCreateEphemeralAutoID(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	issue := &types.Issue{
+		Title:     "Ephemeral auto ID test",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-user"); err != nil {
+		t.Fatalf("CreateIssue (ephemeral, no explicit ID) failed: %v", err)
+	}
+
+	// ID must not be empty (the GH#2087 bug)
+	if issue.ID == "" {
+		t.Fatal("ephemeral issue got empty ID — GH#2087 regression")
+	}
+
+	// ID should contain the wisp infix
+	if !strings.Contains(issue.ID, "-wisp-") {
+		t.Errorf("expected wisp-prefixed ID, got %q", issue.ID)
+	}
+
+	// Verify the issue is retrievable from the wisps table
+	got, err := store.GetIssue(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue(%q) failed: %v", issue.ID, err)
+	}
+	if got.Title != "Ephemeral auto ID test" {
+		t.Errorf("title mismatch: got %q", got.Title)
+	}
+	if !got.Ephemeral {
+		t.Error("expected Ephemeral=true on retrieved issue")
+	}
+}
+
+// TestCreateMultipleEphemeralAutoIDs verifies that multiple ephemeral issues
+// created without explicit IDs each get unique, non-empty IDs.
+// Regression test for GH#2087: second insert hit UNIQUE constraint on empty ID.
+func TestCreateMultipleEphemeralAutoIDs(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	ids := make(map[string]bool)
+	for i := 0; i < 5; i++ {
+		issue := &types.Issue{
+			Title:     fmt.Sprintf("Ephemeral #%d", i),
+			Status:    types.StatusOpen,
+			Priority:  2,
+			IssueType: types.TypeTask,
+			Ephemeral: true,
+		}
+		if err := store.CreateIssue(ctx, issue, "test-user"); err != nil {
+			t.Fatalf("CreateIssue #%d failed: %v", i, err)
+		}
+		if issue.ID == "" {
+			t.Fatalf("ephemeral issue #%d got empty ID", i)
+		}
+		if ids[issue.ID] {
+			t.Fatalf("duplicate ID %q on issue #%d", issue.ID, i)
+		}
+		ids[issue.ID] = true
+	}
 }

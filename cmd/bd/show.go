@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -12,7 +13,7 @@ import (
 )
 
 var showCmd = &cobra.Command{
-	Use:     "show [id...] [--id=<id>...]",
+	Use:     "show [id...] [--id=<id>...] [--current]",
 	Aliases: []string{"view"},
 	GroupID: "issues",
 	Short:   "Show issue details",
@@ -20,12 +21,14 @@ var showCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		showThread, _ := cmd.Flags().GetBool("thread")
 		shortMode, _ := cmd.Flags().GetBool("short")
+		longMode, _ := cmd.Flags().GetBool("long")
 		showRefs, _ := cmd.Flags().GetBool("refs")
 		showChildren, _ := cmd.Flags().GetBool("children")
 		asOfRef, _ := cmd.Flags().GetString("as-of")
 		idFlags, _ := cmd.Flags().GetStringArray("id")
 		localTime, _ := cmd.Flags().GetBool("local-time")
 		watchMode, _ := cmd.Flags().GetBool("watch")
+		currentMode, _ := cmd.Flags().GetBool("current")
 		ctx := rootCtx
 
 		// Helper to format timestamp based on --local-time flag
@@ -40,9 +43,21 @@ var showCmd = &cobra.Command{
 		// This allows IDs that look like flags (e.g., --xyz or gt--abc) to be passed safely
 		args = append(args, idFlags...)
 
+		// Handle --current: resolve the active issue (GH#2184)
+		if currentMode {
+			if len(args) > 0 {
+				FatalErrorRespectJSON("--current cannot be combined with explicit issue IDs")
+			}
+			currentID := resolveCurrentIssueID(ctx)
+			if currentID == "" {
+				FatalErrorRespectJSON("no current issue found (no in-progress, hooked, or recently touched issues)")
+			}
+			args = []string{currentID}
+		}
+
 		// Validate that at least one ID is provided
 		if len(args) == 0 {
-			FatalErrorRespectJSON("at least one issue ID is required (use positional args or --id flag)")
+			FatalErrorRespectJSON("at least one issue ID is required (use positional args, --id flag, or --current)")
 		}
 
 		// Handle --as-of flag: show issue at a specific point in history
@@ -193,6 +208,11 @@ var showCmd = &cobra.Command{
 				fmt.Printf("\n%s %s\n", ui.RenderBold("LABELS:"), strings.Join(labels, ", "))
 			}
 
+			// Show custom metadata (GH#1406)
+			if metaStr := formatIssueCustomMetadata(issue); metaStr != "" {
+				fmt.Printf("\n%s\n", metaStr)
+			}
+
 			// Collect related issues from both directions for deduplication
 			// (relates-to is bidirectional, so we merge and show once)
 			relatedSeen := make(map[string]*types.IssueWithDependencyMetadata)
@@ -308,6 +328,11 @@ var showCmd = &cobra.Command{
 				}
 			}
 
+			// Long mode: show all extended fields
+			if longMode {
+				fmt.Print(formatIssueLongExtras(issue, formatTime))
+			}
+
 			fmt.Println()
 			result.Close() // Close routed storage after each iteration
 		}
@@ -338,12 +363,54 @@ var showCmd = &cobra.Command{
 func init() {
 	showCmd.Flags().Bool("thread", false, "Show full conversation thread (for messages)")
 	showCmd.Flags().Bool("short", false, "Show compact one-line output per issue")
+	showCmd.Flags().Bool("long", false, "Show all available fields (extended metadata, agent identity, gate fields, etc.)")
 	showCmd.Flags().Bool("refs", false, "Show issues that reference this issue (reverse lookup)")
 	showCmd.Flags().Bool("children", false, "Show only the children of this issue")
 	showCmd.Flags().String("as-of", "", "Show issue as it existed at a specific commit hash or branch (requires Dolt)")
 	showCmd.Flags().StringArray("id", nil, "Issue ID (use for IDs that look like flags, e.g., --id=gt--xyz)")
 	showCmd.Flags().Bool("local-time", false, "Show timestamps in local time instead of UTC")
 	showCmd.Flags().BoolP("watch", "w", false, "Watch for changes and auto-refresh display")
+	showCmd.Flags().Bool("current", false, "Show the currently active issue (in-progress, hooked, or last touched)")
 	showCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(showCmd)
+}
+
+// resolveCurrentIssueID determines the current active issue for the agent.
+// Priority: in-progress assigned to actor > hooked > last touched.
+func resolveCurrentIssueID(ctx context.Context) string {
+	if store == nil {
+		// No store — fall back to last touched
+		return GetLastTouchedID()
+	}
+
+	currentActor := getActorWithGit()
+
+	// 1. In-progress issues assigned to current actor
+	if currentActor != "" {
+		status := types.StatusInProgress
+		filter := types.IssueFilter{
+			Status:   &status,
+			Assignee: &currentActor,
+		}
+		issues, err := store.SearchIssues(ctx, "", filter)
+		if err == nil && len(issues) > 0 {
+			return issues[0].ID
+		}
+	}
+
+	// 2. Hooked issues assigned to current actor
+	if currentActor != "" {
+		status := types.StatusHooked
+		filter := types.IssueFilter{
+			Status:   &status,
+			Assignee: &currentActor,
+		}
+		issues, err := store.SearchIssues(ctx, "", filter)
+		if err == nil && len(issues) > 0 {
+			return issues[0].ID
+		}
+	}
+
+	// 3. Last touched issue (fallback)
+	return GetLastTouchedID()
 }

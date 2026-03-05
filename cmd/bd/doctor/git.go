@@ -8,12 +8,17 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/beads/cmd/bd/doctor/fix"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// gitCmdTimeout is the timeout for git subprocess commands in doctor checks.
+// Prevents doctor checks from blocking indefinitely if git hangs.
+const gitCmdTimeout = 30 * time.Second
 
 const (
 	hooksExamplesURL = "https://github.com/steveyegge/beads/tree/main/examples/git-hooks"
@@ -26,6 +31,10 @@ const bdShimMarker = "# bd-shim"
 // bdInlineHookMarker identifies inline hooks created by bd init (GH#1120)
 // These hooks have the logic embedded directly rather than calling bd hooks run
 const bdInlineHookMarker = "# bd (beads)"
+
+// bdSectionMarkerPrefix identifies marker-managed hooks (GH#1380)
+// These use "# --- BEGIN BEADS INTEGRATION vX.Y.Z ---" section markers.
+const bdSectionMarkerPrefix = "# --- BEGIN BEADS INTEGRATION"
 
 // bdHooksRunPattern matches hooks that call bd hooks run
 var bdHooksRunPattern = regexp.MustCompile(`\bbd\s+hooks\s+run\b`)
@@ -44,9 +53,9 @@ func CheckGitHooks(cliVersion string) DoctorCheck {
 
 	// Recommended hooks and their purposes
 	recommendedHooks := map[string]string{
-		"pre-commit": "Flushes pending bd changes to JSONL before commit",
-		"post-merge": "Imports updated JSONL after git pull/merge",
-		"pre-push":   "Exports database to JSONL before push",
+		"pre-commit": "Syncs pending bd changes before commit",
+		"post-merge": "Syncs database after git pull/merge",
+		"pre-push":   "Validates database state before push",
 	}
 	var missingHooks []string
 	var installedHooks []string
@@ -197,8 +206,18 @@ func findOutdatedBDHookVersions(
 		if err != nil {
 			continue
 		}
-		hookVersion, ok := parseBDHookVersion(string(content))
+		contentStr := string(content)
+		hookVersion, ok := parseBDHookVersion(contentStr)
 		if !ok || !IsValidSemver(hookVersion) {
+			// No version comment found. If this is a bd hook (has shim marker,
+			// inline marker, or calls bd hooks run), treat it as outdated since
+			// all current hook templates include a version comment. (GH#1466)
+			if isBdHookContent(contentStr) {
+				outdated = append(outdated, fmt.Sprintf("%s@unknown", hookName))
+				if oldest == "" {
+					oldest = "0.0.0"
+				}
+			}
 			continue
 		}
 		if CompareVersions(hookVersion, cliVersion) < 0 {
@@ -211,23 +230,39 @@ func findOutdatedBDHookVersions(
 	return outdated, oldest
 }
 
+// isBdHookContent checks if hook content is a bd hook (shim, inline, section-marker, or calls bd hooks run).
+func isBdHookContent(content string) bool {
+	return strings.Contains(content, bdShimMarker) ||
+		strings.Contains(content, bdInlineHookMarker) ||
+		strings.Contains(content, bdSectionMarkerPrefix) ||
+		bdHooksRunPattern.MatchString(content)
+}
+
 func parseBDHookVersion(content string) (string, bool) {
-	if !strings.Contains(content, "bd-hooks-version:") {
-		return "", false
-	}
 	for _, line := range strings.Split(content, "\n") {
-		if !strings.Contains(line, "bd-hooks-version:") {
-			continue
+		// Check for section marker: "# --- BEGIN BEADS INTEGRATION v0.57.0 ---"
+		// This is the current hook format used by marker-managed installs (GH#1380).
+		if strings.HasPrefix(line, bdSectionMarkerPrefix) {
+			after := strings.TrimPrefix(line, bdSectionMarkerPrefix)
+			after = strings.TrimSpace(after)
+			after = strings.TrimPrefix(after, "v")
+			after = strings.TrimSuffix(after, "---")
+			version := strings.TrimSpace(after)
+			if version != "" {
+				return version, true
+			}
 		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			return "", false
+		// Check for legacy version comment: "# bd-hooks-version: 0.55.0"
+		if strings.Contains(line, "bd-hooks-version:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			version := strings.TrimSpace(parts[1])
+			if version != "" {
+				return version, true
+			}
 		}
-		version := strings.TrimSpace(parts[1])
-		if version == "" {
-			return "", false
-		}
-		return version, true
 	}
 	return "", false
 }
@@ -262,7 +297,10 @@ func areBdShimsInstalled(hooksDir string) (bool, []string) {
 // CheckGitWorkingTree checks if the git working tree is clean.
 // This helps prevent leaving work stranded (AGENTS.md: keep git state clean).
 func CheckGitWorkingTree(path string) DoctorCheck {
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--git-dir")
 	cmd.Dir = path
 	if err := cmd.Run(); err != nil {
 		return DoctorCheck{
@@ -272,7 +310,7 @@ func CheckGitWorkingTree(path string) DoctorCheck {
 		}
 	}
 
-	cmd = exec.Command("git", "status", "--porcelain")
+	cmd = exec.CommandContext(ctx, "git", "status", "--porcelain")
 	cmd.Dir = path
 	out, err := cmd.Output()
 	if err != nil {
@@ -294,8 +332,34 @@ func CheckGitWorkingTree(path string) DoctorCheck {
 		}
 	}
 
+	// Parse raw porcelain lines preserving leading spaces for correct XY parsing.
+	// strings.TrimSpace above strips the leading space from the first " D ..."
+	// line, corrupting porcelain format. Use the raw output for line parsing.
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+
+	// In redirect worktrees (.beads/redirect exists), deleted .beads/ files
+	// are expected — the actual data lives at the redirect target (the rig).
+	// Filter these out so they don't trigger a false warning.
+	redirectPath := filepath.Join(path, ".beads", "redirect")
+	if _, err := os.Stat(redirectPath); err == nil {
+		var filtered []string
+		for _, line := range lines {
+			if isExpectedRedirectChange(line) {
+				continue
+			}
+			filtered = append(filtered, line)
+		}
+		if len(filtered) == 0 {
+			return DoctorCheck{
+				Name:    "Git Working Tree",
+				Status:  StatusOK,
+				Message: "Clean (redirect worktree, .beads/ deletions expected)",
+			}
+		}
+		lines = filtered
+	}
+
 	// Show a small sample of paths for quick debugging.
-	lines := strings.Split(status, "\n")
 	maxLines := 8
 	if len(lines) > maxLines {
 		lines = append(lines[:maxLines], "…")
@@ -310,10 +374,38 @@ func CheckGitWorkingTree(path string) DoctorCheck {
 	}
 }
 
+// isExpectedRedirectChange returns true if a git status --porcelain line
+// represents an expected change in a redirect worktree: deleted .beads/ files
+// or the untracked .beads/redirect file itself.
+// Porcelain format: XY PATH where X=index status, Y=worktree status.
+// Deletions show as " D .beads/..." (unstaged) or "D  .beads/..." (staged).
+func isExpectedRedirectChange(line string) bool {
+	if len(line) < 4 {
+		return false
+	}
+	xy := line[:2]
+	filePath := line[3:]
+	if !strings.HasPrefix(filePath, ".beads/") {
+		return false
+	}
+	// Deleted .beads/ files (expected: data lives at redirect target)
+	if xy == " D" || xy == "D " || xy == "DD" {
+		return true
+	}
+	// Untracked .beads/redirect file (expected: the redirect marker itself)
+	if xy == "??" && filePath == ".beads/redirect" {
+		return true
+	}
+	return false
+}
+
 // CheckGitUpstream checks whether the current branch is up to date with its upstream.
 // This catches common "forgot to pull/push" failure modes (AGENTS.md: pull --rebase, push).
 func CheckGitUpstream(path string) DoctorCheck {
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--git-dir")
 	cmd.Dir = path
 	if err := cmd.Run(); err != nil {
 		return DoctorCheck{
@@ -324,7 +416,7 @@ func CheckGitUpstream(path string) DoctorCheck {
 	}
 
 	// Detect detached HEAD.
-	cmd = exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	cmd = exec.CommandContext(ctx, "git", "symbolic-ref", "--short", "HEAD")
 	cmd.Dir = path
 	branchOut, err := cmd.Output()
 	if err != nil {
@@ -337,7 +429,19 @@ func CheckGitUpstream(path string) DoctorCheck {
 	}
 	branch := strings.TrimSpace(string(branchOut))
 
-	cmd = exec.Command("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	// Check if any remotes exist — no point warning about upstream if there's no remote
+	remoteCmd := exec.CommandContext(ctx, "git", "remote")
+	remoteCmd.Dir = path
+	remoteOut, err := remoteCmd.Output()
+	if err != nil || strings.TrimSpace(string(remoteOut)) == "" {
+		return DoctorCheck{
+			Name:    "Git Upstream",
+			Status:  StatusOK,
+			Message: "N/A — no remotes configured",
+		}
+	}
+
+	cmd = exec.CommandContext(ctx, "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	cmd.Dir = path
 	upOut, err := cmd.Output()
 	if err != nil {
@@ -350,8 +454,8 @@ func CheckGitUpstream(path string) DoctorCheck {
 	}
 	upstream := strings.TrimSpace(string(upOut))
 
-	ahead, aheadErr := gitRevListCount(path, "@{u}..HEAD")
-	behind, behindErr := gitRevListCount(path, "HEAD..@{u}")
+	ahead, aheadErr := gitRevListCount(ctx, path, "@{u}..HEAD")
+	behind, behindErr := gitRevListCount(ctx, path, "HEAD..@{u}")
 	if aheadErr != nil || behindErr != nil {
 		detailParts := []string{}
 		if aheadErr != nil {
@@ -394,7 +498,7 @@ func CheckGitUpstream(path string) DoctorCheck {
 			Status:  StatusWarning,
 			Message: fmt.Sprintf("Behind upstream by %d commit(s)", behind),
 			Detail:  fmt.Sprintf("Branch: %s, upstream: %s", branch, upstream),
-			Fix:     "Run 'git pull --rebase' (then re-run bd sync / bd doctor)",
+			Fix:     "Run 'git pull --rebase' (then re-run bd doctor)",
 		}
 	}
 
@@ -407,8 +511,8 @@ func CheckGitUpstream(path string) DoctorCheck {
 	}
 }
 
-func gitRevListCount(path string, rangeExpr string) (int, error) {
-	cmd := exec.Command("git", "rev-list", "--count", rangeExpr) // #nosec G204 -- fixed args
+func gitRevListCount(ctx context.Context, path string, rangeExpr string) (int, error) {
+	cmd := exec.CommandContext(ctx, "git", "rev-list", "--count", rangeExpr) // #nosec G204 -- fixed args
 	cmd.Dir = path
 	out, err := cmd.Output()
 	if err != nil {
@@ -485,6 +589,20 @@ func CheckMergeDriver(path string) DoctorCheck {
 	}
 }
 
+// FixMergeDriver sets the git merge driver configuration to the correct value.
+func FixMergeDriver() error {
+	correctConfig := "bd merge %A %O %A %B"
+	cmd := exec.Command("git", "config", "merge.beads.driver", correctConfig) // #nosec G204
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to set merge.beads.driver: %w", err)
+	}
+	// Also ensure merge.beads.name is set
+	nameCmd := exec.Command("git", "config", "merge.beads.name", "Beads merge driver") // #nosec G204
+	if err := nameCmd.Run(); err != nil {
+		return fmt.Errorf("failed to set merge.beads.name: %w", err)
+	}
+	return nil
+}
 
 // CheckGitHooksDoltCompatibility checks if installed git hooks are compatible with Dolt backend.
 // Hooks installed before Dolt support was added don't have the backend check and will
@@ -525,6 +643,15 @@ func CheckGitHooksDoltCompatibility(path string) DoctorCheck {
 
 	contentStr := string(content)
 
+	// Section-marker hooks (GH#1380) delegate to 'bd hooks run' which handles Dolt correctly
+	if strings.Contains(contentStr, bdSectionMarkerPrefix) {
+		return DoctorCheck{
+			Name:    "Git Hooks Dolt Compatibility",
+			Status:  StatusOK,
+			Message: "Marker-managed hooks (Dolt handled by bd hooks run)",
+		}
+	}
+
 	// Shim hooks (bd-shim) delegate to 'bd hook' which handles Dolt correctly
 	if strings.Contains(contentStr, bdShimMarker) {
 		return DoctorCheck{
@@ -558,7 +685,7 @@ func CheckGitHooksDoltCompatibility(path string) DoctorCheck {
 		Name:    "Git Hooks Dolt Compatibility",
 		Status:  StatusError,
 		Message: "Git hooks incompatible with Dolt backend",
-		Detail:  "Installed hooks attempt JSONL sync which fails with Dolt. This causes errors on git pull/commit.",
+		Detail:  "Installed hooks are outdated and incompatible with the Dolt backend.",
 		Fix:     "Run 'bd hooks install --force' to update hooks for Dolt compatibility",
 	}
 }
@@ -576,8 +703,11 @@ func fixGitHooks(path string) error {
 //   - gitPath: The directory to scan for git commits
 //   - provider: The issue provider to get open issues and prefix from
 func FindOrphanedIssues(gitPath string, provider types.IssueProvider) ([]OrphanIssue, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+
 	// Skip if not in a git repo
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--git-dir")
 	cmd.Dir = gitPath
 	if err := cmd.Run(); err != nil {
 		return []OrphanIssue{}, nil // Not a git repo, return empty list
@@ -587,10 +717,9 @@ func FindOrphanedIssues(gitPath string, provider types.IssueProvider) ([]OrphanI
 	issuePrefix := provider.GetIssuePrefix()
 
 	// Get all open/in_progress issues from provider
-	ctx := context.Background()
 	issues, err := provider.GetOpenIssues(ctx)
 	if err != nil {
-		return []OrphanIssue{}, nil
+		return nil, fmt.Errorf("getting open issues: %w", err)
 	}
 
 	openIssues := make(map[string]*OrphanIssue)
@@ -607,11 +736,11 @@ func FindOrphanedIssues(gitPath string, provider types.IssueProvider) ([]OrphanI
 	}
 
 	// Get git log
-	cmd = exec.Command("git", "log", "--oneline", "--all")
+	cmd = exec.CommandContext(ctx, "git", "log", "--oneline", "--all")
 	cmd.Dir = gitPath
 	output, err := cmd.Output()
 	if err != nil {
-		return []OrphanIssue{}, nil
+		return nil, fmt.Errorf("reading git log: %w", err)
 	}
 
 	// Parse commits for issue references
@@ -663,14 +792,6 @@ func FindOrphanedIssues(gitPath string, provider types.IssueProvider) ([]OrphanI
 	return orphanedIssues, nil
 }
 
-// findOrphanedIssuesFromPath is a convenience function for callers that don't have a provider.
-// Note: Cross-repo orphan detection via local database provider has been removed
-// along with the SQLite backend. This function now returns an error; callers
-// should use FindOrphanedIssues with an explicit IssueProvider instead.
-func findOrphanedIssuesFromPath(path string) ([]OrphanIssue, error) {
-	return nil, fmt.Errorf("cross-repo orphan detection requires an explicit IssueProvider (local database provider removed)")
-}
-
 // CheckOrphanedIssues detects issues referenced in git commits but still open.
 // This catches cases where someone implemented a fix with "(bd-xxx)" in the commit
 // message but forgot to run "bd close".
@@ -685,4 +806,3 @@ func CheckOrphanedIssues(path string) DoctorCheck {
 		Category: CategoryGit,
 	}
 }
-

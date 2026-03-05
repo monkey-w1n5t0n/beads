@@ -1,12 +1,26 @@
 # Makefile for beads project
 
-.PHONY: all build test test-full-cgo bench bench-quick clean install help check-up-to-date fmt fmt-check
+# On Windows, GNU Make defaults to cmd.exe which doesn't support POSIX
+# shell syntax used throughout this Makefile. Use Git for Windows' bash.
+ifeq ($(OS),Windows_NT)
+GIT_BASH := $(shell where git 2>nul)
+ifneq ($(GIT_BASH),)
+SHELL := $(subst cmd,bin,$(subst git.exe,bash.exe,$(GIT_BASH)))
+endif
+endif
+
+.PHONY: all build test test-full-cgo test-regression bench bench-quick clean install install-force help check-up-to-date fmt fmt-check
 
 # Default target
 all: build
 
 BUILD_DIR := .
+GIT_BUILD := $(shell git rev-parse --short HEAD)
+ifeq ($(OS),Windows_NT)
+INSTALL_DIR := $(USERPROFILE)/.local/bin
+else
 INSTALL_DIR := $(HOME)/.local/bin
+endif
 
 # Dolt backend requires CGO for embedded database support.
 # Without CGO, builds will fail with "dolt backend requires CGO".
@@ -47,9 +61,9 @@ endif
 build:
 	@echo "Building bd..."
 ifeq ($(OS),Windows_NT)
-	go build -tags gms_pure_go -ldflags="-X main.Build=$$(git rev-parse --short HEAD)" -o $(BUILD_DIR)/bd.exe ./cmd/bd
+	go build -tags gms_pure_go -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/bd.exe ./cmd/bd
 else
-	go build -ldflags="-X main.Build=$$(git rev-parse --short HEAD)" -o $(BUILD_DIR)/bd ./cmd/bd
+	go build -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/bd ./cmd/bd
 ifeq ($(shell uname),Darwin)
 	@codesign -s - -f $(BUILD_DIR)/bd 2>/dev/null || true
 	@echo "Signed bd for macOS"
@@ -66,6 +80,13 @@ test:
 test-full-cgo:
 	@echo "Running full CGO-enabled tests..."
 	@./scripts/test-cgo.sh ./...
+
+# Run differential regression tests (baseline v0.49.6 vs current worktree).
+# Downloads baseline binary on first run; cached in ~/Library/Caches/beads-regression/.
+# Override baseline: BD_REGRESSION_BASELINE_BIN=/path/to/bd make test-regression
+test-regression:
+	@echo "Running regression tests (baseline vs candidate)..."
+	go test -tags=regression -timeout=10m -v ./tests/regression/...
 
 # Run performance benchmarks against Dolt storage backend
 # Requires CGO and Dolt; generates CPU profile files
@@ -85,6 +106,8 @@ bench-quick:
 # Check that local branch is up to date with origin/main
 check-up-to-date:
 ifndef SKIP_UPDATE_CHECK
+	@# Skip check on detached HEAD (tag checkouts, CI builds)
+	@if ! git symbolic-ref HEAD >/dev/null 2>&1; then exit 0; fi
 	@git fetch origin main --quiet 2>/dev/null || true
 	@LOCAL=$$(git rev-parse HEAD 2>/dev/null); \
 	REMOTE=$$(git rev-parse origin/main 2>/dev/null); \
@@ -92,14 +115,15 @@ ifndef SKIP_UPDATE_CHECK
 		echo "ERROR: Local branch is not up to date with origin/main"; \
 		echo "  Local:  $$(git rev-parse --short HEAD)"; \
 		echo "  Remote: $$(git rev-parse --short origin/main)"; \
-		echo "Run 'git pull' first, or use SKIP_UPDATE_CHECK=1 to override"; \
+		echo "Run 'git pull' first, or use 'make install-force' to override"; \
 		exit 1; \
 	fi
 endif
 
 # Install bd to ~/.local/bin (builds, signs on macOS, and copies)
 # Also creates 'beads' symlink as an alias for bd
-install: check-up-to-date build
+# Use install-force to skip the origin/main update check
+install install-force: build
 	@mkdir -p $(INSTALL_DIR)
 ifeq ($(OS),Windows_NT)
 	@rm -f $(INSTALL_DIR)/bd.exe
@@ -113,6 +137,9 @@ else
 	@ln -s bd $(INSTALL_DIR)/beads
 	@echo "Created 'beads' alias -> bd"
 endif
+	@git config core.hooksPath .githooks 2>/dev/null && echo "Configured git hooks (.githooks/)" || true
+
+install: check-up-to-date
 
 # Format all Go files
 fmt:
@@ -147,9 +174,11 @@ help:
 	@echo "  make build        - Build the bd binary"
 	@echo "  make test         - Run all tests"
 	@echo "  make test-full-cgo - Run full CGO-enabled test suite"
+	@echo "  make test-regression - Run differential regression tests (baseline vs candidate)"
 	@echo "  make bench        - Run performance benchmarks (generates CPU profiles)"
 	@echo "  make bench-quick  - Run quick benchmarks (shorter benchtime)"
 	@echo "  make install      - Install bd to ~/.local/bin (with codesign on macOS, includes 'beads' alias)"
+	@echo "  make install-force - Install bd, skipping the origin/main update check"
 	@echo "  make fmt          - Format all Go files with gofmt"
 	@echo "  make fmt-check    - Check Go formatting (for CI)"
 	@echo "  make clean        - Remove build artifacts and profile files"

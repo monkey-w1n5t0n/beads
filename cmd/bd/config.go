@@ -24,14 +24,15 @@ var configCmd = &cobra.Command{
 	Short:   "Manage configuration settings",
 	Long: `Manage configuration settings for external integrations and preferences.
 
-Configuration is stored per-project in .beads/*.db and is version-control-friendly.
+Configuration is stored per-project in the beads database and is version-control-friendly.
 
 Common namespaces:
-  - jira.*       Jira integration settings
-  - linear.*     Linear integration settings
-  - github.*     GitHub integration settings
-  - custom.*     Custom integration settings
-  - status.*     Issue status configuration
+  - jira.*            Jira integration settings
+  - linear.*          Linear integration settings
+  - github.*          GitHub integration settings
+  - custom.*          Custom integration settings
+  - status.*          Issue status configuration
+  - doctor.suppress.* Suppress specific bd doctor warnings (GH#1095)
 
 Custom Status States:
   You can define custom status states for multi-step pipelines using the
@@ -43,10 +44,19 @@ Custom Status States:
   This enables issues to use statuses like 'awaiting_review' in addition to
   the built-in statuses (open, in_progress, blocked, deferred, closed).
 
+Suppressing Doctor Warnings:
+  Suppress specific bd doctor warnings by check name slug:
+    bd config set doctor.suppress.pending-migrations true
+    bd config set doctor.suppress.git-hooks true
+  Check names are converted to slugs: "Git Hooks" → "git-hooks".
+  Only warnings are suppressed (errors and passing checks always show).
+  To unsuppress: bd config unset doctor.suppress.<slug>
+
 Examples:
   bd config set jira.url "https://company.atlassian.net"
   bd config set jira.project "PROJ"
   bd config set status.custom "awaiting_review,awaiting_testing"
+  bd config set doctor.suppress.pending-migrations true
   bd config get jira.url
   bd config list
   bd config unset jira.url`,
@@ -263,14 +273,49 @@ var configListCmd = &cobra.Command{
 // This addresses the confusion when `bd config list` shows one value but the effective
 // value used by commands is different due to higher-priority config sources.
 func showConfigYAMLOverrides(dbConfig map[string]string) {
-	var overrides []string
+	var warnings []string
 
-	if len(overrides) > 0 {
-		fmt.Println("\n⚠️  Config overrides (higher priority sources):")
-		for _, o := range overrides {
-			fmt.Println(o)
+	// Check each DB config key for env var overrides
+	for key, dbValue := range dbConfig {
+		envKey := "BD_" + strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
+		if envValue := os.Getenv(envKey); envValue != "" && envValue != dbValue {
+			warnings = append(warnings, fmt.Sprintf("  %s: DB has %q, but env %s=%q takes precedence", key, dbValue, envKey, envValue))
 		}
-		fmt.Println("\nNote: config.yaml and environment variables take precedence over database config.")
+	}
+
+	// Check for yaml-only keys set in config.yaml that aren't visible in DB output
+	yamlKeys := []string{
+		"no-db", "json", "actor", "identity",
+		"routing.mode", "routing.default", "routing.maintainer", "routing.contributor",
+		"sync.mode", "sync.git-remote", "no-push", "no-git-ops",
+		"git.author", "git.no-gpg-sign",
+		"create.require-description",
+		"validation.on-create", "validation.on-sync",
+		"hierarchy.max-depth",
+		"dolt.idle-timeout",
+	}
+
+	var yamlOverrides []string
+	for _, key := range yamlKeys {
+		val := config.GetYamlConfig(key)
+		if val != "" && config.GetValueSource(key) == config.SourceConfigFile {
+			yamlOverrides = append(yamlOverrides, fmt.Sprintf("  %s = %s", key, val))
+		}
+	}
+
+	if len(yamlOverrides) > 0 {
+		fmt.Println("\nAlso set in config.yaml (not shown above):")
+		for _, line := range yamlOverrides {
+			fmt.Println(line)
+		}
+	}
+
+	if len(warnings) > 0 {
+		sort.Strings(warnings)
+		fmt.Println("\n⚠ Environment variable overrides detected:")
+		for _, w := range warnings {
+			fmt.Println(w)
+		}
 	}
 }
 
@@ -309,12 +354,11 @@ var configValidateCmd = &cobra.Command{
 	Long: `Validate sync-related configuration settings.
 
 Checks:
-  - sync.mode is a valid value (local, git-branch, external)
-  - conflict.strategy is valid (lww, manual, ours, theirs)
-  - federation.sovereignty is valid (if set)
+  - sync.mode is a valid value (dolt-native)
+  - conflict.strategy is valid (newest, ours, theirs, manual)
+  - federation.sovereignty is valid (T1, T2, T3, T4, or empty)
   - federation.remote is set when sync.mode requires it
   - Remote URL format is valid (dolthub://, gs://, s3://, file://)
-  - sync.branch is a valid git branch name
   - routing.mode is valid (auto, maintainer, contributor, explicit)
 
 Examples:
@@ -397,42 +441,23 @@ func validateSyncConfig(repoPath string) []string {
 	federationRemote := v.GetString("federation.remote")
 
 	// Validate sync.mode
-	validSyncModes := map[string]bool{
-		"":           true, // not set is valid (uses default)
-		"local":      true,
-		"git-branch": true,
-		"external":   true,
-	}
-	if syncMode != "" && !validSyncModes[syncMode] {
-		issues = append(issues, fmt.Sprintf("sync.mode: %q is invalid (valid values: local, git-branch, external)", syncMode))
+	if syncMode != "" && !config.IsValidSyncMode(syncMode) {
+		issues = append(issues, fmt.Sprintf("sync.mode: %q is invalid (valid values: %s)", syncMode, strings.Join(config.ValidSyncModes(), ", ")))
 	}
 
 	// Validate conflict.strategy
-	validConflictStrategies := map[string]bool{
-		"":       true, // not set is valid (uses default lww)
-		"lww":    true, // last-write-wins (default)
-		"manual": true, // require manual resolution
-		"ours":   true, // prefer local changes
-		"theirs": true, // prefer remote changes
-	}
-	if conflictStrategy != "" && !validConflictStrategies[conflictStrategy] {
-		issues = append(issues, fmt.Sprintf("conflict.strategy: %q is invalid (valid values: lww, manual, ours, theirs)", conflictStrategy))
+	if conflictStrategy != "" && !config.IsValidConflictStrategy(conflictStrategy) {
+		issues = append(issues, fmt.Sprintf("conflict.strategy: %q is invalid (valid values: %s)", conflictStrategy, strings.Join(config.ValidConflictStrategies(), ", ")))
 	}
 
 	// Validate federation.sovereignty
-	validSovereignties := map[string]bool{
-		"":          true, // not set is valid
-		"none":      true, // no sovereignty restrictions
-		"isolated":  true, // fully isolated, no federation
-		"federated": true, // participates in federation
-	}
-	if federationSov != "" && !validSovereignties[federationSov] {
-		issues = append(issues, fmt.Sprintf("federation.sovereignty: %q is invalid (valid values: none, isolated, federated)", federationSov))
+	if federationSov != "" && !config.IsValidSovereignty(federationSov) {
+		issues = append(issues, fmt.Sprintf("federation.sovereignty: %q is invalid (valid values: %s, or empty for no restriction)", federationSov, strings.Join(config.ValidSovereigntyTiers(), ", ")))
 	}
 
-	// Validate federation.remote when required
-	if syncMode == "external" && federationRemote == "" {
-		issues = append(issues, "federation.remote: required when sync.mode is 'external'")
+	// Validate federation.remote is set (required for Dolt sync)
+	if federationRemote == "" {
+		issues = append(issues, "federation.remote: required for Dolt sync")
 	}
 
 	// Validate remote URL format

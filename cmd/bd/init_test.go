@@ -5,20 +5,35 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
+// skipIfNoDolt skips the test when no Dolt server is available.
+// Checks both binary availability and test server status.
+func skipIfNoDolt(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("skipping: dolt not installed")
+	}
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test server not running")
+	}
+}
+
 func TestInitCommand(t *testing.T) {
+	skipIfNoDolt(t)
 	tests := []struct {
 		name           string
 		prefix         string
@@ -143,10 +158,8 @@ func TestInitCommand(t *testing.T) {
 					"daemon.log",
 					"daemon.pid",
 					"bd.sock",
-					"beads.base.jsonl",
-					"beads.left.jsonl",
-					"beads.right.jsonl",
-					"Do NOT add negation patterns", // Comment explaining fork protection
+					"dolt/",
+					"dolt-access.lock",
 				}
 				for _, pattern := range expectedPatterns {
 					if !strings.Contains(gitignoreStr, pattern) {
@@ -176,6 +189,7 @@ func TestInitCommand(t *testing.T) {
 // on errors, which makes it difficult to test in a unit test context.
 
 func TestInitAlreadyInitialized(t *testing.T) {
+	skipIfNoDolt(t)
 	// Reset global state
 	origDBPath := dbPath
 	defer func() { dbPath = origDBPath }()
@@ -362,203 +376,6 @@ func TestInitWithCustomDBPath(t *testing.T) {
 			t.Error(".beads/ directory should not be created in CWD when BEADS_DB is set")
 		}
 	})
-}
-
-func TestInitNoDbMode(t *testing.T) {
-	t.Skip("no-db mode has been removed; beads now requires Dolt")
-	// Reset global state
-	origDBPath := dbPath
-	origNoDb := noDb
-	defer func() {
-		dbPath = origDBPath
-		noDb = origNoDb
-	}()
-	dbPath = ""
-	noDb = false
-
-	// Reset Cobra flags - critical for --no-db to work correctly
-	rootCmd.PersistentFlags().Set("no-db", "false")
-
-	tmpDir := t.TempDir()
-	t.Chdir(tmpDir)
-
-	// Set BEADS_DIR to prevent git repo detection from finding project's .beads
-	origBeadsDir := os.Getenv("BEADS_DIR")
-	os.Setenv("BEADS_DIR", filepath.Join(tmpDir, ".beads"))
-	// Reset caches so RepoContext picks up new BEADS_DIR and CWD
-	beads.ResetCaches()
-	git.ResetCaches()
-	defer func() {
-		if origBeadsDir != "" {
-			os.Setenv("BEADS_DIR", origBeadsDir)
-		} else {
-			os.Unsetenv("BEADS_DIR")
-		}
-		// Reset caches on cleanup too
-		beads.ResetCaches()
-		git.ResetCaches()
-	}()
-
-	// Initialize with --no-db flag
-	rootCmd.SetArgs([]string{"init", "--no-db", "--prefix", "test", "--quiet"})
-
-	t.Logf("DEBUG: noDb before Execute=%v", noDb)
-
-	if err := rootCmd.Execute(); err != nil {
-		t.Fatalf("Init with --no-db failed: %v", err)
-	}
-
-	t.Logf("DEBUG: noDb after Execute=%v", noDb)
-
-	// Debug: Check where files were created
-	beadsDirEnv := os.Getenv("BEADS_DIR")
-	t.Logf("DEBUG: tmpDir=%s", tmpDir)
-	t.Logf("DEBUG: BEADS_DIR=%s", beadsDirEnv)
-	t.Logf("DEBUG: CWD=%s", func() string { cwd, _ := os.Getwd(); return cwd }())
-
-	// Check what files exist in tmpDir
-	entries, _ := os.ReadDir(tmpDir)
-	t.Logf("DEBUG: entries in tmpDir: %v", entries)
-	if beadsDirEnv != "" {
-		beadsEntries, err := os.ReadDir(beadsDirEnv)
-		t.Logf("DEBUG: entries in BEADS_DIR: %v (err: %v)", beadsEntries, err)
-	}
-
-	// Verify issues.jsonl was created
-	jsonlPath := filepath.Join(tmpDir, ".beads", "issues.jsonl")
-	if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
-		// Also check at BEADS_DIR directly
-		beadsDirJsonlPath := filepath.Join(beadsDirEnv, "issues.jsonl")
-		if _, err2 := os.Stat(beadsDirJsonlPath); err2 == nil {
-			t.Logf("DEBUG: issues.jsonl found at BEADS_DIR path: %s", beadsDirJsonlPath)
-		}
-		t.Error("issues.jsonl was not created in --no-db mode")
-	}
-
-	// Verify config.yaml was created with no-db: true
-	configPath := filepath.Join(tmpDir, ".beads", "config.yaml")
-	configContent, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("Failed to read config.yaml: %v", err)
-	}
-
-	configStr := string(configContent)
-	if !strings.Contains(configStr, "no-db: true") {
-		t.Error("config.yaml should contain 'no-db: true' in --no-db mode")
-	}
-	if !strings.Contains(configStr, "issue-prefix:") {
-		t.Error("config.yaml should contain issue-prefix in --no-db mode")
-	}
-
-	// Reset config so it picks up the newly created config.yaml
-	// (simulates a new process invocation which would load fresh config)
-	initConfigForTest(t)
-
-	// Verify config has correct values
-	if !config.GetBool("no-db") {
-		t.Error("config should have no-db=true after init --no-db")
-	}
-	if config.GetString("issue-prefix") != "test" {
-		t.Errorf("config should have issue-prefix='test', got %q", config.GetString("issue-prefix"))
-	}
-
-	// NOTE: Testing subsequent command execution in the same process is complex
-	// due to cobra's flag caching and global state. The key functionality
-	// (init creating proper config.yaml for no-db mode) is verified above.
-	// Real-world usage works correctly since each command is a fresh process.
-
-	// Verify no SQLite database was created
-	dbPath := filepath.Join(tmpDir, ".beads", "beads.db")
-	if _, err := os.Stat(dbPath); err == nil {
-		t.Error("SQLite database should not be created in --no-db mode")
-	}
-}
-
-// TestReadFirstIssueFromJSONL_ValidFile verifies reading first issue from valid JSONL
-func TestReadFirstIssueFromJSONL_ValidFile(t *testing.T) {
-	tempDir := t.TempDir()
-	jsonlPath := filepath.Join(tempDir, "test.jsonl")
-
-	// Create test JSONL file with multiple issues
-	content := `{"id":"bd-1","title":"First Issue","description":"First test"}
-{"id":"bd-2","title":"Second Issue","description":"Second test"}
-{"id":"bd-3","title":"Third Issue","description":"Third test"}
-`
-	if err := os.WriteFile(jsonlPath, []byte(content), 0o600); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
-	}
-
-	issue, err := readFirstIssueFromJSONL(jsonlPath)
-	if err != nil {
-		t.Fatalf("readFirstIssueFromJSONL failed: %v", err)
-	}
-
-	if issue == nil {
-		t.Fatal("Expected non-nil issue, got nil")
-	}
-
-	// Verify we got the FIRST issue
-	if issue.ID != "bd-1" {
-		t.Errorf("Expected ID 'bd-1', got '%s'", issue.ID)
-	}
-	if issue.Title != "First Issue" {
-		t.Errorf("Expected title 'First Issue', got '%s'", issue.Title)
-	}
-	if issue.Description != "First test" {
-		t.Errorf("Expected description 'First test', got '%s'", issue.Description)
-	}
-}
-
-// TestReadFirstIssueFromJSONL_EmptyLines verifies skipping empty lines
-func TestReadFirstIssueFromJSONL_EmptyLines(t *testing.T) {
-	tempDir := t.TempDir()
-	jsonlPath := filepath.Join(tempDir, "test.jsonl")
-
-	// Create JSONL with empty lines before first valid issue
-	content := `
-
-{"id":"bd-1","title":"First Valid Issue"}
-{"id":"bd-2","title":"Second Issue"}
-`
-	if err := os.WriteFile(jsonlPath, []byte(content), 0o600); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
-	}
-
-	issue, err := readFirstIssueFromJSONL(jsonlPath)
-	if err != nil {
-		t.Fatalf("readFirstIssueFromJSONL failed: %v", err)
-	}
-
-	if issue == nil {
-		t.Fatal("Expected non-nil issue, got nil")
-	}
-
-	if issue.ID != "bd-1" {
-		t.Errorf("Expected ID 'bd-1', got '%s'", issue.ID)
-	}
-	if issue.Title != "First Valid Issue" {
-		t.Errorf("Expected title 'First Valid Issue', got '%s'", issue.Title)
-	}
-}
-
-// TestReadFirstIssueFromJSONL_EmptyFile verifies handling of empty file
-func TestReadFirstIssueFromJSONL_EmptyFile(t *testing.T) {
-	tempDir := t.TempDir()
-	jsonlPath := filepath.Join(tempDir, "empty.jsonl")
-
-	// Create empty file
-	if err := os.WriteFile(jsonlPath, []byte(""), 0o600); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
-	}
-
-	issue, err := readFirstIssueFromJSONL(jsonlPath)
-	if err != nil {
-		t.Fatalf("readFirstIssueFromJSONL should not error on empty file: %v", err)
-	}
-
-	if issue != nil {
-		t.Errorf("Expected nil issue for empty file, got %+v", issue)
-	}
 }
 
 // TestSetupClaudeSettings_InvalidJSON verifies that invalid JSON in existing
@@ -824,13 +641,8 @@ func captureStdout(t *testing.T, fn func() error) string {
 // TestInitPromptRoleConfig tests the beads.role git config read/write functions
 func TestInitPromptRoleConfig(t *testing.T) {
 	t.Run("getBeadsRole returns empty when not configured", func(t *testing.T) {
-		tmpDir := t.TempDir()
+		tmpDir := newGitRepo(t)
 		t.Chdir(tmpDir)
-
-		// Initialize git repo
-		if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
 
 		role, hasRole := getBeadsRole()
 		if hasRole {
@@ -842,13 +654,8 @@ func TestInitPromptRoleConfig(t *testing.T) {
 	})
 
 	t.Run("setBeadsRole and getBeadsRole roundtrip", func(t *testing.T) {
-		tmpDir := t.TempDir()
+		tmpDir := newGitRepo(t)
 		t.Chdir(tmpDir)
-
-		// Initialize git repo
-		if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
 
 		// Set role to contributor
 		if err := setBeadsRole("contributor"); err != nil {
@@ -880,6 +687,7 @@ func TestInitPromptRoleConfig(t *testing.T) {
 
 // TestInitPromptSkippedWithFlags verifies that --contributor and --team flags skip the prompt
 func TestInitPromptSkippedWithFlags(t *testing.T) {
+	skipIfNoDolt(t)
 	t.Run("contributor flag skips prompt and runs wizard", func(t *testing.T) {
 		// Reset global state
 		origDBPath := dbPath
@@ -897,13 +705,8 @@ func TestInitPromptSkippedWithFlags(t *testing.T) {
 		// Reset Cobra flags
 		initCmd.Flags().Set("contributor", "false")
 
-		tmpDir := t.TempDir()
+		tmpDir := newGitRepo(t)
 		t.Chdir(tmpDir)
-
-		// Initialize git repo
-		if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
 
 		// Verify no role is set initially
 		role, hasRole := getBeadsRole()
@@ -938,13 +741,8 @@ func TestInitPromptSkippedWithFlags(t *testing.T) {
 		// Reset Cobra flags
 		initCmd.Flags().Set("team", "false")
 
-		tmpDir := t.TempDir()
+		tmpDir := newGitRepo(t)
 		t.Chdir(tmpDir)
-
-		// Initialize git repo
-		if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
 
 		// Verify no role is set initially
 		role, hasRole := getBeadsRole()
@@ -982,6 +780,7 @@ func TestInitPromptTTYDetection(t *testing.T) {
 
 // TestInitPromptNonGitRepo verifies prompt is skipped in non-git directories
 func TestInitPromptNonGitRepo(t *testing.T) {
+	skipIfNoDolt(t)
 	// Reset global state
 	origDBPath := dbPath
 	defer func() { dbPath = origDBPath }()
@@ -1019,6 +818,7 @@ func TestInitPromptNonGitRepo(t *testing.T) {
 
 // TestInitPromptExistingRole verifies behavior when beads.role is already set
 func TestInitPromptExistingRole(t *testing.T) {
+	skipIfNoDolt(t)
 	t.Run("existing role is preserved on reinit with --force", func(t *testing.T) {
 		// Reset global state
 		origDBPath := dbPath
@@ -1038,13 +838,8 @@ func TestInitPromptExistingRole(t *testing.T) {
 		initCmd.Flags().Set("team", "false")
 		initCmd.Flags().Set("force", "false")
 
-		tmpDir := t.TempDir()
+		tmpDir := newGitRepo(t)
 		t.Chdir(tmpDir)
-
-		// Initialize git repo
-		if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
 
 		// Set role before init
 		if err := setBeadsRole("contributor"); err != nil {
@@ -1086,10 +881,76 @@ func TestInitPromptExistingRole(t *testing.T) {
 	})
 }
 
+func TestInitContributorSetsBeadsRoleContributor(t *testing.T) {
+	skipIfNoDolt(t)
+
+	origDBPath := dbPath
+	defer func() { dbPath = origDBPath }()
+	dbPath = ""
+
+	beads.ResetCaches()
+	git.ResetCaches()
+	defer func() {
+		beads.ResetCaches()
+		git.ResetCaches()
+	}()
+
+	initCmd.Flags().Set("contributor", "false")
+	initCmd.Flags().Set("team", "false")
+	initCmd.Flags().Set("force", "false")
+
+	tmpDir := newGitRepo(t)
+	t.Chdir(tmpDir)
+
+	// Keep test isolated from the real home/planning repo.
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	// Configure remotes so contributor wizard doesn't ask the "continue anyway" prompt.
+	cmd := exec.Command("git", "remote", "add", "origin", "git@github.com:osamu2001/zmx.git")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to add origin remote: %v", err)
+	}
+	cmd = exec.Command("git", "remote", "add", "upstream", "git@github.com:neurosnap/zmx.git")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to add upstream remote: %v", err)
+	}
+
+	// Wizard answers:
+	// 1) "Do you want to use a separate planning repo anyway? [Y/n]" -> Enter (default yes)
+	// 2) "Planning repo path [press Enter for default]" -> Enter (default ~/.beads-planning)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create stdin pipe: %v", err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = oldStdin })
+	t.Cleanup(func() { _ = r.Close() })
+	_, _ = w.WriteString("\n\n")
+	_ = w.Close()
+
+	rootCmd.SetArgs([]string{"init", "--prefix", "test", "--contributor", "--quiet"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("init --contributor failed: %v", err)
+	}
+
+	role, hasRole := getBeadsRole()
+	if !hasRole {
+		t.Fatal("expected beads.role to be configured")
+	}
+	if role != "contributor" {
+		t.Fatalf("beads.role = %q, want %q", role, "contributor")
+	}
+}
+
 // TestInitWithRedirect verifies that bd init creates the database in the redirect target,
 // not in the local .beads directory. (GH#bd-0qel)
 // TestInitRedirect groups redirect-related init tests.
 func TestInitRedirect(t *testing.T) {
+	skipIfNoDolt(t)
 	resetRedirectState := func(t *testing.T) {
 		t.Helper()
 		origDBPath := dbPath
@@ -1230,6 +1091,7 @@ func TestInitRedirect(t *testing.T) {
 // TestInitBEADS_DIR groups BEADS_DIR-related init tests.
 // Tests requirements FR-001, FR-002, FR-004, NFR-001.
 func TestInitBEADS_DIR(t *testing.T) {
+	skipIfNoDolt(t)
 	// resetBeadsDirState resets global state and env vars for each subtest.
 	resetBeadsDirState := func(t *testing.T) {
 		t.Helper()
@@ -1417,6 +1279,70 @@ func TestInitBEADS_DIR(t *testing.T) {
 		}
 	})
 
+	// Worktree bypass: BEADS_DIR skips the worktree guard and git init
+	t.Run("WorktreeBypassWhenBeadsDirSet", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Skipping worktree test on Windows")
+		}
+
+		resetBeadsDirState(t)
+
+		tmpDir := t.TempDir()
+
+		// Create a main git repo with an initial commit (required for worktrees)
+		mainRepo := filepath.Join(tmpDir, "main-repo")
+		if err := os.MkdirAll(mainRepo, 0755); err != nil {
+			t.Fatalf("Failed to create main repo dir: %v", err)
+		}
+		runGit := func(dir string, args ...string) {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = dir
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, out)
+			}
+		}
+		runGit(mainRepo, "init")
+		runGit(mainRepo, "config", "user.email", "test@test.com")
+		runGit(mainRepo, "config", "user.name", "Test")
+		runGit(mainRepo, "commit", "--allow-empty", "-m", "initial")
+
+		// Create a worktree
+		worktreeDir := filepath.Join(tmpDir, "my-worktree")
+		runGit(mainRepo, "worktree", "add", worktreeDir, "-b", "test-wt")
+
+		// Set BEADS_DIR to a standalone location outside the repo
+		beadsDirPath := filepath.Join(tmpDir, "standalone", ".beads")
+		if err := os.MkdirAll(filepath.Dir(beadsDirPath), 0755); err != nil {
+			t.Fatalf("Failed to create standalone dir: %v", err)
+		}
+		os.Setenv("BEADS_DIR", beadsDirPath)
+		t.Cleanup(func() { os.Unsetenv("BEADS_DIR") })
+		beads.ResetCaches()
+		git.ResetCaches()
+
+		// cd into the worktree — without BEADS_DIR this would fail
+		t.Chdir(worktreeDir)
+
+		rootCmd.SetArgs([]string{"init", "--prefix", "wt-bypass", "--skip-hooks", "--quiet"})
+		err := rootCmd.Execute()
+		if err != nil {
+			t.Fatalf("Init with BEADS_DIR from worktree should succeed, got: %v", err)
+		}
+
+		// Verify database was created at BEADS_DIR, not in the worktree
+		expectedDBPath := filepath.Join(beadsDirPath, "dolt")
+		if _, statErr := os.Stat(expectedDBPath); os.IsNotExist(statErr) {
+			t.Errorf("Dolt database was not created at BEADS_DIR path: %s", expectedDBPath)
+		}
+
+		worktreeDBPath := filepath.Join(worktreeDir, ".beads", "dolt")
+		if _, statErr := os.Stat(worktreeDBPath); statErr == nil {
+			t.Errorf("Database should NOT have been created in worktree: %s", worktreeDBPath)
+		}
+	})
+
 	// Precedence: BEADS_DB > BEADS_DIR
 	t.Run("BEADS_DB_OverridesBeadsDir", func(t *testing.T) {
 		t.Skip("BEADS_DB env var does not control Dolt store location; Dolt always uses .beads/dolt/")
@@ -1548,6 +1474,7 @@ func TestInit_WithBEADS_DIR_DoltBackend(t *testing.T) {
 // all 3 tracking metadata fields (bd_version, repo_id, clone_id) via verifyMetadata.
 // Covers FR-001, FR-002, FR-003, FR-004.
 func TestInitDoltMetadata(t *testing.T) {
+	skipIfNoDolt(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("Skipping Dolt metadata test on Windows")
 	}
@@ -1571,15 +1498,10 @@ func TestInitDoltMetadata(t *testing.T) {
 	initCmd.Flags().Set("quiet", "false")
 	initCmd.Flags().Set("backend", "")
 
-	tmpDir := t.TempDir()
+	tmpDir := newGitRepo(t)
 	t.Chdir(tmpDir)
 
-	// Create a git repo so ComputeRepoID succeeds (needs remote.origin.url)
-	if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-		t.Fatalf("git init failed: %v", err)
-	}
-	_ = runCommandInDir(tmpDir, "git", "config", "user.email", "test@example.com")
-	_ = runCommandInDir(tmpDir, "git", "config", "user.name", "Test User")
+	// Add remote.origin.url so ComputeRepoID succeeds
 	_ = runCommandInDir(tmpDir, "git", "config", "remote.origin.url", "https://github.com/test/repo.git")
 
 	rootCmd.SetArgs([]string{"init", "--prefix", "test", "--quiet"})
@@ -1590,7 +1512,7 @@ func TestInitDoltMetadata(t *testing.T) {
 	// Open the dolt store to verify metadata was written
 	ctx := context.Background()
 	doltPath := filepath.Join(tmpDir, ".beads", "dolt")
-	doltStore, err := openDoltStoreForTest(t, ctx, doltPath, "beads_test")
+	doltStore, err := openDoltStoreForTest(t, ctx, doltPath, "test")
 	if err != nil {
 		t.Fatalf("failed to open dolt store for verification: %v", err)
 	}
@@ -1639,6 +1561,7 @@ func openDoltStoreForTest(t *testing.T, ctx context.Context, doltPath, dbName st
 // verifyMetadata now takes *dolt.DoltStore (concrete type), making interface-based
 // mocking impossible. The failure paths are simple error-to-stderr logic.
 func TestVerifyMetadataSuccess(t *testing.T) {
+	skipIfNoDolt(t)
 	ctx := context.Background()
 
 	tmpDir := t.TempDir()
@@ -1665,6 +1588,7 @@ func TestVerifyMetadataSuccess(t *testing.T) {
 // Verifies warning output; actual metadata persistence checked by e2e tests.
 // Covers FR-015 (skip repo_id outside git).
 func TestInitDoltMetadataNoGit(t *testing.T) {
+	skipIfNoDolt(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("Skipping Dolt metadata test on Windows")
 	}
@@ -1687,22 +1611,20 @@ func TestInitDoltMetadataNoGit(t *testing.T) {
 	initCmd.Flags().Set("quiet", "false")
 	initCmd.Flags().Set("backend", "")
 
-	// Create temp dir WITHOUT git init — ComputeRepoID will fail
+	// Create temp dir WITHOUT git init — bd init will create one,
+	// but there will be no remote configured so upstream warning is expected.
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
 
-	// Capture stderr to check for repo_id warning
-	stderr := captureStderr(t, func() {
-		rootCmd.SetArgs([]string{"init", "--prefix", "nogit"})
-		if err := rootCmd.Execute(); err != nil {
-			t.Fatalf("init --backend dolt failed: %v", err)
-		}
-	})
-
-	// Should warn about repository ID (not in a git repo)
-	if !strings.Contains(stderr, "repository ID") {
-		t.Errorf("expected warning about repository ID in non-git dir, stderr: %s", stderr)
+	// Run init in a non-git directory (bd init will create git repo internally)
+	rootCmd.SetArgs([]string{"init", "--prefix", "nogit"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("init --prefix nogit failed: %v", err)
 	}
+
+	// Note: no upstream/repository ID warning expected here because bd init
+	// creates a brand-new git repo with no remotes, and the upstream warning
+	// is intentionally skipped for repos with no remotes (not noise-worthy).
 
 	// Verify .beads/dolt directory was created (init succeeded)
 	doltPath := filepath.Join(tmpDir, ".beads", "dolt")
@@ -1717,4 +1639,314 @@ func TestInitDoltMetadataNoGit(t *testing.T) {
 	if _, err := os.Stat(sqlitePath); err == nil {
 		t.Errorf("unexpected sqlite database created in dolt mode")
 	}
+}
+
+// buildBDOnce builds the bd binary once for subprocess tests in this file.
+// Uses sync.Once for efficiency when multiple tests need the binary.
+var (
+	initTestBD     string
+	initTestBDOnce sync.Once
+	initTestBDErr  error
+)
+
+func buildBDForInitTests(t *testing.T) string {
+	t.Helper()
+	initTestBDOnce.Do(func() {
+		// Check if bd binary exists in repo root (../../bd from cmd/bd/)
+		bdBinary := "bd"
+		if runtime.GOOS == "windows" {
+			bdBinary = "bd.exe"
+		}
+		repoRoot := filepath.Join("..", "..")
+		existingBD := filepath.Join(repoRoot, bdBinary)
+		if _, err := os.Stat(existingBD); err == nil {
+			initTestBD, _ = filepath.Abs(existingBD)
+			return
+		}
+		// Fall back to building
+		tmpDir, err := os.MkdirTemp("", "bd-init-test-*")
+		if err != nil {
+			initTestBDErr = fmt.Errorf("failed to create temp dir: %w", err)
+			return
+		}
+		initTestBD = filepath.Join(tmpDir, bdBinary)
+		cmd := exec.Command("go", "build", "-o", initTestBD, ".")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			initTestBDErr = fmt.Errorf("go build failed: %v\n%s", err, out)
+		}
+	})
+	if initTestBDErr != nil {
+		t.Fatalf("Failed to build bd binary: %v", initTestBDErr)
+	}
+	return initTestBD
+}
+
+// TestInitDatabaseFlag tests the --database flag for bd init.
+// Uses subprocess execution because:
+//   - init manipulates extensive Cobra global state that's difficult to reset
+//   - FatalError calls os.Exit(1) for validation errors, which kills in-process tests
+//
+// Each subtest runs bd init in a temp directory and verifies metadata.json.
+func TestInitDatabaseFlag(t *testing.T) {
+	skipIfNoDolt(t)
+	bd := buildBDForInitTests(t)
+
+	t.Run("metadata_written", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Run init with --database to specify a pre-existing database name
+		cmd := exec.Command(bd, "init", "--database", "myapp_production", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd init --database failed: %v\n%s", err, out)
+		}
+
+		// Verify metadata.json contains the correct database name
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		cfg, err := configfile.Load(beadsDir)
+		if err != nil {
+			t.Fatalf("Failed to load metadata.json: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("metadata.json not found")
+		}
+
+		if cfg.DoltDatabase != "myapp_production" {
+			t.Errorf("Expected DoltDatabase %q, got %q", "myapp_production", cfg.DoltDatabase)
+		}
+		if cfg.DoltMode != configfile.DoltModeServer {
+			t.Errorf("Expected DoltMode %q, got %q", configfile.DoltModeServer, cfg.DoltMode)
+		}
+	})
+
+	t.Run("with_prefix", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Run init with both --database and --prefix
+		// --database should override prefix for DB name, but prefix still sets issue_prefix
+		cmd := exec.Command(bd, "init", "--database", "shared_db", "--prefix", "team-alpha", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd init --database --prefix failed: %v\n%s", err, out)
+		}
+
+		// Verify metadata.json
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		cfg, err := configfile.Load(beadsDir)
+		if err != nil {
+			t.Fatalf("Failed to load metadata.json: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("metadata.json not found")
+		}
+
+		// --database overrides the SQL database name
+		if cfg.DoltDatabase != "shared_db" {
+			t.Errorf("Expected DoltDatabase %q (from --database), got %q", "shared_db", cfg.DoltDatabase)
+		}
+
+		// Verify the database was opened and issue_prefix was set
+		// by reopening the store and checking config
+		dbPath := filepath.Join(beadsDir, "dolt")
+		s, err := openExistingTestDB(t, dbPath)
+		if err != nil {
+			t.Fatalf("Failed to reopen database: %v", err)
+		}
+		defer s.Close()
+
+		ctx := context.Background()
+		issuePrefix, err := s.GetConfig(ctx, "issue_prefix")
+		if err != nil {
+			t.Fatalf("Failed to get issue_prefix: %v", err)
+		}
+		if issuePrefix != "team-alpha" {
+			t.Errorf("Expected issue_prefix %q (from --prefix), got %q", "team-alpha", issuePrefix)
+		}
+	})
+
+	t.Run("server_config_in_metadata", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Run init with --database
+		cmd := exec.Command(bd, "init", "--database", "test_server_cfg", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd init --database failed: %v\n%s", err, out)
+		}
+
+		// Verify metadata.json has both dolt_database and dolt_mode: server
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		cfg, err := configfile.Load(beadsDir)
+		if err != nil {
+			t.Fatalf("Failed to load metadata.json: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("metadata.json not found")
+		}
+
+		if cfg.DoltDatabase != "test_server_cfg" {
+			t.Errorf("Expected DoltDatabase %q, got %q", "test_server_cfg", cfg.DoltDatabase)
+		}
+		if cfg.DoltMode != configfile.DoltModeServer {
+			t.Errorf("Expected DoltMode %q, got %q", configfile.DoltModeServer, cfg.DoltMode)
+		}
+		if cfg.Backend != configfile.BackendDolt {
+			t.Errorf("Expected Backend %q, got %q", configfile.BackendDolt, cfg.Backend)
+		}
+	})
+
+	t.Run("validation_invalid_name", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Run init with an invalid database name (contains semicolon = SQL injection)
+		cmd := exec.Command(bd, "init", "--database", "bad;name", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatal("Expected error for invalid database name, but command succeeded")
+		}
+
+		outStr := string(out)
+		if !strings.Contains(outStr, "invalid database name") {
+			t.Errorf("Expected error to mention 'invalid database name', got: %s", outStr)
+		}
+
+		// Verify no .beads directory was created (early validation prevents side effects)
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if _, err := os.Stat(beadsDir); err == nil {
+			t.Error(".beads directory should not be created when validation fails")
+		}
+	})
+
+	t.Run("validation_name_with_spaces", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Database name with spaces should fail validation
+		cmd := exec.Command(bd, "init", "--database", "my database", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatal("Expected error for database name with spaces, but command succeeded")
+		}
+
+		outStr := string(out)
+		if !strings.Contains(outStr, "invalid database name") {
+			t.Errorf("Expected error to mention 'invalid database name', got: %s", outStr)
+		}
+	})
+
+	t.Run("validation_name_with_backtick", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Database name with backtick injection should fail validation
+		cmd := exec.Command(bd, "init", "--database", "db`; DROP DATABASE x; --", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatal("Expected error for database name with backtick injection, but command succeeded")
+		}
+
+		outStr := string(out)
+		if !strings.Contains(outStr, "invalid database name") {
+			t.Errorf("Expected error to mention 'invalid database name', got: %s", outStr)
+		}
+	})
+}
+
+func TestInitBackendFlag(t *testing.T) {
+	bd := buildBDForInitTests(t)
+
+	t.Run("sqlite_shows_deprecation", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		cmd := exec.Command(bd, "init", "--backend", "sqlite", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatal("Expected non-zero exit for --backend=sqlite, but command succeeded")
+		}
+
+		outStr := string(out)
+		if !strings.Contains(outStr, "DEPRECATED") {
+			t.Errorf("Expected deprecation notice, got: %s", outStr)
+		}
+		if !strings.Contains(outStr, "SQLite backend has been removed") {
+			t.Errorf("Expected 'SQLite backend has been removed' message, got: %s", outStr)
+		}
+		if !strings.Contains(outStr, "bd migrate --to-dolt") {
+			t.Errorf("Expected migration instructions, got: %s", outStr)
+		}
+
+		// Verify no .beads directory was created
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if _, err := os.Stat(beadsDir); err == nil {
+			t.Error(".beads directory should not be created when --backend=sqlite is used")
+		}
+	})
+
+	t.Run("unknown_backend_errors", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		cmd := exec.Command(bd, "init", "--backend", "postgres", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatal("Expected non-zero exit for --backend=postgres, but command succeeded")
+		}
+
+		outStr := string(out)
+		if !strings.Contains(outStr, "unknown backend") {
+			t.Errorf("Expected 'unknown backend' error, got: %s", outStr)
+		}
+	})
+
+	t.Run("dolt_backend_succeeds", func(t *testing.T) {
+		skipIfNoDolt(t)
+		tmpDir := t.TempDir()
+
+		cmd := exec.Command(bd, "init", "--backend", "dolt", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd init --backend=dolt should succeed: %v\n%s", err, out)
+		}
+	})
+
+	t.Run("default_backend_is_dolt", func(t *testing.T) {
+		skipIfNoDolt(t)
+		tmpDir := t.TempDir()
+
+		cmd := exec.Command(bd, "init", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd init should default to dolt: %v\n%s", err, out)
+		}
+
+		// Verify metadata.json has backend: dolt
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		cfg, err := configfile.Load(beadsDir)
+		if err != nil {
+			t.Fatalf("Failed to load metadata.json: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("metadata.json not found")
+		}
+		if cfg.Backend != configfile.BackendDolt {
+			t.Errorf("Expected backend %q, got %q", configfile.BackendDolt, cfg.Backend)
+		}
+	})
 }

@@ -5,14 +5,12 @@ package doctor
 import (
 	"bufio"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/utils"
@@ -44,7 +42,7 @@ type MigrationValidationResult struct {
 // CheckMigrationReadiness validates that a beads installation is ready for Dolt migration.
 // This is a pre-migration check that ensures:
 // 1. JSONL file exists and is valid (parseable, no corruption)
-// 2. All issues in JSONL are also in SQLite (or explains discrepancies)
+// 2. All issues in JSONL are also in the database (or explains discrepancies)
 // 3. No blocking issues prevent migration
 //
 // Returns a doctor check suitable for standard output and a detailed result for automation.
@@ -100,7 +98,7 @@ func CheckMigrationReadiness(path string) (DoctorCheck, MigrationValidationResul
 	}
 
 	// Validate JSONL integrity
-	jsonlCount, malformed, ids, err := validateJSONLForMigration(jsonlPath)
+	jsonlCount, malformed, _, err := validateJSONLForMigration(jsonlPath)
 	result.JSONLCount = jsonlCount
 	result.JSONLMalformed = malformed
 	if err != nil {
@@ -122,33 +120,7 @@ func CheckMigrationReadiness(path string) (DoctorCheck, MigrationValidationResul
 		result.Warnings = append(result.Warnings, fmt.Sprintf("%d malformed lines in JSONL (skipped)", malformed))
 	}
 
-	// Check SQLite database if it exists
-	dbPath := getSQLiteDBPath(beadsDir)
-	if _, err := os.Stat(dbPath); err == nil {
-		result.Backend = "sqlite"
-
-		// Compare JSONL with SQLite
-		sqliteCount, missingInDB, missingInJSONL, err := compareSQLiteWithJSONL(dbPath, ids)
-		result.SQLiteCount = sqliteCount
-		result.MissingInDB = missingInDB
-		result.MissingInJSONL = missingInJSONL
-
-		if err != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("SQLite comparison failed: %v", err))
-		}
-
-		if len(missingInDB) > 0 {
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("%d issues in JSONL not in SQLite (will be imported during migration)", len(missingInDB)))
-		}
-
-		if len(missingInJSONL) > 0 {
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("%d issues in SQLite not in JSONL (ephemeral or deleted)", len(missingInJSONL)))
-		}
-	} else {
-		result.Backend = "jsonl-only"
-	}
+	result.Backend = "jsonl-only"
 
 	// Build status message
 	if len(result.Errors) > 0 {
@@ -229,8 +201,8 @@ func CheckMigrationCompletion(path string) (DoctorCheck, MigrationValidationResu
 
 	// Check Dolt database health
 	ctx := context.Background()
-	doltPath := filepath.Join(beadsDir, "dolt")
-	store, err := dolt.New(ctx, &dolt.Config{Path: doltPath, ReadOnly: true})
+	doltPath := getDatabasePath(beadsDir)
+	store, err := dolt.New(ctx, &dolt.Config{Path: doltPath, ReadOnly: true, Database: doltDatabaseName(beadsDir)})
 	if err != nil {
 		result.Ready = false
 		result.DoltHealthy = false
@@ -264,10 +236,14 @@ func CheckMigrationCompletion(path string) (DoctorCheck, MigrationValidationResu
 	result.DoltCount = stats.TotalIssues
 
 	// Check for Dolt locks/uncommitted changes
-	doltLocked, lockDetail := checkDoltLocks(beadsDir)
-	result.DoltLocked = doltLocked
-	if doltLocked {
-		result.Warnings = append(result.Warnings, fmt.Sprintf("Dolt has uncommitted changes: %s", lockDetail))
+	doltLocked, lockDetail, lockErr := checkDoltLocks(beadsDir)
+	if lockErr != nil {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("Could not check Dolt locks: %v", lockErr))
+	} else {
+		result.DoltLocked = doltLocked
+		if doltLocked {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Dolt has uncommitted changes: %s", lockDetail))
+		}
 	}
 
 	// Find JSONL file for comparison
@@ -360,7 +336,17 @@ func CheckDoltLocks(path string) DoctorCheck {
 		}
 	}
 
-	locked, detail := checkDoltLocks(beadsDir)
+	locked, detail, err := checkDoltLocks(beadsDir)
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Dolt Locks",
+			Status:   StatusWarning,
+			Message:  "Could not check Dolt locks",
+			Detail:   err.Error(),
+			Fix:      "Ensure the Dolt server is running: gt dolt status",
+			Category: CategoryMaintenance,
+		}
+	}
 	if locked {
 		return DoctorCheck{
 			Name:     "Dolt Locks",
@@ -382,14 +368,16 @@ func CheckDoltLocks(path string) DoctorCheck {
 
 // Helper functions
 
-// Note: findJSONLFile is defined in sync_divergence.go
-
-// getSQLiteDBPath returns the path to the SQLite database.
-func getSQLiteDBPath(beadsDir string) string {
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.Database != "" {
-		return cfg.DatabasePath(beadsDir)
+// findJSONLFile locates the JSONL file in a .beads directory.
+// Temporary: will be removed with Phase 2c (doctor JSONL cleanup).
+func findJSONLFile(beadsDir string) string {
+	for _, name := range []string{"issues.jsonl", "beads.jsonl"} {
+		p := filepath.Join(beadsDir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
 	}
-	return filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	return ""
 }
 
 // validateJSONLForMigration validates a JSONL file for migration readiness.
@@ -450,82 +438,54 @@ func validateJSONLForMigration(jsonlPath string) (int, int, map[string]bool, err
 	return len(ids), malformed, ids, nil
 }
 
-// compareSQLiteWithJSONL compares SQLite database with JSONL file.
-// Returns: SQLite count, IDs in JSONL but not SQLite, IDs in SQLite but not JSONL, error.
-func compareSQLiteWithJSONL(dbPath string, jsonlIDs map[string]bool) (int, []string, []string, error) {
-	db, err := sql.Open("sqlite3", sqliteConnString(dbPath, true))
-	if err != nil {
-		return 0, nil, nil, fmt.Errorf("failed to open SQLite: %w", err)
-	}
-	defer db.Close()
-
-	// Get all non-ephemeral IDs from SQLite
-	rows, err := db.Query("SELECT id FROM issues WHERE ephemeral = 0 OR ephemeral IS NULL")
-	if err != nil {
-		return 0, nil, nil, fmt.Errorf("failed to query SQLite: %w", err)
-	}
-	defer rows.Close()
-
-	sqliteIDs := make(map[string]bool)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			continue
-		}
-		sqliteIDs[id] = true
-	}
-
-	// Find differences (sample first 100)
-	var missingInDB []string
-	var missingInJSONL []string
-
-	for id := range jsonlIDs {
-		if !sqliteIDs[id] {
-			missingInDB = append(missingInDB, id)
-			if len(missingInDB) >= 100 {
-				break
-			}
-		}
-	}
-
-	for id := range sqliteIDs {
-		if !jsonlIDs[id] {
-			missingInJSONL = append(missingInJSONL, id)
-			if len(missingInJSONL) >= 100 {
-				break
-			}
-		}
-	}
-
-	return len(sqliteIDs), missingInDB, missingInJSONL, nil
-}
-
 // compareDoltWithJSONL compares Dolt database with JSONL IDs.
 // Returns IDs in JSONL but not in Dolt (sample first 100).
 func compareDoltWithJSONL(ctx context.Context, store *dolt.DoltStore, jsonlIDs map[string]bool) []string {
-	var missing []string
-
+	ids := make([]string, 0, len(jsonlIDs))
 	for id := range jsonlIDs {
-		_, err := store.GetIssue(ctx, id)
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// Batch fetch all issues from Dolt in chunks
+	foundIDs := make(map[string]bool, len(ids))
+	const batchSize = 500
+	for i := 0; i < len(ids); i += batchSize {
+		end := i + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		issues, err := store.GetIssuesByIDs(ctx, ids[i:end])
 		if err != nil {
+			continue
+		}
+		for _, issue := range issues {
+			foundIDs[issue.ID] = true
+		}
+	}
+
+	// Set difference: IDs in JSONL but not in Dolt (sample first 100)
+	var missing []string
+	for _, id := range ids {
+		if !foundIDs[id] {
 			missing = append(missing, id)
 			if len(missing) >= 100 {
 				break
 			}
 		}
 	}
-
 	return missing
 }
 
 // checkDoltLocks checks for uncommitted changes in Dolt.
-// Respects dolt_mode configuration: uses MySQL driver for server mode,
-// embedded driver for embedded mode.
-// Uses openDoltDBWithLock for AccessLock coordination.
-func checkDoltLocks(beadsDir string) (bool, string) {
-	conn, err := openDoltDBWithLock(beadsDir)
+// Returns (locked, detail, error). A non-nil error means the check could not
+// be performed (e.g. connection failure) and the locked result is meaningless.
+func checkDoltLocks(beadsDir string) (bool, string, error) {
+	conn, err := openDoltConn(beadsDir)
 	if err != nil {
-		return false, ""
+		return false, "", fmt.Errorf("cannot connect to Dolt: %w", err)
 	}
 	defer conn.Close()
 
@@ -534,7 +494,7 @@ func checkDoltLocks(beadsDir string) (bool, string) {
 	// Check dolt_status for uncommitted changes
 	rows, err := conn.db.QueryContext(ctx, "SELECT table_name, staged, status FROM dolt_status")
 	if err != nil {
-		return false, ""
+		return false, "", fmt.Errorf("cannot query dolt_status: %w", err)
 	}
 	defer rows.Close()
 
@@ -546,18 +506,26 @@ func checkDoltLocks(beadsDir string) (bool, string) {
 		if err := rows.Scan(&tableName, &staged, &status); err != nil {
 			continue
 		}
+		// Skip wisp tables — they are ephemeral and expected to have
+		// uncommitted changes (covered by dolt_ignore).
+		if isWispTable(tableName) {
+			continue
+		}
 		mark := ""
 		if staged {
 			mark = " (staged)"
 		}
 		changes = append(changes, fmt.Sprintf("%s: %s%s", tableName, status, mark))
 	}
-
-	if len(changes) > 0 {
-		return true, strings.Join(changes, ", ")
+	if err := rows.Err(); err != nil {
+		return false, "", fmt.Errorf("row iteration error: %w", err)
 	}
 
-	return false, ""
+	if len(changes) > 0 {
+		return true, strings.Join(changes, ", "), nil
+	}
+
+	return false, "", nil
 }
 
 // categorizeDoltExtras finds issues in Dolt that aren't in JSONL and categorizes them
@@ -599,6 +567,9 @@ func categorizeDoltExtras(ctx context.Context, store *dolt.DoltStore, jsonlIDs m
 			ephemeralCount++
 		}
 	}
+	// Best effort: rows.Err() ignored here since this is a diagnostic categorization
+	// and partial results are acceptable.
+	_ = rows.Err()
 
 	var foreignCount int
 	for _, count := range foreignPrefixes {

@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -59,13 +60,14 @@ func runMolBurn(cmd *cobra.Command, args []string) {
 
 	// mol burn requires direct store access (daemon auto-bypassed for wisp ops)
 	if store == nil {
-		fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		fmt.Fprintf(os.Stderr, "Hint: run 'bd init' or 'bd import' to initialize the database\n")
-		os.Exit(1)
+		FatalErrorWithHint("no database connection", "run 'bd init' or 'bd import' to initialize the database")
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	force, _ := cmd.Flags().GetBool("force")
+	if yes, _ := cmd.Flags().GetBool("yes"); yes {
+		force = true
+	}
 
 	// Single ID: use original logic for backward compatibility
 	if len(args) == 1 {
@@ -82,15 +84,13 @@ func burnSingleMolecule(ctx context.Context, moleculeID string, dryRun, force bo
 	// Resolve molecule ID in main store
 	resolvedID, err := utils.ResolvePartialID(ctx, store, moleculeID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error resolving molecule ID %s: %v\n", moleculeID, err)
-		os.Exit(1)
+		FatalError("resolving molecule ID %s: %v", moleculeID, err)
 	}
 
 	// Load the molecule
 	rootIssue, err := store.GetIssue(ctx, resolvedID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-		os.Exit(1)
+		FatalError("loading molecule: %v", err)
 	}
 
 	// Branch based on molecule phase
@@ -244,8 +244,7 @@ func burnWispMolecule(ctx context.Context, resolvedID string, dryRun, force bool
 	// Load the molecule subgraph
 	subgraph, err := loadTemplateSubgraph(ctx, store, resolvedID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading wisp molecule: %v\n", err)
-		os.Exit(1)
+		FatalError("loading wisp molecule: %v", err)
 	}
 
 	// Collect wisp issue IDs to delete (only delete wisps, not regular children)
@@ -305,8 +304,7 @@ func burnWispMolecule(ctx context.Context, resolvedID string, dryRun, force bool
 	// Perform the burn
 	result, err := burnWisps(ctx, store, wispIDs)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error burning wisp: %v\n", err)
-		os.Exit(1)
+		FatalError("burning wisp: %v", err)
 	}
 	result.MoleculeID = resolvedID
 
@@ -325,8 +323,7 @@ func burnPersistentMolecule(ctx context.Context, resolvedID string, dryRun, forc
 	// Load the molecule subgraph to show what will be deleted
 	subgraph, err := loadTemplateSubgraph(ctx, store, resolvedID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-		os.Exit(1)
+		FatalError("loading molecule: %v", err)
 	}
 
 	// Collect all issue IDs in the molecule
@@ -385,22 +382,25 @@ func burnPersistentMolecule(ctx context.Context, resolvedID string, dryRun, forc
 	deleteBatch(nil, issueIDs, true, false, false, jsonOutput, false, "mol burn")
 }
 
-// burnWisps deletes all wisp issues without creating a digest
-//
-//nolint:unparam // error return kept for future use and consistent API
+// burnWisps deletes all wisp issues atomically within a single transaction.
+// If any delete fails, the entire operation is rolled back to prevent partial deletion.
 func burnWisps(ctx context.Context, s *dolt.DoltStore, ids []string) (*BurnResult, error) {
 	result := &BurnResult{
 		DeletedIDs: make([]string, 0, len(ids)),
 	}
 
-	for _, id := range ids {
-		if err := s.DeleteIssue(ctx, id); err != nil {
-			// Log but continue - try to delete as many as possible
-			fmt.Fprintf(os.Stderr, "Warning: failed to delete %s: %v\n", id, err)
-			continue
+	err := transact(ctx, s, "bd: burn wisps", func(tx storage.Transaction) error {
+		for _, id := range ids {
+			if err := tx.DeleteIssue(ctx, id); err != nil {
+				return fmt.Errorf("failed to delete wisp %s: %w", id, err)
+			}
+			result.DeletedIDs = append(result.DeletedIDs, id)
+			result.DeletedCount++
 		}
-		result.DeletedIDs = append(result.DeletedIDs, id)
-		result.DeletedCount++
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return result, nil
@@ -409,6 +409,8 @@ func burnWisps(ctx context.Context, s *dolt.DoltStore, ids []string) (*BurnResul
 func init() {
 	molBurnCmd.Flags().Bool("dry-run", false, "Preview what would be deleted")
 	molBurnCmd.Flags().Bool("force", false, "Skip confirmation prompt")
+	molBurnCmd.Flags().BoolP("yes", "y", false, "Alias for --force (skip confirmation)")
+	_ = molBurnCmd.Flags().MarkHidden("yes")
 
 	molCmd.AddCommand(molBurnCmd)
 }

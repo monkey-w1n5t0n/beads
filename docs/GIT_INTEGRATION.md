@@ -55,7 +55,7 @@ bd config set sync.branch beads-sync
 ```bash
 # Agents work normally - no changes needed!
 bd create "Fix authentication" -t bug -p 1
-bd update bd-a1b2 --status in_progress
+bd update bd-a1b2 --claim
 bd close bd-a1b2 "Fixed"
 ```
 
@@ -63,14 +63,14 @@ bd close bd-a1b2 "Fixed"
 
 ```bash
 # Check what's changed
-bd sync --status
+bd dolt show
 
 # Option 1: Create pull request
 git push origin beads-sync
 # Then create PR on GitHub/GitLab
 
 # Option 2: Direct merge (if allowed)
-bd sync --merge
+git merge beads-sync
 ```
 
 ### Benefits
@@ -84,22 +84,64 @@ See [PROTECTED_BRANCHES.md](PROTECTED_BRANCHES.md) for complete setup guide, tro
 
 ## Git Hooks
 
+### External Hook Manager Support
+
+bd detects and integrates with these external git hook managers:
+
+- **[lefthook](https://lefthook.dev/)** — YAML/TOML/JSON config
+- **[husky](https://typicode.github.io/husky/)** — `.husky/` directory scripts
+- **[pre-commit](https://pre-commit.com/)** — `.pre-commit-config.yaml`
+- **[prek](https://prek.j178.dev/)** — Rust-based pre-commit alternative (same config)
+- **[hk](https://hk.jdx.dev/)** — Fast hook manager using Pkl config
+- **[overcommit](https://github.com/sds/overcommit)** — Ruby-based (detection only)
+- **[simple-git-hooks](https://github.com/toplenboren/simple-git-hooks)** — Lightweight JS (detection only)
+
+When an external hook manager is detected, `bd hooks install` uses `--chain` to preserve existing hooks.
+
+#### hk Integration Example
+
+Add bd hooks to your `hk.pkl`:
+
+```pkl
+hooks {
+    ["pre-commit"] {
+        steps {
+            ["bd-pre-commit"] {
+                check = "bd hooks run pre-commit"
+            }
+        }
+    }
+    ["post-merge"] {
+        steps {
+            ["bd-post-merge"] {
+                check = "bd hooks run post-merge"
+            }
+        }
+    }
+    ["pre-push"] {
+        steps {
+            ["bd-pre-push"] {
+                check = "bd hooks run pre-push \"$@\""
+            }
+        }
+    }
+}
+```
+
 ### Installation
 
 ```bash
-# Install hooks for JSONL export on commit
+# Install hooks
 bd hooks install --beads
 ```
 
 ### What Gets Installed
 
 **pre-commit hook:**
-- Exports Dolt database to JSONL before commit
-- Ensures JSONL stays current in git for portability
+- Runs pre-commit checks for beads data consistency
 
 **post-merge hook:**
-- Imports updated JSONL after pull/merge
-- Keeps Dolt database current after remote changes
+- Ensures Dolt database is current after pull/merge operations
 
 ### Hook Implementation Details
 
@@ -140,7 +182,7 @@ The `detectExistingHooks()` function scans for existing hooks and classifies the
 ```
 ┌──────────────┐      ┌─────────────────┐
 │  OSS Contrib │─────▶│ Planning Repo   │
-│  (Fork)      │      │ (.beads/*.jsonl)│
+│  (Fork)      │      │ (.beads/dolt/)  │
 └──────────────┘      └─────────────────┘
        │
        │ PR
@@ -201,9 +243,40 @@ See [MULTI_REPO_MIGRATION.md](MULTI_REPO_MIGRATION.md) for complete guide.
 
 ### Git LFS Considerations
 
-**Do NOT use Git LFS for `.beads/issues.jsonl`:**
-- File size stays reasonable (<1MB per 10K issues)
-- Text diffs are valuable for review
+The Dolt database directory (`.beads/dolt/`) should be gitignored, not tracked via LFS or regular git.
+
+## Custom Merge Driver
+
+bd includes a built-in merge driver for resolving conflicts in `.beads/issues.jsonl` files. This replaces the standalone `beads-merge` binary that was previously maintained in a separate repository.
+
+### Alternative: Standalone beads-merge Binary (Deprecated)
+
+> **⚠️ Deprecated:** The standalone `beads-merge` binary (previously hosted at `github.com/neongreen/mono`) is no longer maintained and may be incompatible with current versions of bd. Use `bd merge` instead.
+
+The built-in `bd merge` command provides the same functionality:
+
+```bash
+bd merge <output> <base> <left> <right>
+```
+
+### Jujutsu Integration
+
+**For [Jujutsu](https://martinvonz.github.io/jj/) users**, add to `~/.config/jj/config.toml`:
+
+```toml
+[merge-tools.beads-merge]
+program = "bd"
+merge-args = ["merge", "$output", "$base", "$left", "$right"]
+merge-conflict-exit-codes = [1]
+```
+
+Then resolve conflicts with:
+
+```bash
+jj resolve --tool=beads-merge .beads/issues.jsonl
+```
+
+This configures Jujutsu to invoke `bd merge` as its merge tool, restricted to `.beads/issues.jsonl` (since it only handles beads data conflicts, not general file conflicts).
 
 ## See Also
 

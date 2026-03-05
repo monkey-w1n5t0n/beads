@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -76,25 +75,21 @@ Examples:
 
 		// Validate args
 		if graphAll && len(args) > 0 {
-			fmt.Fprintf(os.Stderr, "Error: cannot specify issue ID with --all flag\n")
-			os.Exit(1)
+			FatalError("cannot specify issue ID with --all flag")
 		}
 		if !graphAll && len(args) == 0 {
-			fmt.Fprintf(os.Stderr, "Error: issue ID required (or use --all for all open issues)\n")
-			os.Exit(1)
+			FatalErrorWithHint("issue ID required", "Use --all for all open issues")
 		}
 
 		if store == nil {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
+			FatalError("no database connection")
 		}
 
 		// Handle --all flag: show graph for all open issues
 		if graphAll {
 			subgraphs, err := loadAllGraphSubgraphs(ctx, store)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading all issues: %v\n", err)
-				os.Exit(1)
+				FatalError("loading all issues: %v", err)
 			}
 
 			if len(subgraphs) == 0 {
@@ -131,15 +126,13 @@ Examples:
 		// Single issue mode
 		issueID, err := utils.ResolvePartialID(ctx, store, args[0])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: issue '%s' not found\n", args[0])
-			os.Exit(1)
+			FatalError("issue '%s' not found", args[0])
 		}
 
 		// Load the subgraph
 		subgraph, err := loadGraphSubgraph(ctx, store, issueID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading graph: %v\n", err)
-			os.Exit(1)
+			FatalError("loading graph: %v", err)
 		}
 
 		// Compute layout
@@ -201,8 +194,8 @@ func loadGraphSubgraph(ctx context.Context, s *dolt.DoltStore, issueID string) (
 		IssueMap: map[string]*types.Issue{root.ID: root},
 	}
 
-	// BFS to find all connected issues (via any dependency type)
-	// We traverse both directions: dependents and dependencies
+	// BFS to find all connected issues (via any dependency type).
+	// Traverse both directions: dependents AND dependencies (GH#2145).
 	queue := []string{root.ID}
 	visited := map[string]bool{root.ID: true}
 
@@ -224,11 +217,18 @@ func loadGraphSubgraph(ctx context.Context, s *dolt.DoltStore, issueID string) (
 			}
 		}
 
-		// Get issues this one depends on (dependencies) - but only for non-root
-		// to avoid pulling in unrelated upstream issues
-		if currentID == root.ID {
-			// For root, we might want to include direct dependencies too
-			// Skip for now to keep graph focused on "what this issue encompasses"
+		// Get issues this one depends on (dependencies)
+		dependencies, err := s.GetDependencies(ctx, currentID)
+		if err != nil {
+			continue
+		}
+		for _, dep := range dependencies {
+			if !visited[dep.ID] {
+				visited[dep.ID] = true
+				subgraph.Issues = append(subgraph.Issues, dep)
+				subgraph.IssueMap[dep.ID] = dep
+				queue = append(queue, dep.ID)
+			}
 		}
 	}
 
@@ -516,6 +516,32 @@ func computeLayout(subgraph *TemplateSubgraph) *GraphLayout {
 	for _, node := range layout.Nodes {
 		if node.Layer < 0 {
 			node.Layer = 0
+		}
+	}
+
+	// Lift children to at least their parent's layer (GH#1748).
+	// Parent-child deps are not blocking deps, but children logically belong
+	// to their parent's scope. If a parent epic is blocked (higher layer),
+	// its children should appear in the same layer, not float in Layer 0.
+	parentOf := make(map[string]string) // childID -> parentID
+	for _, dep := range subgraph.Dependencies {
+		if dep.Type == types.DepParentChild {
+			parentOf[dep.IssueID] = dep.DependsOnID
+		}
+	}
+	if len(parentOf) > 0 {
+		// Iterate until stable — handles nested parent-child hierarchies
+		changed = true
+		for changed {
+			changed = false
+			for childID, parentID := range parentOf {
+				childNode := layout.Nodes[childID]
+				parentNode := layout.Nodes[parentID]
+				if childNode != nil && parentNode != nil && childNode.Layer < parentNode.Layer {
+					childNode.Layer = parentNode.Layer
+					changed = true
+				}
+			}
 		}
 	}
 

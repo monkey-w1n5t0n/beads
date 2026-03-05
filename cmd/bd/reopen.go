@@ -25,14 +25,13 @@ This is more explicit than 'bd update --status open' and emits a Reopened event.
 		// Resolve partial IDs
 		_, err := utils.ResolvePartialIDs(ctx, store, args)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		reopenedIssues := []*types.Issue{}
 		// Direct storage access
 		if store == nil {
 			FatalErrorWithHint("database not initialized",
-				"run 'bd init' to create a database, or use 'bd --no-db' for JSONL-only mode")
+				"run 'bd init' to create a database")
 		}
 		for _, id := range args {
 			fullID, err := utils.ResolvePartialID(ctx, store, id)
@@ -40,9 +39,23 @@ This is more explicit than 'bd update --status open' and emits a Reopened event.
 				fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
 				continue
 			}
-			// UpdateIssue automatically clears closed_at when status changes from closed
+			// Skip if already open — avoid false "Reopened" message
+			issue, err := store.GetIssue(ctx, fullID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting %s: %v\n", fullID, err)
+				continue
+			}
+			if issue.Status == types.StatusOpen {
+				fmt.Fprintf(os.Stderr, "%s is already open\n", fullID)
+				continue
+			}
+			// UpdateIssue automatically clears closed_at when status changes from closed.
+			// Also clear defer_until so the issue appears in bd ready immediately.
+			// Without this, a deferred issue that was closed and reopened stays
+			// hidden from bd ready despite being "open".
 			updates := map[string]interface{}{
-				"status": string(types.StatusOpen),
+				"status":      string(types.StatusOpen),
+				"defer_until": nil,
 			}
 			if err := store.UpdateIssue(ctx, fullID, updates, actor); err != nil {
 				fmt.Fprintf(os.Stderr, "Error reopening %s: %v\n", fullID, err)

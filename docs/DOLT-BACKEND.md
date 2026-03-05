@@ -1,18 +1,21 @@
-# Dolt Backend Guide
+# Dolt Storage Backend
 
-Beads supports [Dolt](https://www.dolthub.com/) as an alternative storage backend to SQLite. Dolt provides Git-like version control for your database, enabling advanced workflows like branch-based development, time travel queries, and distributed sync without JSONL files.
+Beads uses [Dolt](https://www.dolthub.com/) as its default storage backend. Dolt provides Git-like version control for your database, enabling advanced workflows like branch-based development, time travel queries, and distributed sync.
+
+> **Note:** Dolt is the only supported backend. The legacy SQLite backend has been removed.
+> To migrate from SQLite, see [Migration from SQLite](#migration-from-sqlite-legacy) below.
 
 ## Overview
 
-| Feature | SQLite | Dolt |
-|---------|--------|------|
-| Single-file storage | Yes | No (directory) |
-| Version control | Via JSONL | Native |
-| Branching | No | Yes |
-| Time travel | No | Yes |
-| Merge conflicts | JSONL-based | SQL-based |
-| Multi-user concurrent | Limited | Server mode |
-| Git sync required | Yes | Optional |
+| Feature | Dolt |
+|---------|------|
+| Storage | Directory-based |
+| Version control | Native (cell-level) |
+| Branching | Yes |
+| Time travel | Yes |
+| Merge conflicts | SQL-based (cell-level merge) |
+| Multi-user concurrent | Server mode |
+| Sync | Native push/pull to Dolt remotes |
 
 ## Quick Start
 
@@ -29,13 +32,13 @@ curl -L https://github.com/dolthub/dolt/releases/latest/download/install.sh | ba
 dolt version
 ```
 
-### 2. Initialize with Dolt Backend
+### 2. Initialize
 
 ```bash
-# New project
-bd init --backend=dolt
+# New project (Dolt is the default backend)
+bd init
 
-# Or convert existing SQLite database
+# Or convert existing SQLite database (legacy installations)
 bd migrate --to-dolt
 ```
 
@@ -43,15 +46,13 @@ bd migrate --to-dolt
 
 ```yaml
 # .beads/config.yaml
-backend: dolt
-
 sync:
-  mode: dolt-native  # Skip JSONL entirely
+  mode: dolt-native  # Default: use Dolt remotes
 ```
 
 ## Server Mode (Recommended)
 
-Server mode provides 5-10x faster operations by running a persistent `dolt sql-server` that handles connections. This eliminates the 500-1000ms bootstrap overhead of embedded mode.
+Server mode provides fast operations by running a persistent `dolt sql-server` that handles connections.
 
 ### Server Mode is Enabled by Default
 
@@ -96,7 +97,7 @@ kill $(cat .beads/dolt/sql-server.pid)
 
 Dolt supports multiple sync strategies:
 
-### `dolt-native` (Recommended for Dolt)
+### `dolt-native` (Default)
 
 ```yaml
 sync:
@@ -104,7 +105,6 @@ sync:
 ```
 
 - Uses Dolt remotes (DoltHub, S3, GCS, etc.)
-- No JSONL files needed
 - Native database-level sync
 - Supports branching and merging
 
@@ -115,81 +115,105 @@ sync:
   mode: belt-and-suspenders
 ```
 
-- Uses BOTH Dolt remotes AND JSONL
+- Uses BOTH Dolt remotes AND JSONL export
 - Maximum redundancy
 - Useful for migration periods
 
-### `git-portable`
+### `git-portable` (Legacy)
 
 ```yaml
 sync:
   mode: git-portable
 ```
 
-- Traditional JSONL-based sync
-- Compatible with SQLite workflows
+- Legacy JSONL-based sync for backward compatibility
 - Dolt provides local version history only
 
 ## Dolt Remotes
 
 ### Configure a Remote
 
+Use `bd dolt remote add` to configure remotes. This ensures the running Dolt SQL
+server sees the remote immediately. Remotes added via the `dolt` CLI directly
+are written to the filesystem but are not visible to the server until restart.
+
 ```bash
 # DoltHub (public or private)
-cd .beads/dolt
-dolt remote add origin https://doltremoteapi.dolthub.com/org/beads
+bd dolt remote add origin https://doltremoteapi.dolthub.com/org/beads
 
 # S3
-dolt remote add origin aws://[bucket]/path/to/repo
+bd dolt remote add origin aws://[bucket]/path/to/repo
 
 # GCS
-dolt remote add origin gs://[bucket]/path/to/repo
+bd dolt remote add origin gs://[bucket]/path/to/repo
+
+# Git SSH (GitHub, GitLab, etc.)
+bd dolt remote add origin git+ssh://git@github.com/org/repo.git
 
 # Local file system
-dolt remote add origin file:///path/to/remote
+bd dolt remote add origin file:///path/to/remote
 ```
 
 ### Push/Pull
 
 ```bash
-# Via bd sync
-bd sync
-
-# Direct dolt commands (if needed)
-cd .beads/dolt
-dolt push origin main
-dolt pull origin main
+bd dolt push
+bd dolt pull
 ```
 
-## Migration from SQLite
+For SSH remotes, `bd dolt push` and `bd dolt pull` automatically use the `dolt`
+CLI instead of the SQL server to avoid MySQL connection timeouts during transfer.
 
-### Option 1: Fresh Start
+`bd dolt remote add` registers the remote on both the SQL server and the
+filesystem (CLI) config. This ensures `dolt push`/`dolt pull` via CLI can find
+the remote. If either surface already has a remote with that name, you'll be
+prompted before overwriting.
+
+> **Also supports sharing a Git repo**: Dolt stores data under `refs/dolt/data`,
+> separate from standard Git refs (`refs/heads/`, `refs/tags/`). You can safely
+> point a `git+ssh://` remote at the same repository as your project source code.
+> See [Dolt Git Remotes](https://docs.dolthub.com/concepts/dolt/git/remotes) for details.
+
+### List/Remove Remotes
 
 ```bash
-# Archive existing beads
-mv .beads .beads-sqlite-backup
-
-# Initialize with Dolt
-bd init --backend=dolt
-
-# Import from JSONL (if you have one)
-bd import .beads-sqlite-backup/issues.jsonl
+bd dolt remote list    # Shows remotes from both SQL server and CLI, flags discrepancies
+bd dolt remote remove origin   # Removes from both surfaces
 ```
 
-### Option 2: In-Place Migration
+Use `bd doctor --fix` to resolve any discrepancies between SQL and CLI remote configs.
+
+## Migration from SQLite (Legacy)
+
+If upgrading from an older version that used SQLite:
+
+### Option 1: In-Place Migration (Recommended)
+
+```bash
+# Preview the migration
+bd migrate --to-dolt --dry-run
+
+# Run the migration
+bd migrate --to-dolt
+
+# Optionally clean up SQLite files
+bd migrate --to-dolt --cleanup
+```
+
+### Option 2: Fresh Start
 
 ```bash
 # Export current state
-bd export --full issues.jsonl
+bd export -o backup.jsonl
 
-# Reconfigure backend
-# Edit .beads/config.yaml to set backend: dolt
+# Archive existing beads
+mv .beads .beads-sqlite-backup
 
-# Re-initialize
-bd init --backend=dolt
+# Initialize fresh
+bd init
 
-# Import
-bd import issues.jsonl
+# Import from backup
+bd import -i backup.jsonl
 ```
 
 ## Troubleshooting
@@ -311,7 +335,7 @@ dolt:
   server_user: "root"
   server_pass: ""
 
-  # Embedded mode settings (when server_mode: false)
+  # Lock settings
   lock_retries: 30
   lock_retry_delay: "100ms"
   idle_timeout: "30s"
@@ -325,7 +349,6 @@ federation:
 
 | Variable | Description |
 |----------|-------------|
-| `BEADS_BACKEND` | Force backend: `sqlite` or `dolt` |
 | `BEADS_DOLT_SERVER_MODE` | Server mode: `1` or `0` |
 | `BEADS_DOLT_SERVER_HOST` | Server host |
 | `BEADS_DOLT_SERVER_PORT` | Server port |

@@ -7,11 +7,13 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// validRefPattern matches valid Dolt commit hashes (32 hex chars) or branch names
-var validRefPattern = regexp.MustCompile(`^[a-zA-Z0-9_\-]+$`)
+// validRefPattern matches valid Dolt commit hashes (32 hex chars) or branch names.
+// Allows dots and slashes for branch names like "release/v2.0" or "feature/auth.flow".
+var validRefPattern = regexp.MustCompile(`^[a-zA-Z0-9_./-]+$`)
 
 // validTablePattern matches valid table names
 var validTablePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
@@ -33,9 +35,9 @@ func validateRef(ref string) error {
 	return nil
 }
 
-// validateDatabaseName checks if a database name is safe to use in queries.
+// ValidateDatabaseName checks if a database name is safe to use in queries.
 // Prevents SQL injection via backtick escaping in CREATE DATABASE statements.
-func validateDatabaseName(name string) error {
+func ValidateDatabaseName(name string) error {
 	if name == "" {
 		return fmt.Errorf("database name cannot be empty")
 	}
@@ -72,6 +74,9 @@ type issueHistory struct {
 
 // getIssueHistory returns the complete history of an issue
 func (s *DoltStore) getIssueHistory(ctx context.Context, issueID string) ([]*issueHistory, error) {
+	// Wrap in a subquery to avoid Dolt's max1Row optimization on PK lookup.
+	// dolt_history_* tables return multiple rows per PK (one per commit),
+	// but the query planner incorrectly assumes WHERE id=? returns one row.
 	rows, err := s.queryContext(ctx, `
 		SELECT
 			id, title, description, design, acceptance_criteria, notes,
@@ -79,9 +84,11 @@ func (s *DoltStore) getIssueHistory(ctx context.Context, issueID string) ([]*iss
 			estimated_minutes, created_at, updated_at, closed_at, close_reason,
 			pinned, mol_type,
 			commit_hash, committer, commit_date
-		FROM dolt_history_issues
-		WHERE id = ?
-		ORDER BY commit_date DESC
+		FROM (
+			SELECT * FROM dolt_history_issues
+		) h
+		WHERE h.id = ?
+		ORDER BY h.commit_date DESC
 	`, issueID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issue history: %w", err)
@@ -176,7 +183,7 @@ func (s *DoltStore) getIssueAsOf(ctx context.Context, issueID string, ref string
 	)
 
 	if err == sql.ErrNoRows {
-		return nil, nil
+		return nil, fmt.Errorf("%w: issue %s as of %s", storage.ErrNotFound, issueID, ref)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issue as of %s: %w", ref, err)

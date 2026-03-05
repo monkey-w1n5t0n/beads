@@ -4,13 +4,15 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/types"
-	"github.com/steveyegge/beads/internal/ui"
-	"github.com/steveyegge/beads/internal/utils"
 	"os"
 	"sort"
 	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 var labelCmd = &cobra.Command{
@@ -19,36 +21,43 @@ var labelCmd = &cobra.Command{
 	Short:   "Manage issue labels",
 }
 
-// Helper function to process label operations for multiple issues
+// processBatchLabelOperation wraps label add/remove for multiple issues in a
+// single transaction for atomicity.
 func processBatchLabelOperation(issueIDs []string, label string, operation string, jsonOut bool,
-	storeFunc func(context.Context, string, string, string) error) {
+	txFunc func(context.Context, storage.Transaction, string, string, string) error) {
 	ctx := rootCtx
-	results := []map[string]interface{}{}
-	for _, issueID := range issueIDs {
-		var err error
-		err = storeFunc(ctx, issueID, label, actor)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error %s label %s %s: %v\n", operation, operation, issueID, err)
-			continue
+	commitMsg := fmt.Sprintf("bd: label %s '%s' on %d issue(s)", operation, label, len(issueIDs))
+	err := transact(ctx, store, commitMsg, func(tx storage.Transaction) error {
+		for _, issueID := range issueIDs {
+			if err := txFunc(ctx, tx, issueID, label, actor); err != nil {
+				return fmt.Errorf("%s label '%s' on %s: %w", operation, label, issueID, err)
+			}
 		}
-		if jsonOut {
+		return nil
+	})
+	if err != nil {
+		FatalErrorRespectJSON("label %s: %v", operation, err)
+	}
+	if jsonOut {
+		results := make([]map[string]interface{}, 0, len(issueIDs))
+		for _, issueID := range issueIDs {
 			results = append(results, map[string]interface{}{
 				"status":   operation,
 				"issue_id": issueID,
 				"label":    label,
 			})
-		} else {
-			verb := "Added"
-			prep := "to"
-			if operation == "removed" {
-				verb = "Removed"
-				prep = "from"
-			}
+		}
+		outputJSON(results)
+	} else {
+		verb := "Added"
+		prep := "to"
+		if operation == "removed" {
+			verb = "Removed"
+			prep = "from"
+		}
+		for _, issueID := range issueIDs {
 			fmt.Printf("%s %s label '%s' %s %s\n", ui.RenderPass("✓"), verb, label, prep, issueID)
 		}
-	}
-	if jsonOut && len(results) > 0 {
-		outputJSON(results)
 	}
 }
 func parseLabelArgs(args []string) (issueIDs []string, label string) {
@@ -66,6 +75,10 @@ var labelAddCmd = &cobra.Command{
 		CheckReadonly("label add")
 		// Use global jsonOutput set by PersistentPreRun
 		issueIDs, label := parseLabelArgs(args)
+		label = strings.TrimSpace(label)
+		if label == "" {
+			FatalErrorRespectJSON("label cannot be empty")
+		}
 		// Resolve partial IDs
 		ctx := rootCtx
 		resolvedIDs := make([]string, 0, len(issueIDs))
@@ -88,8 +101,8 @@ var labelAddCmd = &cobra.Command{
 		}
 
 		processBatchLabelOperation(issueIDs, label, "added", jsonOutput,
-			func(ctx context.Context, issueID, lbl, act string) error {
-				return store.AddLabel(ctx, issueID, lbl, act)
+			func(ctx context.Context, tx storage.Transaction, issueID, lbl, act string) error {
+				return tx.AddLabel(ctx, issueID, lbl, act)
 			})
 	},
 }
@@ -118,8 +131,8 @@ var labelRemoveCmd = &cobra.Command{
 		}
 		issueIDs = resolvedIDs
 		processBatchLabelOperation(issueIDs, label, "removed", jsonOutput,
-			func(ctx context.Context, issueID, lbl, act string) error {
-				return store.RemoveLabel(ctx, issueID, lbl, act)
+			func(ctx context.Context, tx storage.Transaction, issueID, lbl, act string) error {
+				return tx.RemoveLabel(ctx, issueID, lbl, act)
 			})
 	},
 }
@@ -233,15 +246,87 @@ var labelListAllCmd = &cobra.Command{
 	},
 }
 
+var labelPropagateCmd = &cobra.Command{
+	Use:   "propagate [parent-id] [label]",
+	Short: "Propagate a label from a parent issue to all its children",
+	Long:  "Push a label from a parent down to all direct children that don't already have it. Useful for applying branch: labels across an epic's subtasks.",
+	Args:  cobra.ExactArgs(2),
+	Run: func(cmd *cobra.Command, args []string) {
+		CheckReadonly("label propagate")
+		ctx := rootCtx
+
+		parentID, err := utils.ResolvePartialID(ctx, store, args[0])
+		if err != nil {
+			FatalErrorRespectJSON("resolving parent %s: %v", args[0], err)
+		}
+		label := strings.TrimSpace(args[1])
+		if label == "" {
+			FatalErrorRespectJSON("label cannot be empty")
+		}
+
+		// Protect reserved label namespaces
+		if strings.HasPrefix(label, "provides:") {
+			FatalErrorRespectJSON("'provides:' labels are reserved for cross-project capabilities. Hint: use 'bd ship %s' instead", strings.TrimPrefix(label, "provides:"))
+		}
+
+		// Find all direct children via parent-child dependency
+		children, err := store.SearchIssues(ctx, "", types.IssueFilter{ParentID: &parentID})
+		if err != nil {
+			FatalErrorRespectJSON("searching children of %s: %v", parentID, err)
+		}
+
+		if len(children) == 0 {
+			if jsonOutput {
+				outputJSON([]map[string]interface{}{})
+			} else {
+				fmt.Printf("No children found for %s\n", parentID)
+			}
+			return
+		}
+
+		// Add label to each child in a single transaction (AddLabel is idempotent)
+		commitMsg := fmt.Sprintf("bd: propagate label '%s' from %s to %d children", label, parentID, len(children))
+		err = transact(ctx, store, commitMsg, func(tx storage.Transaction) error {
+			for _, child := range children {
+				if err := tx.AddLabel(ctx, child.ID, label, actor); err != nil {
+					return fmt.Errorf("add label '%s' on %s: %w", label, child.ID, err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			FatalErrorRespectJSON("label propagate: %v", err)
+		}
+
+		if jsonOutput {
+			results := make([]map[string]interface{}, 0, len(children))
+			for _, child := range children {
+				results = append(results, map[string]interface{}{
+					"status":   "propagated",
+					"issue_id": child.ID,
+					"label":    label,
+				})
+			}
+			outputJSON(results)
+		} else {
+			for _, child := range children {
+				fmt.Printf("%s Propagated label '%s' to %s\n", ui.RenderPass("✓"), label, child.ID)
+			}
+		}
+	},
+}
+
 func init() {
 	// Issue ID completions
 	labelAddCmd.ValidArgsFunction = issueIDCompletion
 	labelRemoveCmd.ValidArgsFunction = issueIDCompletion
 	labelListCmd.ValidArgsFunction = issueIDCompletion
+	labelPropagateCmd.ValidArgsFunction = issueIDCompletion
 
 	labelCmd.AddCommand(labelAddCmd)
 	labelCmd.AddCommand(labelRemoveCmd)
 	labelCmd.AddCommand(labelListCmd)
 	labelCmd.AddCommand(labelListAllCmd)
+	labelCmd.AddCommand(labelPropagateCmd)
 	rootCmd.AddCommand(labelCmd)
 }

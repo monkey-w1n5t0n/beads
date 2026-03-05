@@ -175,6 +175,25 @@ func findLocalBeadsDir() string {
 		return utils.CanonicalizePath(beadsDir)
 	}
 
+	// For worktrees, check worktree-local redirect first (per-worktree override).
+	// Returns the raw worktree .beads dir (not the resolved target) since
+	// findLocalBeadsDir doesn't follow redirects — callers use FollowRedirect.
+	if git.IsWorktree() {
+		if root := git.GetRepoRoot(); root != "" {
+			wt := filepath.Join(root, ".beads")
+			// Check for redirect file first
+			if _, err := os.Stat(filepath.Join(wt, "redirect")); err == nil {
+				return wt
+			}
+			// Check for worktree's own .beads with project files (separate-DB mode)
+			if info, err := os.Stat(wt); err == nil && info.IsDir() {
+				if hasBeadsProjectFiles(wt) {
+					return wt
+				}
+			}
+		}
+	}
+
 	// Check for worktree - use main repo's .beads
 	// Note: GetMainRepoRoot() is safe to call outside a git repo - it returns an error
 	mainRepoRoot, err := git.GetMainRepoRoot()
@@ -290,7 +309,7 @@ func FindDatabasePath() string {
 // Returns true if the directory contains any of:
 // - metadata.json or config.yaml (project configuration)
 // - Any *.db file (excluding backups and vc.db)
-// - Any *.jsonl file (JSONL-only mode or git-tracked issues)
+// - A dolt/ directory (Dolt database)
 //
 // Returns false for directories that only contain daemon registry files.
 // This prevents FindBeadsDir from returning ~/.beads/ which only has registry.json.
@@ -303,6 +322,11 @@ func hasBeadsProjectFiles(beadsDir string) bool {
 		return true
 	}
 
+	// Check for Dolt database directory
+	if info, err := os.Stat(filepath.Join(beadsDir, "dolt")); err == nil && info.IsDir() {
+		return true
+	}
+
 	// Check for database files (excluding backups and vc.db)
 	dbMatches, _ := filepath.Glob(filepath.Join(beadsDir, "*.db"))
 	for _, match := range dbMatches {
@@ -312,22 +336,17 @@ func hasBeadsProjectFiles(beadsDir string) bool {
 		}
 	}
 
-	// Check for JSONL files (JSONL-only mode or fresh clone)
-	jsonlMatches, _ := filepath.Glob(filepath.Join(beadsDir, "*.jsonl"))
-	if len(jsonlMatches) > 0 {
-		return true
-	}
-
 	return false
 }
 
-// FindBeadsDir finds the .beads/ directory in the current directory tree
-// Returns empty string if not found. Supports both database and JSONL-only mode.
+// FindBeadsDir finds the .beads/ directory in the current directory tree.
+// Returns empty string if not found.
 // Stops at the git repository root to avoid finding unrelated directories.
 // Validates that the directory contains actual project files.
 // Redirect files are supported: if a .beads/redirect file exists, its contents
 // are used as the actual .beads directory path.
-// For worktrees, prioritizes the main repository's .beads directory.
+// For worktrees, checks in order: worktree redirect, worktree's own .beads
+// (separate-DB mode), then main repository's .beads (shared-DB fallback).
 // This is useful for commands that need to detect beads projects without requiring a database.
 func FindBeadsDir() string {
 	// 1. Check BEADS_DIR environment variable (preferred)
@@ -345,9 +364,29 @@ func FindBeadsDir() string {
 		}
 	}
 
-	// 2. For worktrees, check main repository root first
+	// 2. For worktrees, check worktree-local redirect first, then own .beads, then main repo
 	var mainRepoRoot string
 	if git.IsWorktree() {
+		// 2a. Per-worktree redirect override
+		if target := worktreeRedirectTarget(); target != "" {
+			if info, err := os.Stat(target); err == nil && info.IsDir() {
+				if hasBeadsProjectFiles(target) {
+					return target
+				}
+			}
+		}
+
+		// 2b. Worktree's own .beads (separate-DB mode, no redirect)
+		if worktreeRoot := git.GetRepoRoot(); worktreeRoot != "" {
+			worktreeBeadsDir := filepath.Join(worktreeRoot, ".beads")
+			if info, err := os.Stat(worktreeBeadsDir); err == nil && info.IsDir() {
+				if hasBeadsProjectFiles(worktreeBeadsDir) {
+					return worktreeBeadsDir
+				}
+			}
+		}
+
+		// 2c. Fall back to main repository's .beads
 		var err error
 		mainRepoRoot, err = git.GetMainRepoRoot()
 		if err == nil && mainRepoRoot != "" {
@@ -415,21 +454,6 @@ func FindBeadsDir() string {
 	return ""
 }
 
-// FindJSONLPath returns the expected JSONL file path for the given database path.
-// It searches for existing *.jsonl files in the database directory and returns
-// the first one found, preferring issues.jsonl over beads.jsonl.
-//
-// This function does not create directories or files - it only discovers paths.
-// Use this when you need to know where bd stores its JSONL export.
-func FindJSONLPath(dbPath string) string {
-	if dbPath == "" {
-		return ""
-	}
-
-	// Get the directory containing the database and delegate to shared utility
-	return utils.FindJSONLInDir(filepath.Dir(dbPath))
-}
-
 // DatabaseInfo contains information about a discovered beads database
 type DatabaseInfo struct {
 	Path       string // Full path to the .db file
@@ -445,6 +469,33 @@ type DatabaseInfo struct {
 // and handles Windows path normalization.
 func findGitRoot() string {
 	return git.GetRepoRoot()
+}
+
+// worktreeRedirectTarget returns the resolved redirect target for the current
+// worktree's .beads/redirect file, or empty string if not in a worktree or no
+// redirect exists. This centralizes the per-worktree redirect override logic
+// used by findLocalBeadsDir, FindBeadsDir, and findDatabaseInTree.
+func worktreeRedirectTarget() string {
+	if !git.IsWorktree() {
+		return ""
+	}
+	worktreeRoot := git.GetRepoRoot()
+	if worktreeRoot == "" {
+		return ""
+	}
+	worktreeBeadsDir := filepath.Join(worktreeRoot, ".beads")
+	redirectFile := filepath.Join(worktreeBeadsDir, "redirect")
+	if _, err := os.Stat(redirectFile); err != nil {
+		return ""
+	}
+	target := FollowRedirect(worktreeBeadsDir)
+	if target == worktreeBeadsDir {
+		// Redirect file exists but FollowRedirect returned the original path
+		// (empty/invalid content). Return the raw .beads dir so callers that
+		// only need to know a redirect *exists* (findLocalBeadsDir) still work.
+		return worktreeBeadsDir
+	}
+	return target
 }
 
 // findDatabaseInTree walks up the directory tree looking for .beads/*.db
@@ -468,7 +519,24 @@ func findDatabaseInTree() string {
 	// Check if we're in a git worktree
 	var mainRepoRoot string
 	if git.IsWorktree() {
-		// For worktrees, search main repository root first
+		// Per-worktree redirect override
+		if target := worktreeRedirectTarget(); target != "" {
+			if dbPath := findDatabaseInBeadsDir(target, true); dbPath != "" {
+				return dbPath
+			}
+		}
+
+		// Worktree's own .beads (separate-DB mode, no redirect)
+		if worktreeRoot := git.GetRepoRoot(); worktreeRoot != "" {
+			worktreeBeadsDir := filepath.Join(worktreeRoot, ".beads")
+			if info, err := os.Stat(worktreeBeadsDir); err == nil && info.IsDir() {
+				if dbPath := findDatabaseInBeadsDir(worktreeBeadsDir, true); dbPath != "" {
+					return dbPath
+				}
+			}
+		}
+
+		// Fall back: search main repository root
 		var err error
 		mainRepoRoot, err = git.GetMainRepoRoot()
 		if err == nil && mainRepoRoot != "" {

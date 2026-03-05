@@ -11,6 +11,7 @@ import (
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
@@ -49,24 +50,6 @@ func trackBdVersion() {
 		_ = writeLocalVersion(localVersionPath, Version) // Best effort: version tracking is advisory
 	}
 
-	// Also ensure metadata.json exists with proper defaults (for JSONL export name)
-	// but don't use it for version tracking anymore
-	cfg, err := configfile.Load(beadsDir)
-	if err != nil {
-		return
-	}
-	if cfg == nil {
-		// No config file yet - create one
-		cfg = configfile.DefaultConfig()
-
-		// Auto-detect actual JSONL file instead of using hardcoded default
-		// This prevents mismatches when metadata.json gets deleted (git clean, merge conflict, etc.)
-		if actualJSONL := findActualJSONLFile(beadsDir); actualJSONL != "" {
-			cfg.JSONLExport = actualJSONL
-		}
-
-		_ = cfg.Save(beadsDir) // Best effort
-	}
 }
 
 // readLocalVersion reads the last bd version from the local version file.
@@ -150,55 +133,6 @@ func maybeShowUpgradeNotification() {
 	fmt.Println()
 }
 
-// findActualJSONLFile scans .beads/ for the actual JSONL file in use.
-// Prefers issues.jsonl over beads.jsonl (canonical name), skips backups and merge artifacts.
-// Returns empty string if no JSONL file is found.
-func findActualJSONLFile(beadsDir string) string {
-	entries, err := os.ReadDir(beadsDir)
-	if err != nil {
-		return ""
-	}
-
-	var candidates []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-
-		// Must end with .jsonl
-		if !strings.HasSuffix(name, ".jsonl") {
-			continue
-		}
-
-		// Skip merge artifacts and backups
-		lowerName := strings.ToLower(name)
-		if strings.Contains(lowerName, "backup") ||
-			strings.Contains(lowerName, ".orig") ||
-			strings.Contains(lowerName, ".bak") ||
-			strings.Contains(lowerName, "~") ||
-			strings.HasPrefix(lowerName, "backup_") {
-			continue
-		}
-
-		candidates = append(candidates, name)
-	}
-
-	if len(candidates) == 0 {
-		return ""
-	}
-
-	// Prefer issues.jsonl over beads.jsonl (canonical name)
-	for _, name := range candidates {
-		if name == "issues.jsonl" {
-			return name
-		}
-	}
-
-	// Fall back to first candidate (including beads.jsonl as legacy)
-	return candidates[0]
-}
-
 // autoMigrateOnVersionBump automatically migrates the database when CLI version changes.
 // This function is best-effort - failures are silent to avoid disrupting commands.
 // Called from PersistentPreRun before opening DB for main operation.
@@ -234,6 +168,18 @@ func autoMigrateOnVersionBump(beadsDir string) {
 		// No database - nothing to migrate
 		debug.Logf("auto-migrate: skipping migration, database does not exist: %s", dbPath)
 		return
+	}
+
+	// GH#2137: If upgrading from pre-0.56, the dolt database may have been
+	// created by the old embedded Dolt mode. Recover by reinitializing.
+	if previousVersion != "" && doctor.CompareVersions(previousVersion, "0.56.0") < 0 {
+		recovered, recErr := doltserver.RecoverPreV56DoltDir(dbPath)
+		if recErr != nil {
+			debug.Logf("auto-migrate: pre-v56 recovery failed: %v", recErr)
+		}
+		if recovered {
+			debug.Logf("auto-migrate: rebuilt pre-v56 dolt database at %s", dbPath)
+		}
 	}
 
 	// Open database using factory (respects backend config from metadata.json)
@@ -295,6 +241,16 @@ func autoMigrateOnVersionBump(beadsDir string) {
 		if err := store.SetMetadata(ctx, "bd_version_max", Version); err != nil {
 			debug.Logf("auto-migrate: failed to update max version: %v", err)
 		}
+	}
+
+	// Commit the version metadata update to Dolt (bd-jgxi).
+	// Without an explicit commit, the working set change is lost when the
+	// Dolt server restarts (common for standalone/embedded users). This
+	// ensures bd doctor and subsequent commands see the correct version.
+	commitMsg := fmt.Sprintf("auto-migrate: update bd_version %s → %s", dbVersion, Version)
+	if err := store.Commit(ctx, commitMsg); err != nil {
+		debug.Logf("auto-migrate: failed to commit version update: %v", err)
+		// Non-fatal: the working set still has the update for this session
 	}
 
 	// Close database

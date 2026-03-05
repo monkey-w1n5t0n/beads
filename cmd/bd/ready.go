@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -16,8 +17,8 @@ import (
 
 var readyCmd = &cobra.Command{
 	Use:   "ready",
-	Short: "Show ready work (open, no blockers)",
-	Long: `Show ready work (open issues with no blockers).
+	Short: "Show ready work (open, no active blockers)",
+	Long: `Show ready work (open issues with no active blockers).
 
 Excludes in_progress, blocked, deferred, and hooked issues. This uses the
 GetReadyWork API which applies blocker-aware semantics to find truly claimable work.
@@ -65,8 +66,7 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		if molTypeStr != "" {
 			mt := types.MolType(molTypeStr)
 			if !mt.IsValid() {
-				fmt.Fprintf(os.Stderr, "Error: invalid mol-type %q (must be swarm, patrol, or work)\n", molTypeStr)
-				os.Exit(1)
+				FatalError("invalid mol-type %q (must be swarm, patrol, or work)", molTypeStr)
 			}
 			molType = &mt
 		}
@@ -108,10 +108,36 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		if molType != nil {
 			filter.MolType = molType
 		}
+
+		// Metadata filters (GH#1406)
+		metadataFieldFlags, _ := cmd.Flags().GetStringArray("metadata-field")
+		if len(metadataFieldFlags) > 0 {
+			filter.MetadataFields = make(map[string]string, len(metadataFieldFlags))
+			for _, mf := range metadataFieldFlags {
+				k, v, ok := strings.Cut(mf, "=")
+				if !ok || k == "" {
+					fmt.Fprintf(os.Stderr, "Error: invalid --metadata-field: expected key=value, got %q\n", mf)
+					os.Exit(1)
+				}
+				if err := storage.ValidateMetadataKey(k); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: invalid --metadata-field key: %v\n", err)
+					os.Exit(1)
+				}
+				filter.MetadataFields[k] = v
+			}
+		}
+		hasMetadataKey, _ := cmd.Flags().GetString("has-metadata-key")
+		if hasMetadataKey != "" {
+			if err := storage.ValidateMetadataKey(hasMetadataKey); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid --has-metadata-key: %v\n", err)
+				os.Exit(1)
+			}
+			filter.HasMetadataKey = hasMetadataKey
+		}
+
 		// Validate sort policy
 		if !filter.SortPolicy.IsValid() {
-			fmt.Fprintf(os.Stderr, "Error: invalid sort policy '%s'. Valid values: hybrid, priority, oldest\n", sortPolicy)
-			os.Exit(1)
+			FatalError("invalid sort policy '%s'. Valid values: hybrid, priority, oldest", sortPolicy)
 		}
 		// Direct mode
 		ctx := rootCtx
@@ -121,18 +147,26 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		if rigOverride != "" {
 			rigStore, err := openStoreForRig(ctx, rigOverride)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
 			defer func() { _ = rigStore.Close() }()
 			activeStore = rigStore
 		} else {
+			// Keep ready/read behavior aligned with bd create routing decisions.
+			// Contributor auto-routing should read from the same target repo.
+			routedStore, routed, err := openRoutedReadStore(ctx, activeStore)
+			if err != nil {
+				FatalError("%v", err)
+			}
+			if routed {
+				defer func() { _ = routedStore.Close() }()
+				activeStore = routedStore
+			}
 		}
 
 		issues, err := activeStore.GetReadyWork(ctx, filter)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		if jsonOutput {
 			// Always output array, even if empty
@@ -143,12 +177,39 @@ This is useful for agents executing molecules to see which steps can run next.`,
 			for i, issue := range issues {
 				issueIDs[i] = issue.ID
 			}
-			commentCounts, _ := activeStore.GetCommentCounts(ctx, issueIDs) // Best effort: comment counts are supplementary display info
+			// Best effort: display gracefully degrades with empty data
+			labelsMap, _ := activeStore.GetLabelsForIssues(ctx, issueIDs)
+			depCounts, _ := activeStore.GetDependencyCounts(ctx, issueIDs)
+			allDeps, _ := activeStore.GetDependencyRecordsForIssues(ctx, issueIDs)
+			commentCounts, _ := activeStore.GetCommentCounts(ctx, issueIDs)
+
+			// Populate labels and dependencies for JSON output
+			for _, issue := range issues {
+				issue.Labels = labelsMap[issue.ID]
+				issue.Dependencies = allDeps[issue.ID]
+			}
+
+			// Build response with counts + computed parent (consistent with bd list --json)
 			issuesWithCounts := make([]*types.IssueWithCounts, len(issues))
 			for i, issue := range issues {
+				counts := depCounts[issue.ID]
+				if counts == nil {
+					counts = &types.DependencyCounts{DependencyCount: 0, DependentCount: 0}
+				}
+				// Compute parent from dependency records
+				var parent *string
+				for _, dep := range allDeps[issue.ID] {
+					if dep.Type == types.DepParentChild {
+						parent = &dep.DependsOnID
+						break
+					}
+				}
 				issuesWithCounts[i] = &types.IssueWithCounts{
-					Issue:        issue,
-					CommentCount: commentCounts[issue.ID],
+					Issue:           issue,
+					DependencyCount: counts.DependencyCount,
+					DependentCount:  counts.DependentCount,
+					CommentCount:    commentCounts[issue.ID],
+					Parent:          parent,
 				}
 			}
 			outputJSON(issuesWithCounts)
@@ -193,7 +254,7 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		// Determine display mode: --plain or --pretty=false triggers plain format
 		usePlain := plainFormat || !prettyFormat
 		if usePlain {
-			fmt.Printf("\n%s Ready work (%d issues with no blockers):\n\n", ui.RenderAccent("📋"), len(issues))
+			fmt.Printf("\n%s Ready work (%d issues with no active blockers):\n\n", ui.RenderAccent("📋"), len(issues))
 			for i, issue := range issues {
 				fmt.Printf("%d. [%s] [%s] %s: %s\n", i+1,
 					ui.RenderPriority(issue.Priority),
@@ -332,7 +393,7 @@ func displayReadyList(issues []*types.Issue, parentEpicMap map[string]string) {
 	// Summary footer
 	fmt.Println()
 	fmt.Println(strings.Repeat("-", 80))
-	fmt.Printf("Ready: %d issues with no blockers\n", len(issues))
+	fmt.Printf("Ready: %d issues with no active blockers\n", len(issues))
 	fmt.Println()
 	fmt.Println("Status: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred")
 }
@@ -343,22 +404,19 @@ func runMoleculeReady(_ *cobra.Command, molIDArg string) {
 
 	// Molecule-ready requires direct store access for subgraph loading
 	if store == nil {
-		fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		os.Exit(1)
+		FatalError("no database connection")
 	}
 
 	// Resolve molecule ID
 	moleculeID, err := utils.ResolvePartialID(ctx, store, molIDArg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: molecule '%s' not found\n", molIDArg)
-		os.Exit(1)
+		FatalError("molecule '%s' not found", molIDArg)
 	}
 
 	// Load molecule subgraph
 	subgraph, err := loadTemplateSubgraph(ctx, store, moleculeID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-		os.Exit(1)
+		FatalError("loading molecule: %v", err)
 	}
 
 	// Get parallel analysis to find ready steps
@@ -483,6 +541,9 @@ func init() {
 	readyCmd.Flags().Bool("include-ephemeral", false, "Include ephemeral issues (wisps) in results")
 	readyCmd.Flags().Bool("gated", false, "Find molecules ready for gate-resume dispatch")
 	readyCmd.Flags().String("rig", "", "Query a different rig's database (e.g., --rig gastown, --rig gt-, --rig gt)")
+	// Metadata filtering (GH#1406)
+	readyCmd.Flags().StringArray("metadata-field", nil, "Filter by metadata field (key=value, repeatable)")
+	readyCmd.Flags().String("has-metadata-key", "", "Filter issues that have this metadata key set")
 	rootCmd.AddCommand(readyCmd)
 	blockedCmd.Flags().String("parent", "", "Filter to descendants of this bead/epic")
 	rootCmd.AddCommand(blockedCmd)

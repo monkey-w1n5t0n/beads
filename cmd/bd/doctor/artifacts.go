@@ -17,7 +17,6 @@ type ArtifactFinding struct {
 
 // ArtifactReport contains all findings from an artifact scan.
 type ArtifactReport struct {
-	JSONLArtifacts  []ArtifactFinding
 	SQLiteArtifacts []ArtifactFinding
 	CruftBeadsDirs  []ArtifactFinding
 	RedirectIssues  []ArtifactFinding
@@ -33,7 +32,16 @@ type ArtifactReport struct {
 // The scan is rooted at the given path and looks for .beads/ directories recursively,
 // checking each for artifacts that indicate incomplete migration cleanup.
 func CheckClassicArtifacts(path string) DoctorCheck {
-	report := ScanForArtifacts(path)
+	report, err := ScanForArtifacts(path)
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Classic Artifacts",
+			Status:   StatusWarning,
+			Message:  "Artifact scan failed",
+			Detail:   err.Error(),
+			Category: CategoryMaintenance,
+		}
+	}
 
 	if report.TotalCount == 0 {
 		return DoctorCheck{
@@ -46,9 +54,6 @@ func CheckClassicArtifacts(path string) DoctorCheck {
 
 	// Build summary message
 	var parts []string
-	if len(report.JSONLArtifacts) > 0 {
-		parts = append(parts, fmt.Sprintf("%d JSONL artifact(s)", len(report.JSONLArtifacts)))
-	}
 	if len(report.SQLiteArtifacts) > 0 {
 		parts = append(parts, fmt.Sprintf("%d SQLite artifact(s)", len(report.SQLiteArtifacts)))
 	}
@@ -64,7 +69,7 @@ func CheckClassicArtifacts(path string) DoctorCheck {
 	// Build detail showing examples
 	var details []string
 	for _, findings := range [][]ArtifactFinding{
-		report.JSONLArtifacts, report.SQLiteArtifacts,
+		report.SQLiteArtifacts,
 		report.CruftBeadsDirs, report.RedirectIssues,
 	} {
 		for i, f := range findings {
@@ -87,11 +92,13 @@ func CheckClassicArtifacts(path string) DoctorCheck {
 }
 
 // ScanForArtifacts performs a recursive scan of the given path for classic beads artifacts.
-func ScanForArtifacts(rootPath string) ArtifactReport {
+// Returns an error if the walk itself fails (e.g., root path doesn't exist or is inaccessible).
+// Individual unreadable subdirectories are skipped without error.
+func ScanForArtifacts(rootPath string) (ArtifactReport, error) {
 	var report ArtifactReport
 
 	// Walk the directory tree looking for .beads/ directories
-	_ = filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+	walkErr := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // Skip directories we can't read
 		}
@@ -119,12 +126,15 @@ func ScanForArtifacts(rootPath string) ArtifactReport {
 		// Don't descend into .beads/ itself (we've scanned it)
 		return filepath.SkipDir
 	})
+	if walkErr != nil {
+		return report, fmt.Errorf("scanning artifacts at %s: %w", rootPath, walkErr)
+	}
 
-	report.TotalCount = len(report.JSONLArtifacts) + len(report.SQLiteArtifacts) +
+	report.TotalCount = len(report.SQLiteArtifacts) +
 		len(report.CruftBeadsDirs) + len(report.RedirectIssues)
 
 	for _, findings := range [][]ArtifactFinding{
-		report.JSONLArtifacts, report.SQLiteArtifacts,
+		report.SQLiteArtifacts,
 		report.CruftBeadsDirs, report.RedirectIssues,
 	} {
 		for _, f := range findings {
@@ -134,43 +144,29 @@ func ScanForArtifacts(rootPath string) ArtifactReport {
 		}
 	}
 
-	return report
+	return report, nil
 }
 
 // scanBeadsDir checks a single .beads directory for artifacts.
 func scanBeadsDir(beadsDir string, report *ArtifactReport) {
-	// Check if this is a dolt-native directory (has dolt/ subdirectory)
-	hasDolt := isDoltNative(beadsDir)
-
 	// Check if this should be a redirect-only directory
 	isRedirectExpected := isRedirectExpectedDir(beadsDir)
 
 	// Check if it has a redirect file
 	hasRedirect := hasRedirectFile(beadsDir)
 
-	// 1. Check for JSONL artifacts in dolt-native directories
-	if hasDolt {
-		scanJSONLArtifacts(beadsDir, report)
-	}
-
-	// 2. Check for SQLite artifacts
+	// 1. Check for SQLite artifacts
 	scanSQLiteArtifacts(beadsDir, report)
 
-	// 3. Check for cruft .beads directories (should be redirect-only)
+	// 2. Check for cruft .beads directories (should be redirect-only)
 	if isRedirectExpected {
-		scanCruftBeadsDir(beadsDir, hasRedirect, report)
+		scanCruftBeadsDir(beadsDir, report)
 	}
 
-	// 4. Validate redirect files
+	// 3. Validate redirect files
 	if hasRedirect {
 		validateRedirect(beadsDir, report)
 	}
-}
-
-// isDoltNative returns true if the .beads directory contains a dolt/ subdirectory.
-func isDoltNative(beadsDir string) bool {
-	info, err := os.Stat(filepath.Join(beadsDir, "dolt"))
-	return err == nil && info.IsDir()
 }
 
 // isRedirectExpectedDir returns true if this .beads directory should contain
@@ -232,45 +228,11 @@ func hasRedirectFile(beadsDir string) bool {
 	return err == nil
 }
 
-// scanJSONLArtifacts checks for stale JSONL files in a dolt-native .beads directory.
-func scanJSONLArtifacts(beadsDir string, report *ArtifactReport) {
-	jsonlFiles := []struct {
-		name string
-		desc string
-	}{
-		// Note: issues.jsonl is NOT an artifact — the pre-commit hook exports
-		// Dolt → JSONL on every git commit so the file is tracked in git.
-		{"issues.jsonl.new", "JSONL export artifact"},
-		{"beads.left.jsonl", "merge leftover"},
-		{"interactions.jsonl", "interactions log (usually empty)"},
-	}
-
-	for _, jf := range jsonlFiles {
-		path := filepath.Join(beadsDir, jf.name)
-		info, err := os.Stat(path)
-		if err != nil {
-			continue
-		}
-
-		// Skip empty files for interactions.jsonl since they're harmless
-		if jf.name == "interactions.jsonl" && info.Size() == 0 {
-			continue
-		}
-
-		report.JSONLArtifacts = append(report.JSONLArtifacts, ArtifactFinding{
-			Path:        path,
-			Type:        "jsonl",
-			Description: jf.desc,
-			SafeDelete:  jf.name != "issues.jsonl", // issues.jsonl needs care
-		})
-	}
-}
-
 // scanSQLiteArtifacts checks for leftover SQLite database files.
 // Only flags SQLite files as artifacts if Dolt is the active backend.
 // If SQLite is still the active backend, beads.db is the live database.
 func scanSQLiteArtifacts(beadsDir string, report *ArtifactReport) {
-	if !isDoltNative(beadsDir) {
+	if !IsDoltBackend(beadsDir) {
 		return
 	}
 
@@ -310,7 +272,7 @@ func scanSQLiteArtifacts(beadsDir string, report *ArtifactReport) {
 
 // scanCruftBeadsDir checks if a .beads directory that should be redirect-only
 // contains extra files beyond the redirect file.
-func scanCruftBeadsDir(beadsDir string, hasRedirect bool, report *ArtifactReport) {
+func scanCruftBeadsDir(beadsDir string, report *ArtifactReport) {
 	entries, err := os.ReadDir(beadsDir)
 	if err != nil {
 		return
@@ -344,7 +306,7 @@ func scanCruftBeadsDir(beadsDir string, hasRedirect bool, report *ArtifactReport
 		Path:        beadsDir,
 		Type:        "cruft-beads",
 		Description: desc,
-		SafeDelete:  hasRedirect, // Safe only if redirect is already in place
+		SafeDelete:  true, // Safe: location is redirect-expected, extra files are cruft
 	})
 }
 

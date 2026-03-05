@@ -1,4 +1,4 @@
-//go:build cgo && integration
+//go:build integration
 
 package dolt
 
@@ -14,6 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/steveyegge/beads/internal/testutil"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -609,12 +612,12 @@ func TestGitRemoteSpecialCharacters(t *testing.T) {
 // --- Embedded driver git remote tests ---
 //
 // These tests verify that Dolt's git remote support works through the
-// embedded SQL driver (dolthub/driver), not just the CLI. This is the
-// critical question for the Dolt-in-Git spike: can we use store.Push()
-// and store.Pull() with a bare git repo as the remote?
+// SQL driver, not just the CLI. This is the critical question for the
+// Dolt-in-Git spike: can we use store.Push() and store.Pull() with a
+// bare git repo as the remote?
 
 // setupEmbeddedGitRemote creates a bare git repo and returns a DoltStore
-// connected via the embedded driver with the bare repo configured as "origin".
+// connected with the bare repo configured as "origin".
 func setupEmbeddedGitRemote(t *testing.T) (*DoltStore, *gitRemoteSetup, func()) {
 	t.Helper()
 	skipIfNoDolt(t)
@@ -648,10 +651,11 @@ func setupEmbeddedGitRemote(t *testing.T) (*DoltStore, *gitRemoteSetup, func()) 
 
 	dbName := uniqueTestDBName(t)
 	store, err := New(ctx, &Config{
-		Path:           doltDir,
-		CommitterName:  "test",
-		CommitterEmail: "test@example.com",
-		Database:       dbName,
+		Path:            doltDir,
+		CommitterName:   "test",
+		CommitterEmail:  "test@example.com",
+		Database:        dbName,
+		CreateIfMissing: true, // test creates a fresh database
 	})
 	if err != nil {
 		os.RemoveAll(baseDir)
@@ -827,10 +831,11 @@ func TestGitRemoteSyncRoundTrip(t *testing.T) {
 	}
 
 	cloneStore, err := New(ctx, &Config{
-		Path:           cloneDoltDir,
-		CommitterName:  "clone-user",
-		CommitterEmail: "clone@example.com",
-		Database:       cloneDBName,
+		Path:            cloneDoltDir,
+		CommitterName:   "clone-user",
+		CommitterEmail:  "clone@example.com",
+		Database:        cloneDBName,
+		CreateIfMissing: true, // clone creates a new database
 	})
 	if err != nil {
 		t.Fatalf("failed to open cloned store: %v", err)
@@ -876,10 +881,11 @@ func TestGitRemoteSyncRoundTrip(t *testing.T) {
 
 	// Step 4: Re-open source and pull — verify bidirectional sync
 	sourceStore2, err := New(ctx, &Config{
-		Path:           filepath.Join(setup.baseDir, "embedded-dolt"),
-		CommitterName:  "test",
-		CommitterEmail: "test@example.com",
-		Database:       findClonedDBName(t, filepath.Join(setup.baseDir, "embedded-dolt")),
+		Path:            filepath.Join(setup.baseDir, "embedded-dolt"),
+		CommitterName:   "test",
+		CommitterEmail:  "test@example.com",
+		Database:        findClonedDBName(t, filepath.Join(setup.baseDir, "embedded-dolt")),
+		CreateIfMissing: true, // re-open may use dynamically discovered DB name
 	})
 	if err != nil {
 		t.Fatalf("failed to re-open source store: %v", err)
@@ -914,6 +920,82 @@ func TestGitRemoteSyncRoundTrip(t *testing.T) {
 	t.Log("Full round-trip sync verified: source -> git remote -> clone -> git remote -> source")
 }
 
+func TestAutoIncrementAfterPull(t *testing.T) {
+	store, setup, cleanup := setupEmbeddedGitRemote(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// Create an issue via the store API (generates AUTO_INCREMENT event rows)
+	sourceIssue := &types.Issue{
+		ID:        "ai-src-001",
+		Title:     "Source issue before push",
+		IssueType: types.TypeTask,
+		Status:    types.StatusOpen,
+		Priority:  2,
+	}
+	if err := store.CreateIssue(ctx, sourceIssue, "tester"); err != nil {
+		t.Fatalf("source CreateIssue failed: %v", err)
+	}
+	if err := store.Commit(ctx, "Add ai-src-001"); err != nil {
+		t.Fatalf("source Commit failed: %v", err)
+	}
+	if err := store.Push(ctx); err != nil {
+		t.Fatalf("source Push failed: %v", err)
+	}
+
+	// Simulate a second peer via CLI: clone, add data with AUTO_INCREMENT
+	// rows (issue + event), commit, and push back to the shared remote.
+	cloneDir := filepath.Join(setup.baseDir, "clone-ai")
+	doltClone(t, setup.remoteURL, cloneDir)
+	sourceInsertIssue(t, cloneDir, "ai-clone-001", "Clone issue generating events")
+	runDoltSQL(t, cloneDir,
+		`INSERT INTO events (issue_id, event_type, actor, created_at) `+
+			`VALUES ('ai-clone-001', 'created', 'clone-user', NOW())`)
+	sourceCommitAndPush(t, cloneDir, "Add ai-clone-001 with event")
+
+	// Pull into the source store — this is the code path under test.
+	// Without resetAutoIncrements, the next CreateIssue would fail with
+	// a duplicate key error because the events AUTO_INCREMENT counter
+	// was not updated to account for the rows merged in by DOLT_PULL.
+	if err := store.Pull(ctx); err != nil {
+		t.Fatalf("Pull failed: %v", err)
+	}
+
+	postPullIssue := &types.Issue{
+		ID:        "ai-src-002",
+		Title:     "Source issue after pull",
+		IssueType: types.TypeTask,
+		Status:    types.StatusOpen,
+		Priority:  2,
+	}
+	if err := store.CreateIssue(ctx, postPullIssue, "tester"); err != nil {
+		t.Fatalf("CreateIssue after pull failed (AUTO_INCREMENT not reset?): %v", err)
+	}
+
+	var eventCount int
+	err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM events").Scan(&eventCount)
+	if err != nil {
+		t.Fatalf("failed to count events: %v", err)
+	}
+	// At least 3 events: source created (ai-src-001), clone created (ai-clone-001),
+	// post-pull created (ai-src-002)
+	if eventCount < 3 {
+		t.Errorf("expected at least 3 events, got %d", eventCount)
+	}
+
+	for _, id := range []string{"ai-src-001", "ai-clone-001", "ai-src-002"} {
+		issue, getErr := store.GetIssue(ctx, id)
+		if getErr != nil {
+			t.Errorf("GetIssue(%s) failed: %v", id, getErr)
+		}
+		if issue == nil {
+			t.Errorf("expected %s to exist", id)
+		}
+	}
+}
+
 // findClonedDBName discovers the database name inside a dolt directory
 // by looking for subdirectories containing .dolt.
 func findClonedDBName(t *testing.T, doltDir string) string {
@@ -933,4 +1015,104 @@ func findClonedDBName(t *testing.T, doltDir string) string {
 	}
 	t.Fatalf("no dolt database found in %s", doltDir)
 	return ""
+}
+
+// TestGitRemoteExternalServerRouting verifies that isGitProtocolRemote returns
+// false when the SQL server reports a git-protocol remote but the CLI directory
+// (dbPath) lacks that remote.
+func TestGitRemoteExternalServerRouting(t *testing.T) {
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("dolt not installed, skipping test")
+	}
+	skipIfNoGit(t)
+
+	baseDir, err := os.MkdirTemp("", "external-server-routing-*")
+	if err != nil {
+		t.Fatalf("failed to create base dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	// Server root: dolt init so sql-server can start
+	serverDataDir := filepath.Join(baseDir, "server-data")
+	if err := os.MkdirAll(serverDataDir, 0o755); err != nil {
+		t.Fatalf("failed to create server data dir: %v", err)
+	}
+	runCmd(t, serverDataDir, "dolt", "init", "--name", "test", "--email", "test@test.com")
+
+	// Sub-database with a git-protocol remote
+	testdbDir := filepath.Join(serverDataDir, "testdb")
+	if err := os.MkdirAll(testdbDir, 0o755); err != nil {
+		t.Fatalf("failed to create testdb dir: %v", err)
+	}
+	runCmd(t, testdbDir, "dolt", "init", "--name", "test", "--email", "test@test.com")
+	runCmd(t, testdbDir, "dolt", "remote", "add", "origin", "git+https://example.com/test.git")
+
+	initSchemaSQL := fmt.Sprintf(`%s
+%s
+%s
+%s
+CALL DOLT_ADD('.');
+CALL DOLT_COMMIT('-Am', 'Genesis: schema and config');`, schema, defaultConfig, readyIssuesView, blockedIssuesView)
+	runDoltSQL(t, testdbDir, initSchemaSQL)
+
+	// Start sql-server from the server root
+	port, err := testutil.FindFreePort()
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	serverCmd := exec.Command("dolt", "sql-server",
+		"-H", "127.0.0.1",
+		"-P", fmt.Sprintf("%d", port),
+	)
+	serverCmd.Dir = serverDataDir
+	if err := serverCmd.Start(); err != nil {
+		t.Fatalf("failed to start dolt sql-server: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = serverCmd.Process.Kill()
+		_ = serverCmd.Wait()
+	})
+
+	if !testutil.WaitForServer(port, 15*time.Second) {
+		t.Fatal("dolt sql-server did not become ready within timeout")
+	}
+
+	// Client directory: separate dolt init with NO remotes (simulates .beads/dolt/)
+	clientDataDir := filepath.Join(baseDir, "client-data")
+	if err := os.MkdirAll(clientDataDir, 0o755); err != nil {
+		t.Fatalf("failed to create client data dir: %v", err)
+	}
+	runCmd(t, clientDataDir, "dolt", "init", "--name", "test", "--email", "test@test.com")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	for _, env := range []string{"BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT", "BEADS_TEST_MODE"} {
+		if prev, ok := os.LookupEnv(env); ok {
+			t.Cleanup(func() { os.Setenv(env, prev) })
+		} else {
+			t.Cleanup(func() { os.Unsetenv(env) })
+		}
+		os.Unsetenv(env)
+	}
+
+	store, err := New(ctx, &Config{
+		Path:            clientDataDir,
+		Database:        "testdb",
+		ServerHost:      "127.0.0.1",
+		ServerPort:      port,
+		ServerUser:      "root",
+		CommitterName:   "test",
+		CommitterEmail:  "test@test.com",
+		AutoStart:       false,
+		CreateIfMissing: false,
+	})
+	if err != nil {
+		t.Fatalf("failed to create DoltStore: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	// SQL sees git+https:// remote in testdb; CLI directory (clientDataDir) has none.
+	// isGitProtocolRemote should return false to route through SQL.
+	require.False(t, store.isGitProtocolRemote(ctx))
 }

@@ -1,6 +1,6 @@
 # Dolt Backend for Beads
 
-Beads uses Dolt as its storage backend. Dolt provides a version-controlled SQL database with cell-level merge, native branching, and multi-writer support via server mode.
+Beads uses Dolt as its storage backend. Dolt provides a version-controlled SQL database with cell-level merge, native branching, and two deployment modes.
 
 ## Why Dolt?
 
@@ -8,16 +8,17 @@ Beads uses Dolt as its storage backend. Dolt provides a version-controlled SQL d
 - **Multi-writer support** — server mode enables concurrent agents
 - **Built-in history** — every write creates a Dolt commit
 - **Native branching** — Dolt branches independent of git branches
+- **Single-binary option** — embedded mode for solo users (no daemon needed)
 
 ## Getting Started
 
 ### New Project
 
 ```bash
-# Embedded mode (single writer)
+# Embedded mode (single writer, no daemon — default for standalone)
 bd init
 
-# Server mode (multi-writer)
+# Server mode (multi-writer, e.g. Gas Town)
 gt dolt start           # Start the Dolt server
 bd init --server        # Initialize with server mode
 ```
@@ -41,22 +42,17 @@ Migration creates backups automatically. Your original SQLite database is preser
 
 ## Modes of Operation
 
-### Embedded Mode (Default)
+### Embedded Mode (Solo / Standalone)
 
-Single-process access to the Dolt database. Good for development and single-agent use.
+In-process Dolt engine — no separate server needed. This is the default for
+standalone Beads users. The `bd` binary includes everything; just `bd init` and go.
 
-```yaml
-# .beads/config.yaml (or auto-detected)
-dolt:
-  mode: embedded
-```
+- Single-writer (one process at a time)
+- Data lives in `.beads/dolt/` alongside your code
+- Push to GitHub with `bd dolt push` — code and issues in one repo
+- Zero ops: no daemon, no ports, no PID files
 
-Characteristics:
-- No server process needed
-- Single writer at a time
-- Direct database access
-
-### Server Mode (Multi-Writer)
+### Server Mode (Multi-Writer / Gas Town)
 
 Connects to a running `dolt sql-server` for multi-client access.
 
@@ -153,22 +149,22 @@ bd federation status
 
 When someone clones a repository that uses Dolt backend:
 
-1. They see the `issues.jsonl` file (committed to git)
-2. On first `bd` command (e.g., `bd list`), bootstrap runs automatically
-3. JSONL is imported into a fresh Dolt database
+1. On first `bd` command (e.g., `bd list`), bootstrap runs automatically
+2. A fresh Dolt database is created
+3. If a Dolt remote is configured, data is pulled from the remote
 4. Work continues normally
 
 **No manual steps required.** The bootstrap:
-- Detects fresh clone (JSONL exists, Dolt doesn't)
+- Detects fresh clone (no Dolt database yet)
 - Acquires a lock to prevent race conditions
-- Imports issues, routes, interactions, labels, dependencies
-- Creates initial Dolt commit "Bootstrap from JSONL"
+- Initializes the Dolt database and pulls from configured remotes
+- Creates initial Dolt commit
 
 ### Verifying Bootstrap Worked
 
 ```bash
 bd list              # Should show issues
-bd vc log            # Should show "Bootstrap from JSONL" commit
+bd vc log            # Should show initial commit
 ```
 
 ## Troubleshooting
@@ -194,7 +190,6 @@ gt dolt status       # Check if running
 
 **Check:**
 ```bash
-ls .beads/issues.jsonl     # Should exist
 ls .beads/dolt/            # Should NOT exist (pre-bootstrap)
 BD_DEBUG=1 bd list         # See bootstrap output
 ```
@@ -223,10 +218,10 @@ bd doctor --server         # Server mode checks (if applicable)
    bd doctor --fix
    ```
 
-2. **Rebuild from JSONL:**
+2. **Rebuild from remote:**
    ```bash
    rm -rf .beads/dolt
-   bd list                  # Re-triggers bootstrap from JSONL
+   bd list                  # Re-triggers bootstrap
    ```
 
 ### Lock Contention (Embedded Mode)
@@ -290,15 +285,15 @@ bd vc commit -m "Checkpoint before refactor"
 
 ### Auto-Commit Behavior
 
-In **embedded mode** (default), each `bd` write command creates a Dolt commit:
+In **embedded mode** (standalone default), each `bd` write command creates a Dolt commit:
 
 ```bash
 bd create "New issue"    # Creates issue + Dolt commit
 ```
 
-In **server mode**, auto-commit defaults to OFF because the server manages its
-own transaction lifecycle. Firing `DOLT_COMMIT` after every write under
-concurrent load causes 'database is read only' errors.
+In **server mode** (Gas Town), auto-commit defaults to OFF because the server
+manages its own transaction lifecycle. Firing `DOLT_COMMIT` after every write
+under concurrent load causes 'database is read only' errors.
 
 Override for batch operations (embedded) or explicit commits (server):
 
@@ -322,13 +317,15 @@ gt dolt sql              # Open SQL shell
 
 Server runs on port 3307 (avoids MySQL conflict on 3306).
 
-### Data Location
+### Data Location (Gas Town)
 
 ```
-~/.dolt-data/
-├── beads/               # HQ database
-├── beads_rig/           # Beads rig database
-└── gastown/             # Gas Town database
+~/gt/.dolt-data/
+├── hq/                  # Town beads (hq-*)
+├── gastown/             # Gastown rig (gt-*)
+├── beads/               # Beads rig (bd-*)
+├── wyvern/              # Wyvern rig (wy-*)
+└── sky/                 # Sky rig (sky-*)
 ```
 
 ## Migration Cleanup
@@ -356,5 +353,6 @@ rm .beads/*.backup-*.db
 ## See Also
 
 - [CONFIG.md](CONFIG.md) - Full configuration reference
+- [DEPENDENCIES.md](DEPENDENCIES.md) - Dependencies and gates
 - [GIT_INTEGRATION.md](GIT_INTEGRATION.md) - Git worktrees and protected branches
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - General troubleshooting

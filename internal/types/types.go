@@ -15,7 +15,7 @@ import (
 type Issue struct {
 	// ===== Core Identification =====
 	ID          string `json:"id"`
-	ContentHash string `json:"-"` // Internal: SHA256 of canonical content - NOT exported to JSONL
+	ContentHash string `json:"-"` // Internal: SHA256 of canonical content
 
 	// ===== Issue Content =====
 	Title              string `json:"title"`
@@ -62,7 +62,7 @@ type Issue struct {
 	CompactedAtCommit *string    `json:"compacted_at_commit,omitempty"` // Git commit hash when compacted
 	OriginalSize      int        `json:"original_size,omitempty"`
 
-	// ===== Internal Routing (not exported to JSONL) =====
+	// ===== Internal Routing (not synced via git) =====
 	SourceRepo     string `json:"-"` // Which repo owns this issue (multi-repo support)
 	IDPrefix       string `json:"-"` // Override prefix for ID generation (appends to config prefix)
 	PrefixOverride string `json:"-"` // Completely replace config prefix (for cross-rig creation)
@@ -74,7 +74,7 @@ type Issue struct {
 
 	// ===== Messaging Fields (inter-agent communication) =====
 	Sender    string   `json:"sender,omitempty"`    // Who sent this (for messages)
-	Ephemeral bool     `json:"ephemeral,omitempty"` // If true, not exported to JSONL
+	Ephemeral bool     `json:"ephemeral,omitempty"` // If true, not synced via git
 	WispType  WispType `json:"wisp_type,omitempty"` // Classification for TTL-based compaction (gt-9br)
 	// NOTE: RepliesTo, RelatesTo, DuplicateOf, SupersededBy moved to dependencies table
 	// per Decision 004 (Edge Schema Consolidation). Use dependency API instead.
@@ -360,21 +360,18 @@ func (i *Issue) ValidateForImport(customStatuses []string) error {
 	return nil
 }
 
-// SetDefaults applies default values for fields omitted during JSONL import.
+// SetDefaults applies default values for fields that may be omitted during deserialization.
 // Call this after json.Unmarshal to ensure missing fields have proper defaults:
 //   - Status: defaults to StatusOpen if empty
 //   - Priority: defaults to 2 if zero (note: P0 issues must explicitly set priority=0)
 //   - IssueType: defaults to TypeTask if empty
-//
-// This enables smaller JSONL output by using omitempty on these fields.
 func (i *Issue) SetDefaults() {
 	if i.Status == "" {
 		i.Status = StatusOpen
 	}
 	// Note: priority 0 (P0) is a valid value, so we can't distinguish between
-	// "explicitly set to 0" and "omitted". For JSONL compactness, we treat
-	// priority 0 in JSONL as P0, not as "use default". This is the expected
-	// behavior since P0 issues are explicitly marked.
+	// "explicitly set to 0" and "omitted". We treat priority 0 as P0,
+	// not as "use default". P0 issues are explicitly marked.
 	// Priority default of 2 only applies to new issues via Create, not import.
 	if i.IssueType == "" {
 		i.IssueType = TypeTask
@@ -653,9 +650,10 @@ type IssueWithDependencyMetadata struct {
 // IssueWithCounts extends Issue with dependency relationship counts
 type IssueWithCounts struct {
 	*Issue
-	DependencyCount int `json:"dependency_count"`
-	DependentCount  int `json:"dependent_count"`
-	CommentCount    int `json:"comment_count"`
+	DependencyCount int     `json:"dependency_count"`
+	DependentCount  int     `json:"dependent_count"`
+	CommentCount    int     `json:"comment_count"`
+	Parent          *string `json:"parent,omitempty"` // Computed parent from parent-child dep (bd-ym8c)
 }
 
 // IssueDetails extends Issue with labels, dependencies, dependents, and comments.
@@ -749,6 +747,25 @@ const (
 	WaitsForAllChildren = "all-children" // Wait for all dynamic children to complete
 	WaitsForAnyChildren = "any-children" // Proceed when first child completes (future)
 )
+
+// ParseWaitsForGateMetadata extracts the waits-for gate type from dependency metadata.
+// Note: spawner identity comes from dependencies.depends_on_id in storage/query paths;
+// metadata.spawner_id is parsed for compatibility/future explicit targeting.
+// Returns WaitsForAllChildren on empty/invalid metadata for backward compatibility.
+func ParseWaitsForGateMetadata(metadata string) string {
+	if strings.TrimSpace(metadata) == "" {
+		return WaitsForAllChildren
+	}
+
+	var meta WaitsForMeta
+	if err := json.Unmarshal([]byte(metadata), &meta); err != nil {
+		return WaitsForAllChildren
+	}
+	if meta.Gate == WaitsForAnyChildren {
+		return WaitsForAnyChildren
+	}
+	return WaitsForAllChildren
+}
 
 // AttestsMeta holds metadata for attests dependencies (skill attestations).
 // Stored as JSON in the Dependency.Metadata field.
@@ -871,6 +888,14 @@ type MoleculeProgressStats struct {
 	LastClosed    *time.Time `json:"last_closed,omitempty"`
 }
 
+// MoleculeLastActivity holds the most recent activity timestamp for a molecule.
+type MoleculeLastActivity struct {
+	MoleculeID   string    `json:"molecule_id"`
+	LastActivity time.Time `json:"last_activity"`
+	Source       string    `json:"source"` // "step_closed", "step_updated", "molecule_updated"
+	SourceStepID string    `json:"source_step_id,omitempty"`
+}
+
 // Statistics provides aggregate metrics
 type Statistics struct {
 	TotalIssues             int     `json:"total_issues"`
@@ -958,6 +983,10 @@ type IssueFilter struct {
 	DueAfter    *time.Time // Filter issues with due_at > this time
 	DueBefore   *time.Time // Filter issues with due_at < this time
 	Overdue     bool       // Filter issues where due_at < now AND status != closed
+
+	// Metadata field filtering (GH#1406)
+	MetadataFields map[string]string // Top-level key=value equality; AND semantics (all must match)
+	HasMetadataKey string            // Existence check: issue has this top-level key set (non-null)
 }
 
 // SortPolicy determines how ready work is ordered
@@ -1019,10 +1048,9 @@ type WorkFilter struct {
 	// Set to true to include them (e.g., for merge-request processing).
 	IncludeEphemeral bool
 
-	// Molecule step filtering
-	// By default, GetReadyWork excludes mol/wisp steps (IDs containing -mol- or -wisp-)
-	// Set to true for internal callers that need to see mol steps (e.g., findGateReadyMolecules)
-	IncludeMolSteps bool
+	// Metadata field filtering (GH#1406)
+	MetadataFields map[string]string // Top-level key=value equality; AND semantics (all must match)
+	HasMetadataKey string            // Existence check: issue has this top-level key set (non-null)
 }
 
 // StaleFilter is used to filter stale issue queries
@@ -1060,7 +1088,6 @@ const (
 // ID prefix constants for molecule/wisp instantiation.
 // These prefixes are inserted into issue IDs: <project>-<prefix>-<id>
 // Used by: cmd/bd/pour.go, cmd/bd/wisp.go (ID generation)
-// Exclusion from bd ready is config-driven via ready.exclude_id_patterns (default: -mol-,-wisp-)
 const (
 	IDPrefixMol  = "mol"  // Persistent molecules (bd-mol-xxx)
 	IDPrefixWisp = "wisp" // Ephemeral wisps (bd-wisp-xxx)
@@ -1079,7 +1106,7 @@ func (i *Issue) GetConstituents() []BondRef {
 
 // EntityRef is a structured reference to an entity (human, agent, or org).
 // This is the foundation for HOP entity tracking and CV chains.
-// Can be rendered as a URI: entity://hop/<platform>/<org>/<id>
+// Can be rendered as a URI: hop://<platform>/<org>/<id>
 //
 // Example usage:
 //
@@ -1089,7 +1116,7 @@ func (i *Issue) GetConstituents() []BondRef {
 //	    Org:      "steveyegge",
 //	    ID:       "polecat-nux",
 //	}
-//	uri := ref.URI() // "entity://hop/gastown/steveyegge/polecat-nux"
+//	uri := ref.URI() // "hop://gastown/steveyegge/polecat-nux"
 type EntityRef struct {
 	// Name is the human-readable identifier (e.g., "polecat/Nux", "mayor")
 	Name string `json:"name,omitempty"`
@@ -1113,13 +1140,13 @@ func (e *EntityRef) IsEmpty() bool {
 }
 
 // URI returns the entity as a HOP URI.
-// Format: entity://hop/<platform>/<org>/<id>
+// Format: hop://<platform>/<org>/<id>
 // Returns empty string if Platform, Org, or ID is missing.
 func (e *EntityRef) URI() string {
 	if e == nil || e.Platform == "" || e.Org == "" || e.ID == "" {
 		return ""
 	}
-	return fmt.Sprintf("entity://hop/%s/%s/%s", e.Platform, e.Org, e.ID)
+	return fmt.Sprintf("hop://%s/%s/%s", e.Platform, e.Org, e.ID)
 }
 
 // String returns a human-readable representation.
@@ -1171,18 +1198,26 @@ func (v *Validation) IsValidOutcome() bool {
 }
 
 // ParseEntityURI parses a HOP entity URI into an EntityRef.
-// Format: entity://hop/<platform>/<org>/<id>
+// Format: hop://<platform>/<org>/<id>
+// Also accepts legacy entity://hop/<platform>/<org>/<id> for backward compatibility.
 // Returns nil and error if the URI is invalid.
 func ParseEntityURI(uri string) (*EntityRef, error) {
-	const prefix = "entity://hop/"
-	if !strings.HasPrefix(uri, prefix) {
-		return nil, fmt.Errorf("invalid entity URI: must start with %q", prefix)
+	const hopPrefix = "hop://"
+	const legacyPrefix = "entity://hop/"
+
+	var rest string
+	switch {
+	case strings.HasPrefix(uri, hopPrefix):
+		rest = uri[len(hopPrefix):]
+	case strings.HasPrefix(uri, legacyPrefix):
+		rest = uri[len(legacyPrefix):]
+	default:
+		return nil, fmt.Errorf("invalid entity URI: must start with %q (or legacy %q)", hopPrefix, legacyPrefix)
 	}
 
-	rest := uri[len(prefix):]
 	parts := strings.SplitN(rest, "/", 3)
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return nil, fmt.Errorf("invalid entity URI: expected entity://hop/<platform>/<org>/<id>, got %q", uri)
+		return nil, fmt.Errorf("invalid entity URI: expected hop://<platform>/<org>/<id>, got %q", uri)
 	}
 
 	return &EntityRef{

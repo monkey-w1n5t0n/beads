@@ -3,7 +3,6 @@ package fix
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -12,12 +11,6 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
-
-// cleanupResult contains the results of a cleanup operation
-type cleanupResult struct {
-	DeletedCount  int
-	SkippedPinned int
-}
 
 // StaleClosedIssues deletes stale closed issues.
 // This is the fix handler for the "Stale Closed Issues" doctor check.
@@ -35,12 +28,6 @@ func StaleClosedIssues(path string) error {
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
-	}
-
-	// Dolt backend: this fix uses SQLite-specific storage, skip for now
-	if cfg != nil && cfg.GetBackend() == configfile.BackendDolt {
-		fmt.Println("  Stale closed issues cleanup skipped (dolt backend)")
-		return nil
 	}
 
 	// Get threshold; 0 means disabled
@@ -118,12 +105,6 @@ func PatrolPollution(path string) error {
 	}
 
 	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-
-	if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
-		fmt.Println("  No JSONL file found, nothing to clean up")
-		return nil
-	}
 
 	// Open database using factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
 	ctx := context.Background()
@@ -134,7 +115,8 @@ func PatrolPollution(path string) error {
 	defer func() { _ = store.Close() }()
 
 	// Get all issues and identify pollution
-	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
+	ephemeral := false
+	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{Ephemeral: &ephemeral})
 	if err != nil {
 		return fmt.Errorf("failed to query issues: %w", err)
 	}

@@ -46,6 +46,11 @@ Tool-level settings you can configure:
 | `git.no-gpg-sign` | - | `BD_GIT_NO_GPG_SIGN` | `false` | Disable GPG signing for beads commits |
 | `directory.labels` | - | - | (none) | Map directories to labels for automatic filtering |
 | `external_projects` | - | - | (none) | Map project names to paths for cross-project deps |
+| `backup.enabled` | - | `BD_BACKUP_ENABLED` | `false` | Enable periodic JSONL backup to `.beads/backup/` |
+| `backup.interval` | - | `BD_BACKUP_INTERVAL` | `15m` | Minimum time between auto-exports |
+| `backup.git-push` | - | `BD_BACKUP_GIT_PUSH` | `false` | Auto git-add + commit + push after export |
+| `dolt.auto-push` | - | `BD_DOLT_AUTO_PUSH` | (auto) | Auto-push to Dolt remote after writes (auto-enabled when origin exists) |
+| `dolt.auto-push-interval` | - | `BD_DOLT_AUTO_PUSH_INTERVAL` | `5m` | Minimum time between auto-pushes |
 | `db` | `--db` | `BD_DB` | (auto-discover) | Database path |
 | `actor` | `--actor` | `BD_ACTOR` | `git config user.name` | Actor name for audit trail (see below) |
 
@@ -76,6 +81,54 @@ dolt:
 
 **Caveat:** enabling this creates **more Dolt commits** over time (one per write command). This is intentional so changes are not left only in the working set.
 
+### JSONL Backup
+
+Periodic JSONL export to `.beads/backup/` provides an off-machine recovery path. Local Dolt snapshots (via `dolt.auto-commit`) remain the primary safety net; JSONL backup is a secondary layer.
+
+```yaml
+backup:
+  enabled: true    # Enable auto-backup after write commands
+  interval: 15m    # Minimum time between auto-exports
+  git-push: false  # Auto git-add + commit + push after export
+```
+
+**How it works:**
+- After each write command (in PersistentPostRun), `bd` checks the Dolt HEAD commit hash against the last backup state
+- If data changed and the throttle interval has passed, all tables are exported to sorted JSONL files
+- Events are exported incrementally (append-only) using a high-water mark
+- Each table is written atomically via temp file + rename (crash-safe)
+- State is tracked in `.beads/backup/backup_state.json`
+
+**Manual commands:**
+- `bd backup` — run export immediately (ignores throttle)
+- `bd backup --force` — export even if nothing changed
+- `bd backup status` — show last backup time, commit hash, counts
+
+**Git push mode:** When `backup.git-push: true`, after each export `bd` runs `git add -f .beads/backup/`, commits with a timestamped message, and pushes. Push failures are warnings only (non-fatal).
+
+### Dolt Auto-Push
+
+When a Dolt remote named `origin` is configured, `bd` automatically pushes after write commands with a 5-minute debounce. This completes the Dolt replication story: add a remote once, and data flows automatically.
+
+```yaml
+dolt:
+  auto-push: true       # Auto-enable when origin remote exists (default)
+  auto-push-interval: 5m  # Minimum time between auto-pushes
+```
+
+**How it works:**
+- After each write command (in PersistentPostRun, after auto-commit and auto-backup), `bd` checks whether a push is due
+- Pushes are debounced: skipped if the last push was less than `dolt.auto-push-interval` ago
+- Change detection: skipped if the Dolt HEAD commit hasn't changed since last push
+- Push failures are warnings only (non-fatal)
+- Last push time and commit are tracked in the metadata table
+
+**Opt out:**
+```yaml
+dolt:
+  auto-push: false
+```
+
 ### Actor Identity Resolution
 
 The actor name (used for `created_by` in issues and audit trails) is resolved in this order:
@@ -102,9 +155,8 @@ The sync mode controls how beads synchronizes data with git and/or Dolt remotes.
 
 | Mode | Description |
 |------|-------------|
-| `git-portable` | (default) Export JSONL on push, import on pull. Standard git-based workflow. |
-| `realtime` | Export JSONL on every database change. Legacy behavior, higher I/O. |
-| `dolt-native` | Use Dolt remotes directly for sync. JSONL is not used for sync (but manual `bd import` / `bd export` still work). |
+| `dolt-native` | (default) Use Dolt remotes directly for sync. Manual `bd import` / `bd export` still work for portability. |
+| `git-portable` | Legacy mode: Export JSONL on push, import on pull. For backward compatibility with older setups. |
 | `belt-and-suspenders` | Both Dolt remote AND JSONL backup. Maximum redundancy. |
 
 #### Sync Triggers
@@ -141,7 +193,7 @@ For Dolt-native or belt-and-suspenders modes:
 ```yaml
 # .beads/config.yaml
 sync:
-  mode: git-portable    # git-portable | realtime | dolt-native | belt-and-suspenders
+  mode: dolt-native     # dolt-native | git-portable | belt-and-suspenders
   export_on: push       # push | change
   import_on: pull       # pull | change
 
@@ -156,10 +208,9 @@ federation:
 
 #### When to Use Each Mode
 
-- **git-portable** (default): Best for most teams. JSONL is committed to git, works with any git hosting.
-- **realtime**: Use when you need instant JSONL updates (e.g., file watchers, CI triggers on JSONL changes).
-- **dolt-native**: Use when you have Dolt infrastructure and want database-level sync; JSONL remains available for portability/audits/manual workflows.
-- **belt-and-suspenders**: Use for critical data where you want both Dolt sync AND git-portable backup.
+- **dolt-native** (default): Best for most teams. Dolt handles sync natively with cell-level merge. `bd import`/`bd export` remain available for portability and migration.
+- **git-portable**: Legacy mode for backward compatibility. JSONL is committed to git, works with any git hosting.
+- **belt-and-suspenders**: Use for critical data where you want both Dolt sync AND JSONL backup.
 
 ### Example Config File
 
@@ -200,6 +251,11 @@ directory:
     packages/maverick: maverick
     packages/agency: agency
     packages/io: io
+
+# Feedback title formatting for mutating commands (GH#1384)
+# 0 = hide titles, N > 0 = truncate to N characters
+output:
+  title-length: 255
 
 # Cross-project dependency resolution (bd-h807)
 # Maps project names to paths for resolving external: blocked_by references
@@ -313,6 +369,7 @@ Configuration keys use dot-notation namespaces to organize settings:
 
 - `compact_*` - Compaction settings (see EXTENDING.md)
 - `issue_prefix` - Issue ID prefix (managed by `bd init`)
+- `issue_id_mode` - ID generation mode: `hash` (default) or `counter` (sequential integers)
 - `max_collision_prob` - Maximum collision probability for adaptive hash IDs (default: 0.25)
 - `min_hash_length` - Minimum hash ID length (default: 4)
 - `max_hash_length` - Maximum hash ID length (default: 8)
@@ -334,6 +391,83 @@ Use these namespaces for external integrations:
 - `linear.*` - Linear integration settings
 - `github.*` - GitHub integration settings
 - `custom.*` - Custom integration settings
+
+### Example: Sequential Counter IDs (issue_id_mode=counter)
+
+By default, beads generates hash-based IDs (e.g., `bd-a3f2`, `bd-7f3a8`). For projects that prefer
+short sequential IDs (e.g., `bd-1`, `bd-2`, `bd-3`), enable counter mode:
+
+```bash
+bd config set issue_id_mode counter
+```
+
+**Valid values:**
+
+| Value | Behavior |
+|-------|----------|
+| `hash` | (default) Hash-based IDs, adaptive length, collision-safe |
+| `counter` | Sequential integers per prefix: `bd-1`, `bd-2`, `bd-3`, ... |
+
+**Counter mode behavior:**
+- Each prefix (`bd`, `plug`, etc.) has its own independent counter
+- Counter is stored atomically in the database; concurrent creates within a single Dolt session are safe
+- Explicit `--id` flag always overrides counter mode (the counter is not incremented)
+
+**Enabling counter mode:**
+
+```bash
+bd config set issue_id_mode counter
+
+# Now new issues get sequential IDs
+bd create "First issue" -p 1
+# → bd-1
+
+bd create "Second issue" -p 2
+# → bd-2
+```
+
+**Migration warning:** If you switch an existing repository to counter mode, seed the counter
+to avoid collisions with existing IDs. Find your highest current integer ID and set the counter
+accordingly:
+
+```bash
+# Check your highest existing sequential ID (if any)
+bd list --json | jq -r '.[].id' | grep -E '^bd-[0-9]+$' | sort -t- -k2 -n | tail -1
+
+# Seed the counter (e.g., if highest existing ID is bd-42)
+bd config set issue_id_mode counter
+# The counter auto-initializes at 0; new issues start at 1
+# If you already have bd-1 through bd-42, manually set counter:
+# (no direct CLI for seeding — use bd dolt sql or create/delete N issues)
+```
+
+For fresh repositories switching to counter mode before any issues exist, no seeding is needed.
+
+**Per-prefix counter isolation:**
+
+Each issue prefix maintains its own counter independently. In multi-repo or routed setups,
+`bd-*` issues and `plug-*` issues each start at 1:
+
+```bash
+# Prefix "bd" and prefix "plug" have independent counters
+bd create "Core task" -p 1          # → bd-1
+bd create "Plugin task" -p 1        # → plug-1 (if prefix is "plug")
+```
+
+**Tradeoff — hash vs. counter:**
+
+| | Hash IDs | Counter IDs |
+|---|---|---|
+| Human readability | Lower (e.g., `bd-a3f2`) | Higher (e.g., `bd-1`) |
+| Distributed/concurrent safety | Excellent (collision-free across branches) | Needs care (counters can diverge on parallel branches) |
+| Predictability | Unpredictable | Sequential |
+| Best for | Multi-agent, multi-branch workflows | Single-writer or project-management UIs |
+
+Counter IDs are well-suited for linear project-management workflows and human-facing issue tracking.
+Hash IDs are safer when multiple agents or branches create issues concurrently, since each hash is
+independently unique without coordination.
+
+See [ADAPTIVE_IDS.md](ADAPTIVE_IDS.md) for full documentation on hash-based ID generation.
 
 ### Example: Adaptive Hash ID Configuration
 

@@ -90,11 +90,9 @@ update_file "README.md" "Alpha (v$CURRENT_VERSION)" "Alpha (v$NEW_VERSION)"
 echo "  • default.nix"
 update_file "default.nix" "version = \"$CURRENT_VERSION\";" "version = \"$NEW_VERSION\";"
 
-# 7. Hook templates
-echo "  • cmd/bd/templates/hooks/*"
-for hook in pre-commit post-merge pre-push post-checkout; do
-    update_file "cmd/bd/templates/hooks/$hook" "# bd-hooks-version: $CURRENT_VERSION" "# bd-hooks-version: $NEW_VERSION"
-done
+# 7. Hook templates — now generated dynamically by cmd/bd/hooks.go using the
+# Version constant from version.go. No template files to update.
+# (Previously updated cmd/bd/templates/hooks/* which no longer exist.)
 
 # 8. Windows PE resource metadata
 echo "  • cmd/bd/winres/winres.json"

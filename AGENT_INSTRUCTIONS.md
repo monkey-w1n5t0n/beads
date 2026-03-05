@@ -34,11 +34,11 @@ beads/
 
 ```bash
 # Create test issues in isolated database
-BEADS_DB=/tmp/test.db ./bd init --quiet --prefix test
-BEADS_DB=/tmp/test.db ./bd create "Test issue" -p 1
+BEADS_DB=/tmp/test.db bd init --quiet --prefix test
+BEADS_DB=/tmp/test.db bd create "Test issue" -p 1
 
 # Or for quick testing
-BEADS_DB=/tmp/test.db ./bd create "Test feature" -p 1
+BEADS_DB=/tmp/test.db bd create "Test feature" -p 1
 ```
 
 **For automated tests**, use `t.TempDir()` in Go tests:
@@ -52,6 +52,15 @@ func TestMyFeature(t *testing.T) {
 }
 ```
 
+**Git test isolation:** For tests that create temporary git repos, force repo-local hooks:
+
+```bash
+git config core.hooksPath .git/hooks
+```
+
+Do not rely on the developer's global git config. Global `core.hooksPath` can leak
+into temp repos and produce flaky test behavior.
+
 **Warning:** bd will warn you when creating issues with "Test" prefix in the production database. Always use `BEADS_DB` for manual testing.
 
 ### Before Committing
@@ -60,7 +69,7 @@ func TestMyFeature(t *testing.T) {
    - For full CGO validation: `make test-full-cgo`
 2. **Run linter**: `golangci-lint run ./...` (ignore baseline warnings)
 3. **Update docs**: If you changed behavior, update README.md or other docs
-4. **Commit**: With git hooks installed (`bd hooks install`), JSONL is auto-exported on commit
+4. **Commit**: With git hooks installed (`bd hooks install`), Dolt changes are auto-committed
 
 ### Commit Message Convention
 
@@ -75,24 +84,22 @@ This enables `bd doctor` to detect **orphaned issues** - work that was committed
 
 ### Git Workflow
 
-bd uses **Dolt** as its primary database. Changes are committed to Dolt history automatically (one Dolt commit per write command). JSONL is maintained for git portability via hooks.
+bd uses **Dolt** as its primary database. Changes are committed to Dolt history automatically (one Dolt commit per write command).
 
-**Install git hooks** for automatic JSONL sync:
+**Install git hooks** for automatic sync:
 ```bash
 bd hooks install
 ```
 
-This ensures JSONL is exported on commit and imported after pull/merge.
-
 ### Git Integration
 
-**JSONL portability**: JSONL is exported via git hooks for sharing through git. The Dolt database is the source of truth.
+**Dolt sync**: Dolt handles sync natively via `bd sync`. No JSONL export/import needed.
 
 **Protected branches**: Use `bd init --branch beads-metadata` to commit to separate branch. See [docs/PROTECTED_BRANCHES.md](docs/PROTECTED_BRANCHES.md).
 
 **Git worktrees**: Work directly with Dolt — no special flags needed. See [docs/ADVANCED.md](docs/ADVANCED.md).
 
-**Merge conflicts**: Rare with hash IDs. If conflicts occur in JSONL, use `git checkout --theirs .beads/issues.jsonl` and `bd import`. Dolt uses cell-level 3-way merge for better conflict resolution.
+**Merge conflicts**: Rare with hash IDs. Dolt uses cell-level 3-way merge for conflict resolution.
 
 ## Landing the Plane
 
@@ -110,14 +117,6 @@ This ensures JSONL is exported on commit and imported after pull/merge.
    ```bash
    # Pull first to catch any remote changes
    git pull --rebase
-
-   # If conflicts in .beads/issues.jsonl, resolve thoughtfully:
-   #   - git checkout --theirs .beads/issues.jsonl (accept remote)
-   #   - bd import -i .beads/issues.jsonl (re-import)
-   #   - Or manual merge, then import
-
-   # Sync the database (exports to JSONL, commits)
-   bd sync
 
    # MANDATORY: Push everything to remote
    # DO NOT STOP BEFORE THIS COMMAND COMPLETES
@@ -161,11 +160,6 @@ bd close bd-42 bd-43 --reason "Completed" --json
 
 # 4. PUSH TO REMOTE - MANDATORY, NO STOPPING BEFORE THIS IS DONE
 git pull --rebase
-# If conflicts in .beads/issues.jsonl, resolve thoughtfully:
-#   - git checkout --theirs .beads/issues.jsonl (accept remote)
-#   - bd import -i .beads/issues.jsonl (re-import)
-#   - Or manual merge, then import
-bd sync        # Export/import/commit
 git push       # MANDATORY - THE PLANE IS STILL IN THE AIR UNTIL THIS SUCCEEDS
 git status     # MUST verify "up to date with origin/main"
 
@@ -202,40 +196,35 @@ bd update <id> --notes "additional notes"
 bd update <id> --acceptance "acceptance criteria"
 ```
 
-**IMPORTANT for AI agents:** When you finish making issue changes, always run:
-
+**Use stdin for descriptions with special characters** (backticks, `!`, nested quotes):
 ```bash
-bd sync
-```
+# Pipe via stdin to avoid shell escaping issues
+echo 'Description with `backticks` and "quotes"' | bd create "Title" --stdin
+echo 'Updated description with $variables' | bd update <id> --description=-
 
-This immediately syncs the database with git — exporting JSONL, committing, pulling remote changes, and pushing.
+# Or use --body-file for longer content
+bd create "Title" --body-file=description.md
+```
 
 **Example agent session:**
 
 ```bash
-# Make changes (each write auto-commits to Dolt history)
+# Make changes (each write auto-commits to Dolt)
 bd create "Fix bug" -p 1
 bd create "Add tests" -p 1
-bd update bd-42 --status in_progress
+bd update bd-42 --claim
 bd close bd-40 --reason "Completed"
 
-# Sync at end of session
-bd sync
+# Push Dolt data to remote if configured
+bd dolt push
 
-# Now safe to end session - everything is committed and pushed
-```
-
-**RECOMMENDED: Install git hooks for automatic JSONL sync:**
-
-```bash
-# One-time setup - run this in each beads workspace
-bd hooks install
+# Now safe to end session
 ```
 
 This installs:
 
-- **pre-commit** — Exports Dolt changes to JSONL and stages it
-- **post-merge** — Imports pulled JSONL changes into Dolt
+- **pre-commit** — Commits pending Dolt changes
+- **post-merge** — Pulls remote Dolt changes after git merge
 
 **Note:** Hooks are embedded in the bd binary and work for all bd users (not just source repo users).
 
@@ -246,6 +235,7 @@ This installs:
 **Minimize cognitive overload.** Every new command, flag, or option adds cognitive burden for users. Before adding anything:
 
 1. **Recovery/fix operations → `bd doctor --fix`**: Don't create separate commands like `bd recover` or `bd repair`. Doctor already detects problems - let `--fix` handle remediation. This keeps all health-related operations in one discoverable place.
+   For git hook marker migration specifically: use `bd migrate hooks --dry-run` to preview operations, and `bd doctor --fix` for the standard apply path.
 
 2. **Prefer flags on existing commands**: Before creating a new command, ask: "Can this be a flag on an existing command?" Example: `bd list --stale` instead of `bd stale`.
 
@@ -284,8 +274,8 @@ This installs:
 ## Building and Testing
 
 ```bash
-# Build
-go build -o bd ./cmd/bd
+# Build and install bd to ~/.local/bin (the canonical location)
+make install
 
 # Test (local baseline)
 make test
@@ -297,11 +287,15 @@ make test-full-cgo
 go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
-# Run locally
-./bd init --prefix test
-./bd create "Test issue" -p 1
-./bd ready
+# Verify installed binary
+bd init --prefix test
+bd create "Test issue" -p 1
+bd ready
 ```
+
+> **WARNING**: Do NOT use `go build -o bd ./cmd/bd` or `go install ./cmd/bd`.
+> These create stale binaries in the working directory or `~/go/bin/` that
+> shadow the canonical install at `~/.local/bin/bd`. Always use `make install`.
 
 ## Version Management
 
@@ -417,6 +411,6 @@ gh issue view 201
 
 - **README.md** - Main documentation (keep this updated!)
 - **EXTENDING.md** - Database extension guide
-- **ADVANCED.md** - JSONL format analysis
+- **ADVANCED.md** - Advanced features (rename, merge, compaction)
 - **CONTRIBUTING.md** - Contribution guidelines
 - **SECURITY.md** - Security policy

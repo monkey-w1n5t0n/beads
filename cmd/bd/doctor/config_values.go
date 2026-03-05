@@ -1,7 +1,7 @@
 package doctor
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,11 +9,10 @@ import (
 	"strconv"
 	"strings"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/ncruces/go-sqlite3/embed"
 	"github.com/spf13/viper"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // validRoutingModes are the allowed values for routing.mode
@@ -23,11 +22,6 @@ var validRoutingModes = map[string]bool{
 	"contributor": true,
 	"explicit":    true,
 }
-
-// validBranchNameRegex validates git branch names
-// Git branch names can't contain: space, ~, ^, :, \, ?, *, [
-// Can't start with -, can't end with ., can't contain ..
-var validBranchNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
 
 // validActorRegex validates actor names (alphanumeric with dashes, underscores, dots, and @ for emails)
 var validActorRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._@-]*$`)
@@ -329,20 +323,6 @@ func checkMetadataConfigValues(repoPath string) []string {
 		}
 	}
 
-	// Validate jsonl_export filename
-	if cfg.JSONLExport != "" {
-		switch cfg.JSONLExport {
-		case "deletions.jsonl", "interactions.jsonl", "molecules.jsonl":
-			issues = append(issues, fmt.Sprintf("metadata.json jsonl_export: %q is a system file and should not be configured as a JSONL export (expected issues.jsonl)", cfg.JSONLExport))
-		}
-		if strings.Contains(cfg.JSONLExport, string(os.PathSeparator)) || strings.Contains(cfg.JSONLExport, "/") {
-			issues = append(issues, fmt.Sprintf("metadata.json jsonl_export: %q should be a filename, not a path", cfg.JSONLExport))
-		}
-		if !strings.HasSuffix(cfg.JSONLExport, ".jsonl") {
-			issues = append(issues, fmt.Sprintf("metadata.json jsonl_export: %q should have .jsonl extension", cfg.JSONLExport))
-		}
-	}
-
 	// Validate deletions_retention_days
 	if cfg.DeletionsRetentionDays < 0 {
 		issues = append(issues, fmt.Sprintf("metadata.json deletions_retention_days: %d is invalid (must be >= 0)", cfg.DeletionsRetentionDays))
@@ -360,32 +340,38 @@ func checkDatabaseConfigValues(repoPath string) []string {
 		return issues // No .beads directory, nothing to check
 	}
 
-	// Get database path (backend-aware)
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
-		// For Dolt, cfg.DatabasePath() is a directory and sqlite checks are not applicable.
-		if cfg.GetBackend() == configfile.BackendDolt {
-			return issues
-		}
-		if cfg.Database != "" {
-			dbPath = cfg.DatabasePath(beadsDir)
-		}
+	// Check backend
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		return issues
 	}
 
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	backend := configfile.BackendDolt
+	if cfg != nil {
+		backend = cfg.GetBackend()
+	}
+
+	if backend != configfile.BackendDolt {
+		return issues // Non-Dolt backend, skip database config validation
+	}
+
+	// Check if Dolt directory exists
+	doltPath := getDatabasePath(beadsDir)
+	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
 		return issues // No database, nothing to check
 	}
 
-	// Open database in read-only mode
-	db, err := sql.Open("sqlite3", sqliteConnString(dbPath, true))
+	// Open Dolt store in read-only mode
+	ctx := context.Background()
+	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
-		return issues // Can't open database, skip
+		issues = append(issues, fmt.Sprintf("database: failed to open Dolt store: %v", err))
+		return issues
 	}
-	defer db.Close()
+	defer func() { _ = store.Close() }()
 
 	// Check status.custom - custom status names should be lowercase alphanumeric with underscores
-	var statusCustom string
-	err = db.QueryRow("SELECT value FROM config WHERE key = 'status.custom'").Scan(&statusCustom)
+	statusCustom, err := store.GetConfig(ctx, "status.custom")
 	if err == nil && statusCustom != "" {
 		statuses := strings.Split(statusCustom, ",")
 		for _, status := range statuses {
@@ -405,41 +391,4 @@ func checkDatabaseConfigValues(repoPath string) []string {
 	}
 
 	return issues
-}
-
-// isValidBranchName checks if a string is a valid git branch name
-func isValidBranchName(name string) bool {
-	if name == "" {
-		return false
-	}
-
-	// Can't start with -
-	if strings.HasPrefix(name, "-") {
-		return false
-	}
-
-	// Can't end with . or /
-	if strings.HasSuffix(name, ".") || strings.HasSuffix(name, "/") {
-		return false
-	}
-
-	// Can't contain ..
-	if strings.Contains(name, "..") {
-		return false
-	}
-
-	// Can't contain these characters: space, ~, ^, :, \, ?, *, [
-	invalidChars := []string{" ", "~", "^", ":", "\\", "?", "*", "[", "@{"}
-	for _, char := range invalidChars {
-		if strings.Contains(name, char) {
-			return false
-		}
-	}
-
-	// Can't end with .lock
-	if strings.HasSuffix(name, ".lock") {
-		return false
-	}
-
-	return true
 }

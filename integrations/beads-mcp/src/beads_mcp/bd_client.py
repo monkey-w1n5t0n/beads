@@ -11,6 +11,7 @@ from typing import Any, List, Optional
 from .config import load_config
 from .models import (
     AddDependencyParams,
+    ClaimIssueParams,
     BlockedIssue,
     BlockedParams,
     CloseIssueParams,
@@ -24,6 +25,27 @@ from .models import (
     Stats,
     UpdateIssueParams,
 )
+
+
+def _sanitize_issue_deps(issue: dict) -> dict:
+    """Strip raw dependency records that don't match the LinkedIssue schema.
+
+    bd list/ready/blocked --json returns raw dep records (issue_id, depends_on_id,
+    type, created_at) but the Pydantic Issue model expects enriched LinkedIssue
+    objects (id, title, status, etc.). Replace raw records with empty lists and
+    preserve counts so validation succeeds.
+    """
+    for field, count_field in [
+        ("dependencies", "dependency_count"),
+        ("dependents", "dependent_count"),
+    ]:
+        raw = issue.get(field)
+        if isinstance(raw, list) and raw:
+            # Check if these are raw dep records (have depends_on_id) vs enriched
+            if isinstance(raw[0], dict) and "depends_on_id" in raw[0]:
+                issue[count_field] = len(raw)
+                issue[field] = []
+    return issue
 
 
 class BdError(Exception):
@@ -99,6 +121,11 @@ class BdClientBase(ABC):
     @abstractmethod
     async def update(self, params: UpdateIssueParams) -> Issue:
         """Update an existing issue."""
+        pass
+
+    @abstractmethod
+    async def claim(self, params: ClaimIssueParams) -> Issue:
+        """Atomically claim an issue for work."""
         pass
 
     @abstractmethod
@@ -403,7 +430,7 @@ class BdCliClient(BdClientBase):
         if not isinstance(data, list):
             return []
 
-        return [Issue.model_validate(issue) for issue in data]
+        return [Issue.model_validate(_sanitize_issue_deps(issue)) for issue in data]
 
     async def list_issues(self, params: ListIssuesParams | None = None) -> list[Issue]:
         """List issues with optional filters.
@@ -442,7 +469,7 @@ class BdCliClient(BdClientBase):
         if not isinstance(data, list):
             return []
 
-        return [Issue.model_validate(issue) for issue in data]
+        return [Issue.model_validate(_sanitize_issue_deps(issue)) for issue in data]
 
     async def show(self, params: ShowIssueParams) -> Issue:
         """Show issue details.
@@ -541,6 +568,27 @@ class BdCliClient(BdClientBase):
         
         if not isinstance(data, dict):
             raise BdCommandError(f"Invalid response for update {params.issue_id}")
+
+        return Issue.model_validate(data)
+
+    async def claim(self, params: ClaimIssueParams) -> Issue:
+        """Atomically claim an issue via bd update --claim.
+
+        Args:
+            params: Claim parameters
+
+        Returns:
+            Claimed issue
+        """
+        data = await self._run_command("update", params.issue_id, "--claim")
+        # bd update returns an array, extract first element
+        if isinstance(data, list):
+            if not data:
+                raise BdCommandError(f"Issue not found: {params.issue_id}")
+            data = data[0]
+
+        if not isinstance(data, dict):
+            raise BdCommandError(f"Invalid response for claim {params.issue_id}")
 
         return Issue.model_validate(data)
 
@@ -685,7 +733,7 @@ class BdCliClient(BdClientBase):
         if not isinstance(data, list):
             return []
 
-        return [BlockedIssue.model_validate(issue) for issue in data]
+        return [BlockedIssue.model_validate(_sanitize_issue_deps(issue)) for issue in data]
 
     async def inspect_migration(self) -> dict[str, Any]:
         """Get migration plan and database state for agent analysis.
