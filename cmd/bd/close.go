@@ -17,6 +17,7 @@ import (
 
 var closeCmd = &cobra.Command{
 	Use:     "close [id...]",
+	Aliases: []string{"done"},
 	GroupID: "issues",
 	Short:   "Close one or more issues",
 	Long: `Close one or more issues.
@@ -48,6 +49,14 @@ create, update, show, or close operation).`,
 			// Check --comment alias (desire-path from hq-ftpg)
 			reason, _ = cmd.Flags().GetString("comment")
 		}
+
+		// Desire-path: "bd done <id> <message>" treats last positional arg as reason
+		// when no reason flag was explicitly provided (hq-pe8ce)
+		if reason == "" && cmd.CalledAs() == "done" && len(args) >= 2 {
+			reason = args[len(args)-1]
+			args = args[:len(args)-1]
+		}
+
 		if reason == "" {
 			reason = "Closed"
 		}
@@ -55,6 +64,8 @@ create, update, show, or close operation).`,
 		continueFlag, _ := cmd.Flags().GetBool("continue")
 		noAuto, _ := cmd.Flags().GetBool("no-auto")
 		suggestNext, _ := cmd.Flags().GetBool("suggest-next")
+
+		claimNext, _ := cmd.Flags().GetBool("claim-next")
 
 		// Get session ID from flag or environment variable
 		session, _ := cmd.Flags().GetString("session")
@@ -76,7 +87,7 @@ create, update, show, or close operation).`,
 
 		// Resolve partial IDs first, handling cross-rig routing
 		var resolvedIDs []string
-		var routedArgs []string // IDs that need cross-repo routing (bypass daemon)
+		var routedArgs []string // IDs that need cross-repo routing
 		// Direct mode - check routing for each ID
 		for _, id := range args {
 			if needsRouting(id) {
@@ -102,6 +113,15 @@ create, update, show, or close operation).`,
 			if err := validateIssueClosable(id, issue, force); err != nil {
 				fmt.Fprintf(os.Stderr, "%s\n", err)
 				continue
+			}
+
+			// Epic close guard: prevent closing epics with open children (mw-local-4so.5.2)
+			if !force && issue != nil && issue.IssueType == types.TypeEpic {
+				openChildren := countEpicOpenChildren(ctx, id)
+				if openChildren > 0 {
+					fmt.Fprintf(os.Stderr, "cannot close epic %s: %d open child issue(s); close children first or use --force to override\n", id, openChildren)
+					continue
+				}
 			}
 
 			// Check gate satisfaction for machine-checkable gates (GH#1467)
@@ -259,8 +279,44 @@ create, update, show, or close operation).`,
 			}
 		}
 
+		// Handle --claim-next flag
+		var claimedNextIssue *types.Issue
+		if claimNext && closedCount > 0 && !continueFlag {
+			readyIssues, err := store.GetReadyWork(ctx, types.WorkFilter{
+				Status:     "open",
+				Limit:      1,
+				SortPolicy: types.SortPolicy("priority"),
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not get ready issues: %v\n", err)
+			} else if len(readyIssues) > 0 {
+				nextIssue := readyIssues[0]
+				err := store.ClaimIssue(ctx, nextIssue.ID, actor)
+				if err == nil {
+					claimedNextIssue = nextIssue
+					if jsonOutput {
+						// JSON handled below
+					} else {
+						fmt.Printf("%s Auto-claimed next ready issue: %s (P%d)\n", ui.RenderPass("✓"), formatFeedbackID(nextIssue.ID, nextIssue.Title), nextIssue.Priority)
+					}
+					SetLastTouchedID(nextIssue.ID)
+				} else {
+					fmt.Fprintf(os.Stderr, "Warning: could not claim next issue %s: %v\n", nextIssue.ID, err)
+				}
+			} else if !jsonOutput {
+				fmt.Printf("\n%s No ready issues available to claim.\n", ui.RenderWarn("✨"))
+			}
+		}
+
 		if jsonOutput && len(closedIssues) > 0 {
-			outputJSON(closedIssues)
+			if claimedNextIssue != nil {
+				outputJSON(map[string]interface{}{
+					"closed":  closedIssues,
+					"claimed": claimedNextIssue,
+				})
+			} else {
+				outputJSON(closedIssues)
+			}
 		}
 
 		// Exit non-zero if no issues were actually closed (close guard
@@ -284,6 +340,7 @@ func init() {
 	closeCmd.Flags().Bool("continue", false, "Auto-advance to next step in molecule")
 	closeCmd.Flags().Bool("no-auto", false, "With --continue, show next step but don't claim it")
 	closeCmd.Flags().Bool("suggest-next", false, "Show newly unblocked issues after closing")
+	closeCmd.Flags().Bool("claim-next", false, "Automatically claim the next highest priority available issue")
 	closeCmd.Flags().String("session", "", "Claude Code session ID (or set CLAUDE_SESSION_ID env var)")
 	closeCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(closeCmd)
@@ -386,4 +443,20 @@ func autoCloseCompletedMolecule(ctx context.Context, s *dolt.DoltStore, closedSt
 	if !jsonOutput {
 		fmt.Printf("%s Auto-closed completed molecule %s\n", ui.RenderPass("✓"), formatFeedbackID(moleculeID, root.Title))
 	}
+}
+
+// countEpicOpenChildren returns the number of open (non-closed) children for an epic.
+// Uses GetDependentsWithMetadata to find parent-child relationships.
+func countEpicOpenChildren(ctx context.Context, epicID string) int {
+	dependents, err := store.GetDependentsWithMetadata(ctx, epicID)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, dep := range dependents {
+		if dep.DependencyType == types.DepParentChild && dep.Issue.Status != types.StatusClosed {
+			count++
+		}
+	}
+	return count
 }

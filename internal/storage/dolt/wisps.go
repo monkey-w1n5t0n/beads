@@ -30,7 +30,7 @@ func insertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 			status, priority, issue_type, assignee, estimated_minutes,
 			created_at, created_by, owner, updated_at, closed_at, external_ref, spec_id,
 			compaction_level, compacted_at, compacted_at_commit, original_size,
-			sender, ephemeral, wisp_type, pinned, is_template, crystallizes,
+			sender, ephemeral, no_history, wisp_type, pinned, is_template, crystallizes,
 			mol_type, work_type, quality_score, source_system, source_repo, close_reason,
 			event_kind, actor, target, payload,
 			await_type, await_id, timeout_ns, waiters,
@@ -41,7 +41,7 @@ func insertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 			?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?,
 			?, ?, ?, ?,
@@ -71,7 +71,7 @@ func insertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 		issue.Status, issue.Priority, issue.IssueType, nullString(issue.Assignee), nullInt(issue.EstimatedMinutes),
 		issue.CreatedAt, issue.CreatedBy, issue.Owner, issue.UpdatedAt, issue.ClosedAt, nullStringPtr(issue.ExternalRef), issue.SpecID,
 		issue.CompactionLevel, issue.CompactedAt, nullStringPtr(issue.CompactedAtCommit), nullIntVal(issue.OriginalSize),
-		issue.Sender, issue.Ephemeral, issue.WispType, issue.Pinned, issue.IsTemplate, issue.Crystallizes,
+		issue.Sender, issue.Ephemeral, issue.NoHistory, issue.WispType, issue.Pinned, issue.IsTemplate, issue.Crystallizes,
 		issue.MolType, issue.WorkType, issue.QualityScore, issue.SourceSystem, issue.SourceRepo, issue.CloseReason,
 		issue.EventKind, issue.Actor, issue.Target, issue.Payload,
 		issue.AwaitType, issue.AwaitID, issue.Timeout.Nanoseconds(), formatJSONStringArray(issue.Waiters),
@@ -103,7 +103,7 @@ func scanIssueFromTable(ctx context.Context, db *sql.DB, table, id string) (*typ
 
 // recordEventInTable records an event in the specified events table.
 //
-//nolint:gosec // G201: table is a hardcoded constant ("events" or "wisp_events")
+//nolint:gosec,unparam // G201: table is a hardcoded constant; unparam: table is always "wisp_events" currently but kept for API symmetry with insertIssueIntoTable
 func recordEventInTable(ctx context.Context, tx *sql.Tx, table, issueID string, eventType types.EventType, actor, newValue string) error {
 	_, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %s (issue_id, event_type, actor, old_value, new_value)
@@ -212,89 +212,6 @@ func wispPrefix(configPrefix string, issue *types.Issue) string {
 		return configPrefix + "-" + issue.IDPrefix
 	}
 	return configPrefix + "-wisp"
-}
-
-// createWisp creates an issue in the wisps table.
-func (s *DoltStore) createWisp(ctx context.Context, issue *types.Issue, actor string) error {
-	issue.Ephemeral = true
-
-	// Fetch custom statuses and types for validation (parity with CreateIssue)
-	customStatuses, err := s.GetCustomStatuses(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get custom statuses: %w", err)
-	}
-	customTypes, err := s.GetCustomTypes(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get custom types: %w", err)
-	}
-
-	now := time.Now().UTC()
-	if issue.CreatedAt.IsZero() {
-		issue.CreatedAt = now
-	} else {
-		issue.CreatedAt = issue.CreatedAt.UTC()
-	}
-	if issue.UpdatedAt.IsZero() {
-		issue.UpdatedAt = now
-	} else {
-		issue.UpdatedAt = issue.UpdatedAt.UTC()
-	}
-
-	if issue.Status == types.StatusClosed && issue.ClosedAt == nil {
-		maxTime := issue.CreatedAt
-		if issue.UpdatedAt.After(maxTime) {
-			maxTime = issue.UpdatedAt
-		}
-		closedAt := maxTime.Add(time.Second)
-		issue.ClosedAt = &closedAt
-	}
-
-	// Validate issue fields (parity with CreateIssue)
-	if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
-		return fmt.Errorf("validation failed: %w", err)
-	}
-
-	if issue.ContentHash == "" {
-		issue.ContentHash = issue.ComputeContentHash()
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Get prefix from config
-	var configPrefix string
-	err = tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", "issue_prefix").Scan(&configPrefix)
-	if err == sql.ErrNoRows || configPrefix == "" {
-		return fmt.Errorf("database not initialized: issue_prefix config is missing (run 'bd init --prefix <prefix>' first)")
-	} else if err != nil {
-		return fmt.Errorf("failed to get config: %w", err)
-	}
-
-	// Normalize prefix: strip trailing hyphen to prevent double-hyphen IDs (bd-6uly)
-	configPrefix = strings.TrimSuffix(configPrefix, "-")
-
-	// Generate wisp ID if not provided
-	if issue.ID == "" {
-		prefix := wispPrefix(configPrefix, issue)
-		generatedID, err := generateIssueIDInTable(ctx, tx, "wisps", prefix, issue, actor)
-		if err != nil {
-			return fmt.Errorf("failed to generate wisp ID: %w", err)
-		}
-		issue.ID = generatedID
-	}
-
-	if err := insertIssueIntoTable(ctx, tx, "wisps", issue); err != nil {
-		return fmt.Errorf("failed to insert wisp: %w", err)
-	}
-
-	if err := recordEventInTable(ctx, tx, "wisp_events", issue.ID, types.EventCreated, actor, ""); err != nil {
-		return fmt.Errorf("failed to record creation event: %w", err)
-	}
-
-	return wrapTransactionError("commit create wisp", tx.Commit())
 }
 
 // getWisp retrieves an issue from the wisps table.
@@ -455,21 +372,22 @@ func (s *DoltStore) deleteWisp(ctx context.Context, id string) error {
 	return wrapTransactionError("commit delete wisp", tx.Commit())
 }
 
-// deleteWispBatch permanently removes multiple wisps in a single transaction.
-// This avoids the per-delete transaction overhead that causes Dolt commit pressure
-// during bulk GC operations (bd-2ehd).
+// deleteWispBatch permanently removes multiple wisps using one transaction per
+// batch of 200. Committing per-batch keeps each transaction short enough to
+// complete within Dolt's writeTimeout (10 s), preventing i/o timeout errors
+// when GC-ing hundreds of wisps at once (ff-tqm).
+//
+// Previously the entire set was wrapped in one mega-transaction; at 631 wisps
+// the commit exceeded the driver write timeout and failed with
+// "read tcp …: i/o timeout".
+//
+// Partial cleanup is acceptable: if one batch fails the earlier batches are
+// already committed and the next GC run will handle the remainder.
 func (s *DoltStore) deleteWispBatch(ctx context.Context, ids []string) (int, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Delete in batches to avoid oversized IN-clauses
 	const batchSize = 200
 	totalDeleted := 0
 
@@ -478,44 +396,71 @@ func (s *DoltStore) deleteWispBatch(ctx context.Context, ids []string) (int, err
 		if end > len(ids) {
 			end = len(ids)
 		}
-		batch := ids[i:end]
-		inClause, args := doltBuildSQLInClause(batch)
-
-		// Delete from auxiliary tables using IN-clause batches.
-		// wisp_dependencies needs both issue_id and depends_on_id checked.
-		//nolint:gosec // G201: inClause contains only ? markers
-		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM wisp_dependencies WHERE issue_id IN (%s) OR depends_on_id IN (%s)", inClause, inClause),
-			append(args, args...)...); err != nil {
-			return 0, fmt.Errorf("failed to batch delete from wisp_dependencies: %w", err)
-		}
-
-		for _, table := range []string{"wisp_events", "wisp_comments", "wisp_labels"} {
-			//nolint:gosec // G201: table is a hardcoded constant, inClause contains only ? markers
-			if _, err := tx.ExecContext(ctx,
-				fmt.Sprintf("DELETE FROM %s WHERE issue_id IN (%s)", table, inClause),
-				args...); err != nil {
-				return 0, fmt.Errorf("failed to batch delete from %s: %w", table, err)
-			}
-		}
-
-		// Delete the wisps themselves
-		//nolint:gosec // G201: inClause contains only ? markers
-		result, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM wisps WHERE id IN (%s)", inClause),
-			args...)
+		deleted, err := s.deleteWispBatchTx(ctx, ids[i:end])
 		if err != nil {
-			return 0, fmt.Errorf("failed to batch delete wisps: %w", err)
+			return totalDeleted, err
 		}
-		rowsAffected, _ := result.RowsAffected()
-		totalDeleted += int(rowsAffected)
+		totalDeleted += deleted
 	}
+
+	return totalDeleted, nil
+}
+
+// deleteWispBatchTx deletes one batch of wisps inside its own transaction.
+// Keeping each transaction to ≤200 wisps (6 DELETE statements) ensures it
+// completes well within Dolt's 10 s write timeout.
+func (s *DoltStore) deleteWispBatchTx(ctx context.Context, ids []string) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	inClause, args := doltBuildSQLInClause(ids)
+
+	// Delete from wisp_dependencies using two separate queries rather than a
+	// single OR condition. An OR across issue_id and depends_on_id forces Dolt
+	// to union two index scans in one statement, which is slow enough to trigger
+	// the driver's write timeout on large batches (ff-tqm). Two targeted queries
+	// each use their own index: PRIMARY KEY for issue_id and
+	// idx_wisp_dep_depends for depends_on_id.
+	//nolint:gosec // G201: inClause contains only ? markers
+	if _, err := tx.ExecContext(ctx,
+		fmt.Sprintf("DELETE FROM wisp_dependencies WHERE issue_id IN (%s)", inClause),
+		args...); err != nil {
+		return 0, fmt.Errorf("failed to batch delete from wisp_dependencies (issue_id): %w", err)
+	}
+	//nolint:gosec // G201: inClause contains only ? markers
+	if _, err := tx.ExecContext(ctx,
+		fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_id IN (%s)", inClause),
+		args...); err != nil {
+		return 0, fmt.Errorf("failed to batch delete from wisp_dependencies (depends_on_id): %w", err)
+	}
+
+	for _, table := range []string{"wisp_events", "wisp_comments", "wisp_labels"} {
+		//nolint:gosec // G201: table is a hardcoded constant, inClause contains only ? markers
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf("DELETE FROM %s WHERE issue_id IN (%s)", table, inClause),
+			args...); err != nil {
+			return 0, fmt.Errorf("failed to batch delete from %s: %w", table, err)
+		}
+	}
+
+	// Delete the wisps themselves
+	//nolint:gosec // G201: inClause contains only ? markers
+	result, err := tx.ExecContext(ctx,
+		fmt.Sprintf("DELETE FROM wisps WHERE id IN (%s)", inClause),
+		args...)
+	if err != nil {
+		return 0, fmt.Errorf("failed to batch delete wisps: %w", err)
+	}
+	rowsAffected, _ := result.RowsAffected()
 
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("failed to commit batch wisp delete: %w", err)
 	}
 
-	return totalDeleted, nil
+	return int(rowsAffected), nil
 }
 
 // claimWisp atomically claims a wisp.

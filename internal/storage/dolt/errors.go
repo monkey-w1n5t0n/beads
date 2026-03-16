@@ -4,6 +4,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	mysql "github.com/go-sql-driver/mysql"
 
@@ -87,4 +90,59 @@ func wrapExecError(op string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("%s: %w: %w", op, ErrExec, err)
+}
+
+// databaseNotFoundError builds the "database not found" error with a config-aware
+// hint about sync.git-remote and backup recovery. Extracted from openServerConnection
+// for testability.
+func databaseNotFoundError(cfg *Config) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "database %q not found on Dolt server at %s:%d\n\n", cfg.Database, cfg.ServerHost, cfg.ServerPort)
+
+	// Check if backup files exist — strong signal this is a branch-switch or
+	// fresh-clone scenario rather than a server misconfiguration (GH#2327).
+	if HasBackupFiles(cfg.BeadsDir) {
+		b.WriteString("Backup files found in .beads/backup/ — this may be a branch-switch\n")
+		b.WriteString("or fresh-clone scenario where the Dolt database doesn't exist yet.\n\n")
+		b.WriteString("To restore your issues:\n")
+		b.WriteString("  bd init --prefix <prefix>    # Initialize the database\n")
+		b.WriteString("  bd backup restore            # Restore issues from backup\n\n")
+		b.WriteString("If this is NOT a branch switch, see common causes below.\n\n")
+	}
+
+	b.WriteString("Common causes:\n")
+	b.WriteString("  - Switched git branches (the Dolt database is runtime state, not in git)\n")
+	b.WriteString("  - The server is serving a different data directory than expected\n")
+	b.WriteString("  - The server was restarted and is using a different port\n")
+	b.WriteString("  - Another project's Dolt server is running on this port\n\n")
+	b.WriteString("To diagnose:\n")
+	b.WriteString("  bd doctor                  # Check server and database health\n")
+	b.WriteString("  bd dolt status             # Show which data directory the server is using")
+
+	if cfg.SyncGitRemote != "" {
+		fmt.Fprintf(&b, "\n\nTip: sync.git-remote is configured (%s).\nRun bd init to bootstrap from the remote.", cfg.SyncGitRemote)
+	} else {
+		b.WriteString("\n\nTip: To bootstrap from an existing Dolt remote, set sync.git-remote\nin .beads/config.yaml and re-run bd init.")
+	}
+
+	return errors.New(b.String())
+}
+
+// HasBackupFiles checks whether .beads/backup/ contains any JSONL files,
+// indicating a prior backup that could be restored (GH#2327).
+func HasBackupFiles(beadsDir string) bool {
+	if beadsDir == "" {
+		return false
+	}
+	backupDir := filepath.Join(beadsDir, "backup")
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			return true
+		}
+	}
+	return false
 }

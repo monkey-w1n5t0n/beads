@@ -2,6 +2,7 @@ package dolt
 
 import (
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,7 +16,14 @@ func TestCircuitBreaker_InitiallyAllows(t *testing.T) {
 	}
 }
 
+func TestMaybeNewCircuitBreaker_PortZeroDisabled(t *testing.T) {
+	if cb := maybeNewCircuitBreaker("127.0.0.1", 0); cb != nil {
+		t.Fatalf("maybeNewCircuitBreaker(0) = %#v, want nil", cb)
+	}
+}
+
 func TestCircuitBreaker_TripsAfterThreshold(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "") // need real breaker behavior
 	cb := newTestCircuitBreaker(t)
 
 	// Record failures up to threshold
@@ -72,7 +80,8 @@ func TestCircuitBreaker_SuccessResets(t *testing.T) {
 	}
 }
 
-func TestCircuitBreaker_HalfOpenAfterCooldown(t *testing.T) {
+func TestCircuitBreaker_ActiveProbeAfterCooldown_NoServer(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
 	cb := newTestCircuitBreaker(t)
 
 	// Trip the breaker
@@ -90,66 +99,75 @@ func TestCircuitBreaker_HalfOpenAfterCooldown(t *testing.T) {
 	cb.writeState(state)
 	cb.mu.Unlock()
 
-	// Should transition to half-open and allow one probe
-	if !cb.Allow() {
-		t.Fatal("breaker should allow probe after cooldown")
-	}
-	if cb.State() != circuitHalfOpen {
-		t.Fatalf("expected half-open, got %q", cb.State())
-	}
-
-	// Second request in half-open should be rejected
+	// With no server listening, active probe fails — stays open
 	if cb.Allow() {
-		t.Fatal("half-open breaker should reject non-probe requests")
+		t.Fatal("breaker should reject when active probe fails (no server)")
+	}
+	if cb.State() != circuitOpen {
+		t.Fatalf("expected open after failed probe, got %q", cb.State())
 	}
 }
 
-func TestCircuitBreaker_HalfOpenProbeSuccess(t *testing.T) {
-	cb := newTestCircuitBreaker(t)
+func TestCircuitBreaker_ActiveProbeAfterCooldown_ServerUp(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	// Start a TCP listener to simulate a healthy server
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start test listener: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
 
-	// Trip and simulate cooldown
+	cb := newTestCircuitBreakerOnPort(t, port)
+
+	// Trip the breaker
 	for i := 0; i < circuitFailureThreshold; i++ {
 		cb.RecordFailure()
 	}
+
+	// Simulate cooldown
 	cb.mu.Lock()
 	state := cb.readState()
 	state.TrippedAt = time.Now().Add(-circuitCooldown - time.Second)
 	cb.writeState(state)
 	cb.mu.Unlock()
 
-	// Allow probe
-	cb.Allow()
-	// Probe succeeds
-	cb.RecordSuccess()
-
+	// Active probe should succeed — transitions directly to closed
+	if !cb.Allow() {
+		t.Fatal("breaker should allow after successful active probe")
+	}
 	if cb.State() != circuitClosed {
 		t.Fatalf("expected closed after successful probe, got %q", cb.State())
 	}
-	if !cb.Allow() {
-		t.Fatal("should allow requests after probe success")
-	}
 }
 
-func TestCircuitBreaker_HalfOpenProbeFailure(t *testing.T) {
-	cb := newTestCircuitBreaker(t)
-
-	// Trip and simulate cooldown
-	for i := 0; i < circuitFailureThreshold; i++ {
-		cb.RecordFailure()
+func TestCircuitBreaker_LegacyHalfOpenState(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	// If a state file has half-open from an older version, the breaker
+	// should handle it gracefully via active probe.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start test listener: %v", err)
 	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	cb := newTestCircuitBreakerOnPort(t, port)
+
+	// Manually write a half-open state (simulating old breaker)
 	cb.mu.Lock()
-	state := cb.readState()
-	state.TrippedAt = time.Now().Add(-circuitCooldown - time.Second)
-	cb.writeState(state)
+	cb.writeState(circuitState{
+		State:    circuitHalfOpen,
+		Failures: circuitFailureThreshold,
+	})
 	cb.mu.Unlock()
 
-	// Allow probe
-	cb.Allow()
-	// Probe fails — should re-trip
-	cb.RecordFailure()
-
-	if cb.State() != circuitOpen {
-		t.Fatalf("expected open after failed probe, got %q", cb.State())
+	// With server up, probe succeeds → closed
+	if !cb.Allow() {
+		t.Fatal("legacy half-open with server up should allow via active probe")
+	}
+	if cb.State() != circuitClosed {
+		t.Fatalf("expected closed, got %q", cb.State())
 	}
 }
 
@@ -174,12 +192,13 @@ func TestCircuitBreaker_Reset(t *testing.T) {
 }
 
 func TestCircuitBreaker_SharedState(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
 	// Two breakers for the same port should share state via the file
 	dir := t.TempDir()
 	path := filepath.Join(dir, "circuit.json")
 
-	cb1 := &circuitBreaker{port: 99999, filePath: path}
-	cb2 := &circuitBreaker{port: 99999, filePath: path}
+	cb1 := &circuitBreaker{host: "127.0.0.1", port: 99999, filePath: path}
+	cb2 := &circuitBreaker{host: "127.0.0.1", port: 99999, filePath: path}
 
 	// Trip via cb1
 	for i := 0; i < circuitFailureThreshold; i++ {
@@ -192,6 +211,39 @@ func TestCircuitBreaker_SharedState(t *testing.T) {
 	}
 	if cb2.Allow() {
 		t.Fatal("cb2 should reject when breaker is open")
+	}
+}
+
+func TestCircuitBreaker_DifferentHostsSeparateState(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	// Two breakers for the same port but different hosts should have independent state.
+	// This is the core fix: previously keyed on port only, which caused cross-host blocking.
+	cb1 := newCircuitBreaker("127.0.0.1", 99999)
+	cb2 := newCircuitBreaker("10.0.0.1", 99999)
+	t.Cleanup(func() {
+		os.Remove(cb1.filePath)
+		os.Remove(cb2.filePath)
+	})
+
+	// Verify different file paths
+	if cb1.filePath == cb2.filePath {
+		t.Fatalf("different hosts should have different file paths: %s vs %s", cb1.filePath, cb2.filePath)
+	}
+
+	// Trip cb1
+	for i := 0; i < circuitFailureThreshold; i++ {
+		cb1.RecordFailure()
+	}
+	if cb1.State() != circuitOpen {
+		t.Fatal("cb1 should be open")
+	}
+
+	// cb2 should be unaffected
+	if cb2.State() != circuitClosed {
+		t.Fatalf("cb2 should be closed (independent of cb1), got %q", cb2.State())
+	}
+	if !cb2.Allow() {
+		t.Fatal("cb2 should allow requests (independent of cb1)")
 	}
 }
 
@@ -246,11 +298,24 @@ func TestIsConnectionError(t *testing.T) {
 }
 
 // newTestCircuitBreaker creates a circuit breaker with a temp file for testing.
+// Uses port 99999 which has no listener, so active probes will fail.
 func newTestCircuitBreaker(t *testing.T) *circuitBreaker {
 	t.Helper()
 	dir := t.TempDir()
 	return &circuitBreaker{
+		host:     "127.0.0.1",
 		port:     99999,
+		filePath: filepath.Join(dir, "circuit.json"),
+	}
+}
+
+// newTestCircuitBreakerOnPort creates a circuit breaker targeting a specific port.
+func newTestCircuitBreakerOnPort(t *testing.T, port int) *circuitBreaker {
+	t.Helper()
+	dir := t.TempDir()
+	return &circuitBreaker{
+		host:     "127.0.0.1",
+		port:     port,
 		filePath: filepath.Join(dir, "circuit.json"),
 	}
 }

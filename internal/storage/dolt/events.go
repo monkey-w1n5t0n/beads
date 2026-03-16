@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -56,23 +57,22 @@ func (s *DoltStore) GetEvents(ctx context.Context, issueID string, limit int) ([
 	return scanEvents(rows)
 }
 
-// GetAllEventsSince returns all events with ID greater than sinceID, ordered by creation time.
-// Queries both events and wisp_events tables. Uses created_at ordering instead of id
-// because events and wisp_events have independent auto-increment sequences whose IDs
-// can collide, making ORDER BY id ambiguous across the UNION.
-func (s *DoltStore) GetAllEventsSince(ctx context.Context, sinceID int64) ([]*types.Event, error) {
+// GetAllEventsSince returns all events created after the given time, ordered by creation time.
+// Queries both events and wisp_events tables. Uses created_at for filtering because
+// event IDs are UUIDs (not sequential integers) and cannot be used as high-water marks.
+func (s *DoltStore) GetAllEventsSince(ctx context.Context, since time.Time) ([]*types.Event, error) {
 	rows, err := s.queryContext(ctx, `
 		SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
 		FROM events
-		WHERE id > ?
+		WHERE created_at > ?
 		UNION ALL
 		SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
 		FROM wisp_events
-		WHERE id > ?
+		WHERE created_at > ?
 		ORDER BY created_at ASC, id ASC
-	`, sinceID, sinceID)
+	`, since, since)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get events since %d: %w", sinceID, err)
+		return nil, fmt.Errorf("failed to get events since %v: %w", since, err)
 	}
 	defer rows.Close()
 
@@ -109,17 +109,14 @@ func (s *DoltStore) ImportIssueComment(ctx context.Context, issueID, author, tex
 
 	createdAt = createdAt.UTC()
 	//nolint:gosec // G201: table is hardcoded
-	result, err := s.execContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (issue_id, author, text, created_at)
-		VALUES (?, ?, ?, ?)
-	`, commentTable), issueID, author, text, createdAt)
+	id := uuid.Must(uuid.NewV7()).String()
+	//nolint:gosec // G201: table is hardcoded
+	_, err := s.execContext(ctx, fmt.Sprintf(`
+		INSERT INTO %s (id, issue_id, author, text, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, commentTable), id, issueID, author, text, createdAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to add comment: %w", err)
-	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get comment id: %w", err)
 	}
 
 	return &types.Comment{
@@ -143,7 +140,7 @@ func (s *DoltStore) GetIssueComments(ctx context.Context, issueID string) ([]*ty
 		SELECT id, issue_id, author, text, created_at
 		FROM %s
 		WHERE issue_id = ?
-		ORDER BY created_at ASC
+		ORDER BY created_at ASC, id ASC
 	`, table), issueID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get comments: %w", err)
@@ -180,36 +177,44 @@ func (s *DoltStore) GetCommentsForIssues(ctx context.Context, issueIDs []string)
 }
 
 // getCommentsForIDsInto queries comments from the specified table and merges into result.
+// Uses batched IN clauses (queryBatchSize) to avoid full table scans on Dolt with large ID sets.
 func (s *DoltStore) getCommentsForIDsInto(ctx context.Context, table string, ids []string, result map[string][]*types.Comment) error {
-	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-
-	//nolint:gosec // G201: table is hardcoded, placeholders contains only ? markers
-	query := fmt.Sprintf(`
-		SELECT id, issue_id, author, text, created_at
-		FROM %s
-		WHERE issue_id IN (%s)
-		ORDER BY issue_id, created_at ASC
-	`, table, joinStrings(placeholders, ","))
-
-	rows, err := s.queryContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to get comments from %s: %w", table, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var c types.Comment
-		if err := rows.Scan(&c.ID, &c.IssueID, &c.Author, &c.Text, &c.CreatedAt); err != nil {
-			return fmt.Errorf("failed to scan comment: %w", err)
+	for start := 0; start < len(ids); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(ids) {
+			end = len(ids)
 		}
-		result[c.IssueID] = append(result[c.IssueID], &c)
+		batch := ids[start:end]
+		placeholders, args := doltBuildSQLInClause(batch)
+
+		//nolint:gosec // G201: table is hardcoded, placeholders contains only ? markers
+		query := fmt.Sprintf(`
+			SELECT id, issue_id, author, text, created_at
+			FROM %s
+			WHERE issue_id IN (%s)
+			ORDER BY issue_id, created_at ASC, id ASC
+		`, table, placeholders)
+
+		rows, err := s.queryContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("failed to get comments from %s: %w", table, err)
+		}
+
+		for rows.Next() {
+			var c types.Comment
+			if err := rows.Scan(&c.ID, &c.IssueID, &c.Author, &c.Text, &c.CreatedAt); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("failed to scan comment: %w", err)
+			}
+			result[c.IssueID] = append(result[c.IssueID], &c)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		_ = rows.Close()
 	}
-	return rows.Err()
+	return nil
 }
 
 // GetCommentCounts returns the number of comments for each issue in a single batch query.
@@ -239,37 +244,45 @@ func (s *DoltStore) GetCommentCounts(ctx context.Context, issueIDs []string) (ma
 }
 
 // getCommentCountsInto queries comment counts from the specified table and merges into result.
+// Uses batched IN clauses (queryBatchSize) to avoid full table scans on Dolt with large ID sets.
 func (s *DoltStore) getCommentCountsInto(ctx context.Context, table string, ids []string, result map[string]int) error {
-	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-
-	//nolint:gosec // G201: table is hardcoded, placeholders contains only ? markers
-	query := fmt.Sprintf(`
-		SELECT issue_id, COUNT(*) as comment_count
-		FROM %s
-		WHERE issue_id IN (%s)
-		GROUP BY issue_id
-	`, table, joinStrings(placeholders, ","))
-
-	rows, err := s.queryContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to get comment counts from %s: %w", table, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var issueID string
-		var count int
-		if err := rows.Scan(&issueID, &count); err != nil {
-			return fmt.Errorf("failed to scan comment count: %w", err)
+	for start := 0; start < len(ids); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(ids) {
+			end = len(ids)
 		}
-		result[issueID] = count
+		batch := ids[start:end]
+		placeholders, args := doltBuildSQLInClause(batch)
+
+		//nolint:gosec // G201: table is hardcoded, placeholders contains only ? markers
+		query := fmt.Sprintf(`
+			SELECT issue_id, COUNT(*) as comment_count
+			FROM %s
+			WHERE issue_id IN (%s)
+			GROUP BY issue_id
+		`, table, placeholders)
+
+		rows, err := s.queryContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("failed to get comment counts from %s: %w", table, err)
+		}
+
+		for rows.Next() {
+			var issueID string
+			var count int
+			if err := rows.Scan(&issueID, &count); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("failed to scan comment count: %w", err)
+			}
+			result[issueID] = count
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		_ = rows.Close()
 	}
-	return rows.Err()
+	return nil
 }
 
 // scanEvents scans event rows into a slice.

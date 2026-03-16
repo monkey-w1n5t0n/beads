@@ -45,13 +45,101 @@ release_has_asset() {
     return 1
 }
 
-# Re-sign binary for macOS to avoid slow Gatekeeper checks
-# See: https://github.com/steveyegge/beads/issues/466
+download_file() {
+    local url=$1
+    local output_path=$2
+
+    if command -v curl &> /dev/null; then
+        curl -fsSL -o "$output_path" "$url"
+        return $?
+    fi
+
+    if command -v wget &> /dev/null; then
+        wget -q -O "$output_path" "$url"
+        return $?
+    fi
+
+    log_error "Neither curl nor wget found. Please install one of them."
+    return 1
+}
+
+sha256_file() {
+    local file_path=$1
+
+    if command -v sha256sum &> /dev/null; then
+        sha256sum "$file_path" | awk '{print $1}'
+        return 0
+    fi
+
+    if command -v shasum &> /dev/null; then
+        shasum -a 256 "$file_path" | awk '{print $1}'
+        return 0
+    fi
+
+    if command -v openssl &> /dev/null; then
+        openssl dgst -sha256 "$file_path" | awk '{print $2}'
+        return 0
+    fi
+
+    return 1
+}
+
+verify_release_checksum() {
+    local release_json=$1
+    local version=$2
+    local archive_name=$3
+    local archive_path=$4
+
+    local checksums_name="checksums.txt"
+    local checksums_url="https://github.com/steveyegge/beads/releases/download/${version}/${checksums_name}"
+
+    if ! release_has_asset "$release_json" "$checksums_name"; then
+        log_error "Release metadata is missing ${checksums_name}; refusing to install unverified binary"
+        return 1
+    fi
+
+    if ! download_file "$checksums_url" "$checksums_name"; then
+        log_error "Failed to download ${checksums_name}; refusing to install unverified binary"
+        return 1
+    fi
+
+    local expected
+    expected=$(awk -v target="$archive_name" '{name=$2; sub(/^\*/, "", name); if (name == target) {print $1; exit}}' "$checksums_name")
+    if [ -z "$expected" ]; then
+        log_error "No checksum entry found for ${archive_name} in ${checksums_name}"
+        return 1
+    fi
+
+    local actual
+    actual=$(sha256_file "$archive_path") || {
+        log_error "No SHA256 tool found (need one of: sha256sum, shasum, openssl)"
+        return 1
+    }
+
+    if [ "$expected" != "$actual" ]; then
+        log_error "Checksum mismatch for ${archive_name}; refusing to install"
+        return 1
+    fi
+
+    log_success "Checksum verified for ${archive_name}"
+    return 0
+}
+
+# Re-sign binary for macOS only when explicitly requested.
+# This replaces the upstream signature with a local ad-hoc signature.
 resign_for_macos() {
     local binary_path=$1
 
     # Only run on macOS
     if [[ "$(uname -s)" != "Darwin" ]]; then
+        return 0
+    fi
+
+    # Keep re-signing opt-in so users can decide whether to preserve
+    # the release signature/Gatekeeper behavior.
+    if [ "${BEADS_INSTALL_RESIGN_MACOS:-0}" != "1" ]; then
+        log_info "Skipping macOS ad-hoc re-signing (default)"
+        log_info "Set BEADS_INSTALL_RESIGN_MACOS=1 to opt in"
         return 0
     fi
 
@@ -61,7 +149,7 @@ resign_for_macos() {
         return 0
     fi
 
-    log_info "Re-signing binary for macOS..."
+    log_warning "Opt-in macOS re-sign enabled: replacing release signature with local ad-hoc signature"
     codesign --remove-signature "$binary_path" 2>/dev/null || true
     if codesign --force --sign - "$binary_path"; then
         log_success "Binary re-signed for this machine"
@@ -73,6 +161,40 @@ resign_for_macos() {
 # Detect OS and architecture
 detect_platform() {
     local os arch
+
+    # Detect Windows environments where this bash script won't produce a usable install.
+    # MSYS2, Git Bash, and Cygwin report MINGW*, MSYS*, or CYGWIN* from uname -s.
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            log_error "Windows detected ($(uname -s))."
+            echo ""
+            echo "  This bash installer is for macOS/Linux. On Windows, use the PowerShell installer:"
+            echo ""
+            echo "    irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex"
+            echo ""
+            exit 1
+            ;;
+    esac
+
+    # Detect WSL (Windows Subsystem for Linux).
+    # WSL reports uname -s as "Linux" but installs into the Linux filesystem,
+    # which is not accessible from native Windows tools.
+    if [ -f /proc/version ] && grep -qi 'microsoft\|wsl' /proc/version 2>/dev/null; then
+        log_warning "WSL (Windows Subsystem for Linux) detected."
+        echo ""
+        echo "  This will install the Linux version of bd, usable only inside WSL."
+        echo "  If you want bd available in native Windows (PowerShell, cmd), use:"
+        echo ""
+        echo "    irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex"
+        echo ""
+        # Only show interactive message and pause if running in a terminal (skip in CI/non-interactive shells)
+        if [ -t 0 ]; then
+            echo "  Continuing with Linux install for WSL in 5 seconds... (Ctrl+C to cancel)"
+            sleep 5
+        else
+            echo "  Continuing with Linux install (non-interactive mode)..."
+        fi
+    fi
 
     case "$(uname -s)" in
         Darwin)
@@ -168,20 +290,18 @@ install_from_release() {
     log_info "Downloading $archive_name..."
     
     cd "$tmp_dir"
-    if command -v curl &> /dev/null; then
-        if ! curl -fsSL -o "$archive_name" "$download_url"; then
-            log_error "Download failed"
-            cd - > /dev/null || cd "$HOME"
-            rm -rf "$tmp_dir"
-            return 1
-        fi
-    elif command -v wget &> /dev/null; then
-        if ! wget -q -O "$archive_name" "$download_url"; then
-            log_error "Download failed"
-            cd - > /dev/null || cd "$HOME"
-            rm -rf "$tmp_dir"
-            return 1
-        fi
+    if ! download_file "$download_url" "$archive_name"; then
+        log_error "Download failed"
+        cd - > /dev/null || cd "$HOME"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    log_info "Verifying release checksum..."
+    if ! verify_release_checksum "$release_json" "$version" "$archive_name" "$archive_name"; then
+        cd - > /dev/null || cd "$HOME"
+        rm -rf "$tmp_dir"
+        return 1
     fi
 
     # Extract archive
@@ -209,7 +329,7 @@ install_from_release() {
         sudo mv bd "$install_dir/"
     fi
 
-    # Re-sign for macOS to avoid Gatekeeper delays
+    # Optional local ad-hoc re-sign for macOS (off by default)
     resign_for_macos "$install_dir/bd"
 
     # Create 'beads' alias symlink
@@ -305,7 +425,7 @@ install_with_go() {
             return 1
         fi
 
-        # Re-sign for macOS to avoid Gatekeeper delays
+        # Optional local ad-hoc re-sign for macOS (off by default)
         resign_for_macos "$bin_dir/bd"
 
         # Create 'beads' alias symlink
@@ -365,7 +485,7 @@ build_from_source() {
                 sudo mv bd "$install_dir/"
             fi
 
-            # Re-sign for macOS to avoid Gatekeeper delays
+            # Optional local ad-hoc re-sign for macOS (off by default)
             resign_for_macos "$install_dir/bd"
 
             # Create 'beads' alias symlink
@@ -554,7 +674,8 @@ main() {
     echo ""
     echo "Manual installation:"
     echo "  1. Download from https://github.com/steveyegge/beads/releases/latest"
-    echo "  2. Extract and move 'bd' to your PATH"
+    echo "  2. Verify SHA256 checksum against checksums.txt"
+    echo "  3. Extract and move 'bd' to your PATH"
     echo ""
     echo "Or install from source:"
     echo "  1. Install Go from https://go.dev/dl/"

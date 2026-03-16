@@ -78,7 +78,10 @@ func resolveAndGetIssueWithRouting(ctx context.Context, localStore *dolt.DoltSto
 	// Check if this ID routes to a different beads directory.
 	beadsDir := filepath.Dir(dbPath)
 	targetDir, routed, routeErr := routing.ResolveBeadsDirForID(ctx, id, beadsDir)
-	routesDifferently := routeErr == nil && routed && targetDir != beadsDir
+	// Redirects may resolve back to the same .beads directory but with a different
+	// dolt_database. ResolveBeadsDirForID sets BEADS_DOLT_SERVER_DATABASE when a
+	// redirect changes the database, so we check for that too.
+	routesDifferently := routeErr == nil && routed && (targetDir != beadsDir || os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "")
 
 	// When routing says this ID belongs to a different database, go directly
 	// to the routed store. Checking the local store first would risk finding
@@ -97,8 +100,23 @@ func resolveAndGetIssueWithRouting(ctx context.Context, localStore *dolt.DoltSto
 		return result, nil
 	}
 
-	// No cross-database routing — use local store.
-	return resolveAndGetFromStore(ctx, localStore, id, false)
+	// No cross-database routing — try local store first.
+	result, err := resolveAndGetFromStore(ctx, localStore, id, false)
+	if err == nil {
+		return result, nil
+	}
+
+	// If not found locally, try contributor auto-routing as fallback (GH#2345).
+	// Commands like show/update/close use this function but previously never
+	// checked the auto-routed store, so issues created via contributor
+	// auto-routing were invisible to them.
+	if isNotFoundErr(err) {
+		if autoResult, autoErr := resolveViaAutoRouting(ctx, localStore, id); autoErr == nil {
+			return autoResult, nil
+		}
+	}
+
+	return nil, err
 }
 
 // resolveAndGetFromStore resolves a partial ID and gets the issue from a specific store.
@@ -121,6 +139,24 @@ func resolveAndGetFromStore(ctx context.Context, s *dolt.DoltStore, id string, r
 		Routed:     routed,
 		ResolvedID: resolvedID,
 	}, nil
+}
+
+// resolveViaAutoRouting attempts to find an issue using contributor auto-routing.
+// This is the fallback when prefix-based routing and local store both fail (GH#2345).
+// Returns a RoutedResult if the issue is found in the auto-routed store.
+func resolveViaAutoRouting(ctx context.Context, localStore *dolt.DoltStore, id string) (*RoutedResult, error) {
+	routedStore, routed, err := openRoutedReadStore(ctx, localStore)
+	if err != nil || !routed {
+		return nil, fmt.Errorf("no auto-routed store available")
+	}
+
+	result, err := resolveAndGetFromStore(ctx, routedStore, id, true)
+	if err != nil {
+		_ = routedStore.Close()
+		return nil, err
+	}
+	result.closeFn = func() { _ = routedStore.Close() }
+	return result, nil
 }
 
 // openStoreForRig opens a read-only storage connection to a different rig's database.
@@ -171,7 +207,10 @@ func getIssueWithRouting(ctx context.Context, localStore *dolt.DoltStore, id str
 	// Check if this ID routes to a different beads directory.
 	beadsDir := filepath.Dir(dbPath)
 	targetDir, routed, routeErr := routing.ResolveBeadsDirForID(ctx, id, beadsDir)
-	routesDifferently := routeErr == nil && routed && targetDir != beadsDir
+	// Redirects may resolve back to the same .beads directory but with a different
+	// dolt_database. ResolveBeadsDirForID sets BEADS_DOLT_SERVER_DATABASE when a
+	// redirect changes the database, so we check for that too.
+	routesDifferently := routeErr == nil && routed && (targetDir != beadsDir || os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "")
 
 	if routesDifferently {
 		routedStore, err := dolt.NewFromConfig(ctx, targetDir)
@@ -195,17 +234,25 @@ func getIssueWithRouting(ctx context.Context, localStore *dolt.DoltStore, id str
 		}, nil
 	}
 
-	// No cross-database routing — use local store.
+	// No cross-database routing — try local store first.
 	issue, err := localStore.GetIssue(ctx, id)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		return &RoutedResult{
+			Issue:      issue,
+			Store:      localStore,
+			Routed:     false,
+			ResolvedID: id,
+		}, nil
 	}
-	return &RoutedResult{
-		Issue:      issue,
-		Store:      localStore,
-		Routed:     false,
-		ResolvedID: id,
-	}, nil
+
+	// If not found locally, try contributor auto-routing as fallback (GH#2345).
+	if isNotFoundErr(err) {
+		if autoResult, autoErr := resolveViaAutoRouting(ctx, localStore, id); autoErr == nil {
+			return autoResult, nil
+		}
+	}
+
+	return nil, err
 }
 
 // getRoutedStoreForID returns a storage connection for an issue ID if routing is needed.
@@ -222,7 +269,7 @@ func getRoutedStoreForID(ctx context.Context, id string) (*routing.RoutedStorage
 }
 
 // needsRouting checks if an ID would be routed to a different beads directory.
-// This is used to decide whether to bypass the daemon for cross-repo lookups.
+// This is used to decide whether to use direct store access for cross-repo lookups.
 func needsRouting(id string) bool {
 	if dbPath == "" || beadsDirOverride() {
 		return false

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -28,7 +29,8 @@ const (
 	circuitFailureWindow = 60 * time.Second
 
 	// circuitCooldown is how long to stay open before allowing a half-open probe.
-	circuitCooldown = 30 * time.Second
+	// Keep this short — planned restarts (e.g. gt dolt sync) only take 2-3s.
+	circuitCooldown = 5 * time.Second
 )
 
 // circuitState is the shared file-based circuit breaker state.
@@ -42,10 +44,11 @@ type circuitState struct {
 	TrippedAt    time.Time `json:"tripped_at,omitempty"`
 }
 
-// circuitBreaker manages the circuit breaker for a specific Dolt server port.
+// circuitBreaker manages the circuit breaker for a specific Dolt server host:port.
 // It uses a file in /tmp for cross-process state sharing and an in-process
 // mutex for thread safety within a single process.
 type circuitBreaker struct {
+	host     string
 	port     int
 	filePath string
 	mu       sync.Mutex
@@ -54,18 +57,43 @@ type circuitBreaker struct {
 // ErrCircuitOpen is returned when the circuit breaker is open and rejecting requests.
 var ErrCircuitOpen = fmt.Errorf("dolt circuit breaker is open: server appears down, failing fast (cooldown %s)", circuitCooldown)
 
-// newCircuitBreaker creates a circuit breaker for the given Dolt server port.
-func newCircuitBreaker(port int) *circuitBreaker {
+// maybeNewCircuitBreaker returns a file-backed circuit breaker only for a
+// concrete port. Port 0 means "not yet resolved" during standalone auto-start,
+// and sharing breaker state on port 0 poisons every fresh init on the machine.
+func maybeNewCircuitBreaker(host string, port int) *circuitBreaker {
+	if port <= 0 {
+		return nil
+	}
+	return newCircuitBreaker(host, port)
+}
+
+// newCircuitBreaker creates a circuit breaker for the given Dolt server host:port.
+func newCircuitBreaker(host string, port int) *circuitBreaker {
+	// Sanitize host for use in filename (replace dots/colons with dashes)
+	safeHost := strings.NewReplacer(".", "-", ":", "-").Replace(host)
 	return &circuitBreaker{
+		host:     host,
 		port:     port,
-		filePath: fmt.Sprintf("/tmp/beads-dolt-circuit-%d.json", port),
+		filePath: fmt.Sprintf("/tmp/beads-dolt-circuit-%s-%d.json", safeHost, port),
 	}
 }
 
 // Allow checks whether a request should be allowed through.
 // Returns true if the circuit is closed or half-open (probe allowed).
 // Returns false if the circuit is open and cooldown hasn't elapsed.
+//
+// When the cooldown elapses, Allow performs an active TCP health probe
+// rather than passively waiting for the next request to succeed or fail.
+// If the probe succeeds, the breaker resets to closed immediately. This
+// avoids the half-open→open re-trip race that can leave the breaker stuck.
 func (cb *circuitBreaker) Allow() bool {
+	// In test mode, bypass the circuit breaker entirely. Tests manage their
+	// own server lifecycle via testcontainers, and the file-based breaker
+	// state persists across test runs causing cascading false-positive trips.
+	if os.Getenv("BEADS_TEST_MODE") == "1" {
+		return true
+	}
+
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
@@ -73,20 +101,52 @@ func (cb *circuitBreaker) Allow() bool {
 	switch state.State {
 	case circuitOpen:
 		if time.Since(state.TrippedAt) >= circuitCooldown {
-			// Cooldown elapsed — transition to half-open, allow one probe
-			state.State = circuitHalfOpen
+			// Cooldown elapsed — actively probe the server
+			if cb.probe() {
+				state.State = circuitClosed
+				state.Failures = 0
+				state.FirstFailure = time.Time{}
+				cb.writeState(state)
+				log.Printf("[circuit-breaker] %s:%d: open → closed (active probe succeeded)", cb.host, cb.port)
+				return true
+			}
+			// Probe failed — stay open, reset the tripped timer
+			state.TrippedAt = time.Now()
 			cb.writeState(state)
-			log.Printf("[circuit-breaker] port %d: open → half-open (cooldown elapsed, allowing probe)", cb.port)
-			return true
+			log.Printf("[circuit-breaker] %s:%d: open → open (active probe failed, cooldown reset)", cb.host, cb.port)
+			return false
 		}
 		return false
 	case circuitHalfOpen:
-		// Only one probe at a time — reject additional requests while probing.
-		// The probe caller will call RecordSuccess or RecordFailure.
+		// Legacy state from older breaker versions — treat as open with
+		// immediate probe since we no longer use half-open passively.
+		if cb.probe() {
+			state.State = circuitClosed
+			state.Failures = 0
+			state.FirstFailure = time.Time{}
+			cb.writeState(state)
+			log.Printf("[circuit-breaker] %s:%d: half-open → closed (active probe succeeded)", cb.host, cb.port)
+			return true
+		}
+		state.State = circuitOpen
+		state.TrippedAt = time.Now()
+		cb.writeState(state)
+		log.Printf("[circuit-breaker] %s:%d: half-open → open (active probe failed)", cb.host, cb.port)
 		return false
 	default:
 		return true
 	}
+}
+
+// probe performs a quick TCP dial to check if the Dolt server is reachable.
+func (cb *circuitBreaker) probe() bool {
+	addr := net.JoinHostPort(cb.host, fmt.Sprintf("%d", cb.port))
+	conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // RecordSuccess records a successful connection. Resets the breaker to closed.
@@ -96,7 +156,7 @@ func (cb *circuitBreaker) RecordSuccess() {
 
 	state := cb.readState()
 	if state.State == circuitHalfOpen {
-		log.Printf("[circuit-breaker] port %d: half-open → closed (probe succeeded)", cb.port)
+		log.Printf("[circuit-breaker] %s:%d: half-open → closed (probe succeeded)", cb.host, cb.port)
 	}
 	// Reset to clean closed state
 	cb.writeState(circuitState{State: circuitClosed})
@@ -117,7 +177,7 @@ func (cb *circuitBreaker) RecordFailure() {
 		state.TrippedAt = now
 		state.LastFailure = now
 		cb.writeState(state)
-		log.Printf("[circuit-breaker] port %d: half-open → open (probe failed)", cb.port)
+		log.Printf("[circuit-breaker] %s:%d: half-open → open (probe failed)", cb.host, cb.port)
 		return
 
 	case circuitOpen:
@@ -144,8 +204,8 @@ func (cb *circuitBreaker) RecordFailure() {
 			state.State = circuitOpen
 			state.TrippedAt = now
 			cb.writeState(state)
-			log.Printf("[circuit-breaker] port %d: closed → open (tripped after %d failures in %s)",
-				cb.port, state.Failures, now.Sub(state.FirstFailure).Round(time.Millisecond))
+			log.Printf("[circuit-breaker] %s:%d: closed → open (tripped after %d failures in %s)",
+				cb.host, cb.port, state.Failures, now.Sub(state.FirstFailure).Round(time.Millisecond))
 			return
 		}
 

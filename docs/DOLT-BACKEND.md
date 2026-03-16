@@ -38,8 +38,7 @@ dolt version
 # New project (Dolt is the default backend)
 bd init
 
-# Or convert existing SQLite database (legacy installations)
-bd migrate --to-dolt
+# For legacy SQLite installations, see Migration from SQLite below
 ```
 
 ### 3. Configure Sync Mode
@@ -75,9 +74,10 @@ dolt:
 |---------------------|---------|-------------|
 | `BEADS_DOLT_SERVER_MODE` | `1` | Enable/disable server mode (`1`/`0`) |
 | `BEADS_DOLT_SERVER_HOST` | `127.0.0.1` | Server bind address |
-| `BEADS_DOLT_SERVER_PORT` | `3306` | Server port (MySQL protocol) |
+| `BEADS_DOLT_SERVER_PORT` | `3307` | Server port (MySQL protocol) |
 | `BEADS_DOLT_SERVER_USER` | `root` | MySQL username |
 | `BEADS_DOLT_SERVER_PASS` | (empty) | MySQL password |
+| `BEADS_DOLT_SHARED_SERVER` | (empty) | Shared server mode: `1` or `true` to enable |
 
 ### Server Lifecycle
 
@@ -86,48 +86,169 @@ dolt:
 bd doctor
 
 # Server auto-starts when needed
-# PID stored in: .beads/dolt/sql-server.pid
-# Logs written to: .beads/dolt/sql-server.log
+# PID stored in: .beads/dolt-server.pid
+# Logs written to: .beads/dolt-server.log
 
-# Manual stop (rarely needed)
-kill $(cat .beads/dolt/sql-server.pid)
+# Start/stop/status
+bd dolt start
+bd dolt stop
+bd dolt status
+```
+
+### Shared Server Mode
+
+On multi-project machines, enable shared server mode to use a single Dolt server
+for all projects (instead of one server per project):
+
+```bash
+# Enable via config
+bd dolt set shared-server true
+
+# Or via environment variable (machine-wide)
+export BEADS_DOLT_SHARED_SERVER=1
+```
+
+Shared server state lives in `~/.beads/shared-server/` and uses port 3308 by default
+(avoiding conflict with Gas Town on 3307). Each project's data remains isolated in its
+own database (named by project prefix). See [DOLT.md](DOLT.md) for details.
+
+## Central Dolt Server (macOS)
+
+If you plan to use Gas Town or manage multiple beads projects from a single
+machine, you can run a central persistent Dolt server instead of per-project
+embedded instances.
+
+### Embedded vs Central Server
+
+| | Embedded (default) | Central Server |
+|---|---|---|
+| **Setup** | Zero-config — `bd init` handles everything | One-time server setup required |
+| **Data location** | `.beads/dolt/` per project | Central directory (e.g. `/opt/homebrew/var/dolt`) |
+| **Concurrency** | Single writer per project | Multi-writer via MySQL protocol |
+| **Use case** | Solo development, single project | Gas Town, multiple projects, multiple agents |
+
+For single-project solo use, **embedded mode is recommended** — it requires no
+setup. Switch to a central server when you need Gas Town or concurrent access.
+
+### Why Not `brew services start dolt`?
+
+After installing Dolt with `brew install dolt`, the natural next step is
+`brew services start dolt`. However, this **silently ignores your config file**.
+
+The Homebrew formula runs `dolt sql-server` without the `--config` flag. Dolt
+does **not** auto-discover `config.yaml` from its working directory — the config
+file must be passed explicitly via `--config <file>`. Any edits to
+`/opt/homebrew/var/dolt/config.yaml` (port, host, etc.) have no effect when
+started through `brew services`.
+
+### Setup with a Custom LaunchAgent
+
+Instead of `brew services`, create a custom LaunchAgent that passes the config
+file explicitly.
+
+**1. Install Dolt and initialize its data directory:**
+
+```bash
+brew install dolt
+
+# Initialize the dolt data directory (if not already done)
+cd /opt/homebrew/var/dolt && dolt init
+```
+
+**2. Configure Dolt for port 3307:**
+
+```yaml
+# /opt/homebrew/var/dolt/config.yaml
+log_level: info
+
+listener:
+  host: 127.0.0.1
+  port: 3307
+  max_connections: 100
+
+behavior:
+  autocommit: true
+```
+
+**3. Create the LaunchAgent plist:**
+
+```bash
+cat > ~/Library/LaunchAgents/com.local.dolt-server.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.dolt-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/opt/dolt/bin/dolt</string>
+        <string>sql-server</string>
+        <string>--config</string>
+        <string>config.yaml</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/opt/homebrew/var/dolt</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/opt/homebrew/var/log/dolt.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/homebrew/var/log/dolt.error.log</string>
+</dict>
+</plist>
+EOF
+```
+
+**4. Load the service:**
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.local.dolt-server.plist
+
+# Verify it's running
+mysql -h 127.0.0.1 -P 3307 -u root -e "SELECT 1"
+```
+
+**5. Point beads at the central server** — add to `~/.zshrc` (or `~/.bashrc`):
+
+```bash
+export BEADS_DOLT_SERVER_HOST="127.0.0.1"
+export BEADS_DOLT_SERVER_PORT="3307"
+export BEADS_DOLT_SERVER_MODE=1
+```
+
+Now `bd init` in any project will connect to the central server instead of
+spawning an embedded instance.
+
+### Managing the Service
+
+```bash
+# Stop
+launchctl unload ~/Library/LaunchAgents/com.local.dolt-server.plist
+
+# Restart (unload + load)
+launchctl unload ~/Library/LaunchAgents/com.local.dolt-server.plist
+launchctl load ~/Library/LaunchAgents/com.local.dolt-server.plist
+
+# Check logs
+tail -f /opt/homebrew/var/log/dolt.log
 ```
 
 ## Sync Modes
 
 Dolt supports multiple sync strategies:
 
-### `dolt-native` (Default)
+### Sync Mode
 
-```yaml
-sync:
-  mode: dolt-native
-```
+Beads uses `dolt-native` sync mode exclusively:
 
 - Uses Dolt remotes (DoltHub, S3, GCS, etc.)
-- Native database-level sync
+- Native database-level sync with cell-level merge
 - Supports branching and merging
-
-### `belt-and-suspenders`
-
-```yaml
-sync:
-  mode: belt-and-suspenders
-```
-
-- Uses BOTH Dolt remotes AND JSONL export
-- Maximum redundancy
-- Useful for migration periods
-
-### `git-portable` (Legacy)
-
-```yaml
-sync:
-  mode: git-portable
-```
-
-- Legacy JSONL-based sync for backward compatibility
-- Dolt provides local version history only
+- `bd export` available for issue portability; `bd backup` / `bd backup restore` for JSONL backup snapshots
 
 ## Dolt Remotes
 
@@ -187,18 +308,16 @@ Use `bd doctor --fix` to resolve any discrepancies between SQL and CLI remote co
 
 If upgrading from an older version that used SQLite:
 
-### Option 1: In-Place Migration (Recommended)
+### Option 1: Migration Script
 
-```bash
-# Preview the migration
-bd migrate --to-dolt --dry-run
-
-# Run the migration
-bd migrate --to-dolt
-
-# Optionally clean up SQLite files
-bd migrate --to-dolt --cleanup
-```
+> **Note:** The `bd migrate --to-dolt` command was removed in v0.58.0.
+> For pre-0.50 installations with JSONL data, use the migration script:
+>
+> ```bash
+> scripts/migrate-jsonl-to-dolt.sh
+> ```
+>
+> See [Troubleshooting](TROUBLESHOOTING.md#circuit-breaker-server-appears-down-failing-fast) if you encounter connection errors after migration.
 
 ### Option 2: Fresh Start
 
@@ -209,11 +328,8 @@ bd export -o backup.jsonl
 # Archive existing beads
 mv .beads .beads-sqlite-backup
 
-# Initialize fresh
-bd init
-
-# Import from backup
-bd import -i backup.jsonl
+# Initialize fresh from backup
+bd init --from-jsonl
 ```
 
 ## Troubleshooting

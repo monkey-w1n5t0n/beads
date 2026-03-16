@@ -55,8 +55,15 @@ var YamlOnlyKeys = map[string]bool{
 	// Hierarchy settings (GH#995)
 	"hierarchy.max-depth": true,
 
+	// Backup settings (must be in yaml so GetValueSource can detect overrides)
+	"backup.enabled":  true,
+	"backup.interval": true,
+	"backup.git-push": true,
+	"backup.git-repo": true,
+
 	// Dolt server settings
-	"dolt.idle-timeout": true, // Idle auto-stop timeout (default "30m", "0" disables)
+	"dolt.idle-timeout":  true, // Idle auto-stop timeout (default "30m", "0" disables)
+	"dolt.shared-server": true, // Shared Dolt server at ~/.beads/shared-server/ (GH#2377)
 }
 
 // IsYamlOnlyKey returns true if the given key should be stored in config.yaml
@@ -68,7 +75,7 @@ func IsYamlOnlyKey(key string) bool {
 	}
 
 	// Check prefix matches for nested keys
-	prefixes := []string{"routing.", "sync.", "git.", "directory.", "repos.", "external_projects.", "validation.", "hierarchy.", "ai.", "dolt.", "federation."}
+	prefixes := []string{"routing.", "sync.", "git.", "directory.", "repos.", "external_projects.", "validation.", "hierarchy.", "ai.", "backup.", "dolt.", "federation."}
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(key, prefix) {
 			return true
@@ -290,6 +297,11 @@ func validateYamlConfigValue(key, value string) error {
 			if _, err := time.ParseDuration(value); err != nil {
 				return fmt.Errorf("dolt.idle-timeout must be a duration (e.g. \"30m\", \"1h\") or \"0\" to disable, got %q", value)
 			}
+		}
+	case "dolt.shared-server":
+		lower := strings.ToLower(value)
+		if lower != "true" && lower != "false" {
+			return fmt.Errorf("dolt.shared-server must be \"true\" or \"false\", got %q", value)
 		}
 	}
 	return nil

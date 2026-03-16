@@ -30,6 +30,13 @@ func TestIsYamlOnlyKey(t *testing.T) {
 		{"hierarchy.max-depth", true},
 		{"hierarchy.custom_setting", true}, // prefix match
 
+		// Backup settings (GH#2358)
+		{"backup.enabled", true},
+		{"backup.interval", true},
+		{"backup.git-push", true},
+		{"backup.git-repo", true},
+		{"backup.future-key", true}, // prefix match
+
 		// Non-yaml keys (should return false)
 		{"jira.url", false},
 		{"jira.project", false},
@@ -271,5 +278,23 @@ func TestValidateYamlConfigValue_OtherKeys(t *testing.T) {
 	err = validateYamlConfigValue("routing.mode", "anything")
 	if err != nil {
 		t.Errorf("unexpected error for routing.mode: %v", err)
+	}
+}
+
+func TestValidateYamlConfigValue_SharedServer(t *testing.T) {
+	if err := validateYamlConfigValue("dolt.shared-server", "true"); err != nil {
+		t.Errorf("expected 'true' to be valid: %v", err)
+	}
+	if err := validateYamlConfigValue("dolt.shared-server", "false"); err != nil {
+		t.Errorf("expected 'false' to be valid: %v", err)
+	}
+	if err := validateYamlConfigValue("dolt.shared-server", "TRUE"); err != nil {
+		t.Errorf("expected 'TRUE' to be valid (case-insensitive): %v", err)
+	}
+	if err := validateYamlConfigValue("dolt.shared-server", "maybe"); err == nil {
+		t.Error("expected 'maybe' to be invalid")
+	}
+	if err := validateYamlConfigValue("dolt.shared-server", "1"); err == nil {
+		t.Error("expected '1' to be invalid (not a boolean string)")
 	}
 }

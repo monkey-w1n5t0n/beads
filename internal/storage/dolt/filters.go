@@ -43,10 +43,11 @@ func buildIssueFilterClauses(query string, filter types.IssueFilter, tables filt
 		lowerQuery := strings.ToLower(query)
 		if looksLikeIssueID(query) {
 			// ID-like query: use exact match + prefix match on indexed id column,
-			// plus title LIKE as fallback for cases where the query appears in titles.
+			// plus title LIKE and external_ref LIKE as fallbacks (e.g. Linear IDs
+			// like "BE-1521" stored in external_ref).
 			// IDs are always lowercase, so no LOWER() needed for id columns.
-			whereClauses = append(whereClauses, "(id = ? OR id LIKE ? OR LOWER(title) LIKE ?)")
-			args = append(args, lowerQuery, lowerQuery+"%", "%"+lowerQuery+"%")
+			whereClauses = append(whereClauses, "(id = ? OR id LIKE ? OR LOWER(title) LIKE ? OR LOWER(external_ref) LIKE ?)")
+			args = append(args, lowerQuery, lowerQuery+"%", "%"+lowerQuery+"%", "%"+lowerQuery+"%")
 		} else {
 			// Text query: search title and id (skip description — it's large and
 			// LIKE %% on TEXT columns causes the worst prolly-tree scan behavior).
@@ -59,20 +60,24 @@ func buildIssueFilterClauses(query string, filter types.IssueFilter, tables filt
 	}
 
 	if filter.TitleSearch != "" {
-		whereClauses = append(whereClauses, "title LIKE ?")
-		args = append(args, "%"+filter.TitleSearch+"%")
+		whereClauses = append(whereClauses, "LOWER(title) LIKE ?")
+		args = append(args, "%"+strings.ToLower(filter.TitleSearch)+"%")
 	}
 	if filter.TitleContains != "" {
-		whereClauses = append(whereClauses, "title LIKE ?")
-		args = append(args, "%"+filter.TitleContains+"%")
+		whereClauses = append(whereClauses, "LOWER(title) LIKE ?")
+		args = append(args, "%"+strings.ToLower(filter.TitleContains)+"%")
 	}
 	if filter.DescriptionContains != "" {
-		whereClauses = append(whereClauses, "description LIKE ?")
-		args = append(args, "%"+filter.DescriptionContains+"%")
+		whereClauses = append(whereClauses, "LOWER(description) LIKE ?")
+		args = append(args, "%"+strings.ToLower(filter.DescriptionContains)+"%")
 	}
 	if filter.NotesContains != "" {
-		whereClauses = append(whereClauses, "notes LIKE ?")
-		args = append(args, "%"+filter.NotesContains+"%")
+		whereClauses = append(whereClauses, "LOWER(notes) LIKE ?")
+		args = append(args, "%"+strings.ToLower(filter.NotesContains)+"%")
+	}
+	if filter.ExternalRefContains != "" {
+		whereClauses = append(whereClauses, "LOWER(external_ref) LIKE ?")
+		args = append(args, "%"+strings.ToLower(filter.ExternalRefContains)+"%")
 	}
 
 	// Status filters
@@ -98,14 +103,13 @@ func buildIssueFilterClauses(query string, filter types.IssueFilter, tables filt
 		whereClauses = append(whereClauses, fmt.Sprintf("id IN (SELECT id FROM %s WHERE issue_type = ?)", tables.main))
 		args = append(args, *filter.IssueType)
 	}
-	// Use subquery for type exclusion to prevent Dolt mergeJoinIter panic (same as above).
 	if len(filter.ExcludeTypes) > 0 {
 		placeholders := make([]string, len(filter.ExcludeTypes))
 		for i, t := range filter.ExcludeTypes {
 			placeholders[i] = "?"
 			args = append(args, string(t))
 		}
-		whereClauses = append(whereClauses, fmt.Sprintf("id IN (SELECT id FROM %s WHERE issue_type NOT IN (%s))", tables.main, strings.Join(placeholders, ",")))
+		whereClauses = append(whereClauses, fmt.Sprintf("issue_type NOT IN (%s)", strings.Join(placeholders, ",")))
 	}
 
 	// Assignee

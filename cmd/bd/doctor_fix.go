@@ -204,15 +204,16 @@ func applyFixList(path string, fixes []doctorCheck) {
 	// Rough dependency chain:
 	// permissions/lock cleanup → config sanity → DB integrity/migrations.
 	order := []string{
+		"Metadata Config",
 		"Lock Files",
 		"Permissions",
-		"Daemon Health",
 		"Database Config",
 		"Config Values",
 		"Database Integrity",
 		"Database",
 		"Fresh Clone",
 		"Schema Compatibility",
+		"Project Identity",
 	}
 	priority := make(map[string]int, len(order))
 	for i, name := range order {
@@ -244,6 +245,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 
 		var err error
 		switch check.Name {
+		case "Metadata Config":
+			err = fix.FixMissingMetadataJSON(path)
 		case "Gitignore":
 			err = doctor.FixGitignore(path)
 		case "Project Gitignore":
@@ -252,6 +255,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 			err = doctor.FixRedirectTracking(path)
 		case "Last-Touched Tracking":
 			err = doctor.FixLastTouchedTracking(path)
+		case "Tracked Runtime Files":
+			err = doctor.FixTrackedRuntimeFiles(path)
 		case "Git Hooks":
 			err = fix.GitHooks(path)
 		case "Sync Divergence":
@@ -284,8 +289,6 @@ func applyFixList(path string, fixes []doctorCheck) {
 		case "Untracked Files":
 			fmt.Printf("  ⚠ Untracked JSONL fix removed (Dolt-native storage)\n")
 			continue
-		case "Merge Artifacts":
-			err = fix.MergeArtifacts(path)
 		case "Orphaned Dependencies":
 			err = fix.OrphanedDependencies(path, doctorVerbose)
 		case "Child-Parent Dependencies":
@@ -332,14 +335,14 @@ func applyFixList(path string, fixes []doctorCheck) {
 			err = fix.ConfigValues(path)
 		case "Classic Artifacts":
 			err = fix.ClassicArtifacts(path)
+		case "Project Identity":
+			err = fix.FixProjectIdentity(path)
 		case "Remote Consistency":
 			err = fix.RemoteConsistency(path)
 		case "Dolt Schema":
 			// GH#2160: Pre-#2142 migrations may have wrong database configured.
 			// Probe the server and backfill dolt_database in metadata.json.
 			err = fix.FixMissingDoltDatabase(path)
-		case "Git Merge Driver":
-			err = doctor.FixMergeDriver()
 		default:
 			fmt.Printf("  ⚠ No automatic fix available for %s\n", check.Name)
 			fmt.Printf("  Manual fix: %s\n", check.Fix)

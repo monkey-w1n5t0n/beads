@@ -49,78 +49,6 @@ func TestCheckGitHooks(t *testing.T) {
 	})
 }
 
-func TestCheckMergeDriver(t *testing.T) {
-	tests := []struct {
-		name           string
-		setup          func(t *testing.T, dir string)
-		expectedStatus string
-		expectMessage  string
-	}{
-		{
-			name: "not a git repo",
-			setup: func(t *testing.T, dir string) {
-				// Just create .beads directory, no git
-				// CheckMergeDriver uses global git detection
-				beadsDir := filepath.Join(dir, ".beads")
-				if err := os.MkdirAll(beadsDir, 0755); err != nil {
-					t.Fatal(err)
-				}
-			},
-			expectedStatus: "warning", // Uses global git detection, so still checks
-			expectMessage:  "",        // Message varies
-		},
-		{
-			name: "merge driver not configured",
-			setup: func(t *testing.T, dir string) {
-				setupGitRepoInDir(t, dir)
-			},
-			expectedStatus: "warning",
-			expectMessage:  "Git merge driver not configured",
-		},
-		{
-			name: "correct config",
-			setup: func(t *testing.T, dir string) {
-				setupGitRepoInDir(t, dir)
-				cmd := exec.Command("git", "config", "merge.beads.driver", "bd merge %A %O %A %B")
-				cmd.Dir = dir
-				if err := cmd.Run(); err != nil {
-					t.Fatalf("failed to set git config: %v", err)
-				}
-			},
-			expectedStatus: "ok",
-			expectMessage:  "Correctly configured",
-		},
-		{
-			name: "incorrect config with old placeholders",
-			setup: func(t *testing.T, dir string) {
-				setupGitRepoInDir(t, dir)
-				cmd := exec.Command("git", "config", "merge.beads.driver", "bd merge %L %O %A %R")
-				cmd.Dir = dir
-				if err := cmd.Run(); err != nil {
-					t.Fatalf("failed to set git config: %v", err)
-				}
-			},
-			expectedStatus: "error",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			tt.setup(t, tmpDir)
-
-			check := CheckMergeDriver(tmpDir)
-
-			if check.Status != tt.expectedStatus {
-				t.Errorf("expected status %q, got %q (message: %s)", tt.expectedStatus, check.Status, check.Message)
-			}
-			if tt.expectMessage != "" && check.Message != tt.expectMessage {
-				t.Errorf("expected message %q, got %q", tt.expectMessage, check.Message)
-			}
-		})
-	}
-}
-
 // setupGitRepoInDir initializes a git repo in the given directory with .beads
 func setupGitRepoInDir(t *testing.T, dir string) {
 	t.Helper()
@@ -313,173 +241,6 @@ func TestCheckGitHooks_CorruptedHookFiles(t *testing.T) {
 	}
 }
 
-// Edge case tests for CheckMergeDriver
-
-func TestCheckMergeDriver_PartiallyConfigured(t *testing.T) {
-	tests := []struct {
-		name           string
-		setup          func(t *testing.T, dir string)
-		expectedStatus string
-		expectInMsg    string
-	}{
-		{
-			name: "only merge.beads.name configured",
-			setup: func(t *testing.T, dir string) {
-				setupGitRepoInDir(t, dir)
-				cmd := exec.Command("git", "config", "merge.beads.name", "Beads merge driver")
-				cmd.Dir = dir
-				if err := cmd.Run(); err != nil {
-					t.Fatalf("failed to set git config: %v", err)
-				}
-			},
-			expectedStatus: "warning",
-			expectInMsg:    "not configured",
-		},
-		{
-			name: "empty merge driver config",
-			setup: func(t *testing.T, dir string) {
-				setupGitRepoInDir(t, dir)
-				cmd := exec.Command("git", "config", "merge.beads.driver", "")
-				cmd.Dir = dir
-				if err := cmd.Run(); err != nil {
-					t.Fatalf("failed to set git config: %v", err)
-				}
-			},
-			// git config trims to empty string, which is non-standard
-			expectedStatus: "warning",
-			expectInMsg:    "Non-standard",
-		},
-		{
-			name: "merge driver with extra spaces",
-			setup: func(t *testing.T, dir string) {
-				setupGitRepoInDir(t, dir)
-				cmd := exec.Command("git", "config", "merge.beads.driver", "  bd merge %A %O %A %B  ")
-				cmd.Dir = dir
-				if err := cmd.Run(); err != nil {
-					t.Fatalf("failed to set git config: %v", err)
-				}
-			},
-			// git config stores the value with spaces, but the code trims it
-			expectedStatus: "ok",
-			expectInMsg:    "Correctly configured",
-		},
-		{
-			name: "merge driver with wrong bd path",
-			setup: func(t *testing.T, dir string) {
-				setupGitRepoInDir(t, dir)
-				cmd := exec.Command("git", "config", "merge.beads.driver", "/usr/local/bin/bd merge %A %O %A %B")
-				cmd.Dir = dir
-				if err := cmd.Run(); err != nil {
-					t.Fatalf("failed to set git config: %v", err)
-				}
-			},
-			expectedStatus: "warning",
-			expectInMsg:    "Non-standard",
-		},
-		{
-			name: "merge driver with only two placeholders",
-			setup: func(t *testing.T, dir string) {
-				setupGitRepoInDir(t, dir)
-				cmd := exec.Command("git", "config", "merge.beads.driver", "bd merge %A %O")
-				cmd.Dir = dir
-				if err := cmd.Run(); err != nil {
-					t.Fatalf("failed to set git config: %v", err)
-				}
-			},
-			expectedStatus: "warning",
-			expectInMsg:    "Non-standard",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			tt.setup(t, tmpDir)
-
-			check := CheckMergeDriver(tmpDir)
-
-			if check.Status != tt.expectedStatus {
-				t.Errorf("expected status %q, got %q (message: %s)", tt.expectedStatus, check.Status, check.Message)
-			}
-			if tt.expectInMsg != "" && !strings.Contains(check.Message, tt.expectInMsg) {
-				t.Errorf("expected message to contain %q, got %q", tt.expectInMsg, check.Message)
-			}
-		})
-	}
-}
-
-// Tests for FixMergeDriver
-
-func TestFixMergeDriver(t *testing.T) {
-	tests := []struct {
-		name         string
-		setup        func(t *testing.T, dir string)
-		expectFixed  bool
-		verifyConfig string
-	}{
-		{
-			name: "fixes invalid %L/%R placeholders",
-			setup: func(t *testing.T, dir string) {
-				setupGitRepoInDir(t, dir)
-				cmd := exec.Command("git", "config", "merge.beads.driver", "bd merge %L %O %A %R")
-				cmd.Dir = dir
-				if err := cmd.Run(); err != nil {
-					t.Fatalf("failed to set git config: %v", err)
-				}
-			},
-			expectFixed:  true,
-			verifyConfig: "bd merge %A %O %A %B",
-		},
-		{
-			name: "fixes missing merge driver config",
-			setup: func(t *testing.T, dir string) {
-				setupGitRepoInDir(t, dir)
-				// No merge driver configured
-			},
-			expectFixed:  true,
-			verifyConfig: "bd merge %A %O %A %B",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			tt.setup(t, tmpDir)
-
-			runInDir(t, tmpDir, func() {
-				err := FixMergeDriver()
-				if tt.expectFixed {
-					if err != nil {
-						t.Fatalf("FixMergeDriver() unexpected error: %v", err)
-					}
-					// Verify the config was set correctly
-					cmd := exec.Command("git", "config", "merge.beads.driver")
-					cmd.Dir = tmpDir
-					output, err := cmd.Output()
-					if err != nil {
-						t.Fatalf("failed to read merge.beads.driver: %v", err)
-					}
-					got := strings.TrimSpace(string(output))
-					if got != tt.verifyConfig {
-						t.Errorf("merge.beads.driver = %q, want %q", got, tt.verifyConfig)
-					}
-					// Verify name was also set
-					nameCmd := exec.Command("git", "config", "merge.beads.name")
-					nameCmd.Dir = tmpDir
-					nameOutput, err := nameCmd.Output()
-					if err != nil {
-						t.Fatalf("failed to read merge.beads.name: %v", err)
-					}
-					nameGot := strings.TrimSpace(string(nameOutput))
-					if nameGot != "Beads merge driver" {
-						t.Errorf("merge.beads.name = %q, want %q", nameGot, "Beads merge driver")
-					}
-				}
-			})
-		})
-	}
-}
-
 // Tests for CheckOrphanedIssues
 
 // TestParseBDHookVersion verifies version extraction from all hook formats (GH#2244).
@@ -569,4 +330,58 @@ func TestCheckOrphanedIssues_DoltBackend(t *testing.T) {
 	if !strings.Contains(check.Message, "N/A") {
 		t.Errorf("expected N/A message, got %q", check.Message)
 	}
+}
+
+func TestCheckStaleLegacyHooks(t *testing.T) {
+	t.Run("no legacy files", func(t *testing.T) {
+		dir := t.TempDir()
+		setupGitRepoInDir(t, dir)
+		runInDir(t, dir, func() {
+			check := CheckStaleLegacyHooks()
+			if check.Status != StatusOK {
+				t.Errorf("expected OK, got %q: %s", check.Status, check.Message)
+			}
+		})
+	})
+
+	t.Run("stale legacy hook with removed bd hook command", func(t *testing.T) {
+		dir := t.TempDir()
+		setupGitRepoInDir(t, dir)
+		hooksDir := filepath.Join(dir, ".git", "hooks")
+		writeHookFile(t, filepath.Join(hooksDir, "pre-commit.legacy"),
+			"#!/bin/sh\nexec bd hook pre-commit \"$@\"\n")
+		runInDir(t, dir, func() {
+			check := CheckStaleLegacyHooks()
+			if check.Status != StatusWarning {
+				t.Errorf("expected warning, got %q: %s", check.Status, check.Message)
+			}
+			if !strings.Contains(check.Detail, "pre-commit.legacy") {
+				t.Errorf("expected detail to mention pre-commit.legacy, got %q", check.Detail)
+			}
+		})
+	})
+
+	t.Run("legacy hook with current bd hooks run command is OK", func(t *testing.T) {
+		dir := t.TempDir()
+		setupGitRepoInDir(t, dir)
+		hooksDir := filepath.Join(dir, ".git", "hooks")
+		writeHookFile(t, filepath.Join(hooksDir, "pre-commit.legacy"),
+			"#!/bin/sh\nbd hooks run pre-commit \"$@\"\n")
+		runInDir(t, dir, func() {
+			check := CheckStaleLegacyHooks()
+			if check.Status != StatusOK {
+				t.Errorf("expected OK, got %q: %s", check.Status, check.Message)
+			}
+		})
+	})
+
+	t.Run("not in git repo", func(t *testing.T) {
+		dir := t.TempDir()
+		runInDir(t, dir, func() {
+			check := CheckStaleLegacyHooks()
+			if check.Status != StatusOK {
+				t.Errorf("expected OK, got %q", check.Status)
+			}
+		})
+	})
 }

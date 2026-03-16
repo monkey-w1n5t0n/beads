@@ -31,11 +31,7 @@ Tool-level settings you can configure:
 | Setting | Flag | Environment Variable | Default | Description |
 |---------|------|---------------------|---------|-------------|
 | `json` | `--json` | `BD_JSON` | `false` | Output in JSON format |
-| `no-push` | `--no-push` | `BD_NO_PUSH` | `false` | Skip pushing to remote in bd sync |
-| `sync.mode` | - | `BD_SYNC_MODE` | `git-portable` | Sync mode (see below) |
-| `sync.export_on` | - | `BD_SYNC_EXPORT_ON` | `push` | When to export: `push`, `change` |
-| `sync.import_on` | - | `BD_SYNC_IMPORT_ON` | `pull` | When to import: `pull`, `change` |
-| `conflict.strategy` | - | `BD_CONFLICT_STRATEGY` | `newest` | Conflict resolution: `newest`, `ours`, `theirs`, `manual` |
+| `no-push` | `--no-push` | `BD_NO_PUSH` | `false` | Skip pushing to remote in `bd dolt push` |
 | `federation.remote` | - | `BD_FEDERATION_REMOTE` | (none) | Dolt remote URL for federation |
 | `federation.sovereignty` | - | `BD_FEDERATION_SOVEREIGNTY` | (none) | Data sovereignty tier: `T1`, `T2`, `T3`, `T4` |
 | `dolt.auto-commit` | `--dolt-auto-commit` | `BD_DOLT_AUTO_COMMIT` | `on` | (Dolt backend) Automatically create a Dolt commit after successful write commands |
@@ -51,6 +47,8 @@ Tool-level settings you can configure:
 | `backup.git-push` | - | `BD_BACKUP_GIT_PUSH` | `false` | Auto git-add + commit + push after export |
 | `dolt.auto-push` | - | `BD_DOLT_AUTO_PUSH` | (auto) | Auto-push to Dolt remote after writes (auto-enabled when origin exists) |
 | `dolt.auto-push-interval` | - | `BD_DOLT_AUTO_PUSH_INTERVAL` | `5m` | Minimum time between auto-pushes |
+| `dolt.shared-server` | `--shared-server` | `BEADS_DOLT_SHARED_SERVER` | `false` | Share a single Dolt server across all projects at `~/.beads/shared-server/` |
+| `dolt.idle-timeout` | - | - | `30m` | Idle auto-stop timeout (`"0"` disables) |
 | `db` | `--db` | `BD_DB` | (auto-discover) | Database path |
 | `actor` | `--actor` | `BD_ACTOR` | `git config user.name` | Actor name for audit trail (see below) |
 
@@ -151,13 +149,9 @@ export BD_ACTOR="my-github-handle"
 
 The sync mode controls how beads synchronizes data with git and/or Dolt remotes.
 
-#### Sync Modes
+#### Sync Mode
 
-| Mode | Description |
-|------|-------------|
-| `dolt-native` | (default) Use Dolt remotes directly for sync. Manual `bd import` / `bd export` still work for portability. |
-| `git-portable` | Legacy mode: Export JSONL on push, import on pull. For backward compatibility with older setups. |
-| `belt-and-suspenders` | Both Dolt remote AND JSONL backup. Maximum redundancy. |
+Beads uses `dolt-native` sync mode exclusively. Dolt remotes handle sync directly with cell-level merge. Use `bd export` for issue portability, `bd backup` / `bd backup restore` for supported JSONL backup snapshots, and `bd backup export-git` / `bd backup fetch-git` to move those snapshots through a git branch.
 
 #### Sync Triggers
 
@@ -166,20 +160,7 @@ Control when sync operations occur:
 - `sync.export_on`: `push` (default) or `change`
 - `sync.import_on`: `pull` (default) or `change`
 
-#### Conflict Resolution Strategies
-
-When merging conflicting changes:
-
-| Strategy | Description |
-|----------|-------------|
-| `newest` | (default) Keep the version with the newer `updated_at` timestamp |
-| `ours` | Always keep the local version |
-| `theirs` | Always keep the remote version |
-| `manual` | Require interactive resolution for each conflict |
-
 #### Federation Configuration
-
-For Dolt-native or belt-and-suspenders modes:
 
 - `federation.remote`: Dolt remote URL (e.g., `dolthub://org/beads`, `gs://bucket/beads`, `s3://bucket/beads`)
 - `federation.sovereignty`: Data sovereignty tier:
@@ -193,24 +174,14 @@ For Dolt-native or belt-and-suspenders modes:
 ```yaml
 # .beads/config.yaml
 sync:
-  mode: dolt-native     # dolt-native | git-portable | belt-and-suspenders
   export_on: push       # push | change
   import_on: pull       # pull | change
 
-conflict:
-  strategy: newest      # newest | ours | theirs | manual
-
-# Optional: Dolt federation for dolt-native or belt-and-suspenders modes
+# Optional: Dolt federation
 federation:
   remote: dolthub://myorg/beads
   sovereignty: T2
 ```
-
-#### When to Use Each Mode
-
-- **dolt-native** (default): Best for most teams. Dolt handles sync natively with cell-level merge. `bd import`/`bd export` remain available for portability and migration.
-- **git-portable**: Legacy mode for backward compatibility. JSONL is committed to git, works with any git hosting.
-- **belt-and-suspenders**: Use for critical data where you want both Dolt sync AND JSONL backup.
 
 ### Example Config File
 
@@ -537,7 +508,7 @@ bd config set auto_export.error_policy "best-effort"
 
 **Context-specific behavior:**
 
-User-initiated exports (`bd sync`, manual export commands) use `export.error_policy` (default: `strict`).
+User-initiated exports (`bd dolt push`, manual export commands) use `export.error_policy` (default: `strict`).
 
 Auto-exports (git hook sync) use `auto_export.error_policy` (default: `best-effort`), falling back to `export.error_policy` if not set.
 
@@ -577,25 +548,24 @@ bd config set import.orphan_handling "allow"
 
 **Mode details:**
 
-- **`strict`** - Import fails immediately if a child's parent is missing. Use when database integrity is critical.
-- **`resurrect`** - Searches the full JSONL file for missing parents and recreates them as tombstones (Status=Closed, Priority=4). Preserves hierarchy with minimal data. Dependencies are also resurrected on best-effort basis.
+- **`strict`** - Fails immediately if a child's parent is missing. Use when database integrity is critical.
+- **`resurrect`** - Searches for missing parents and recreates them as tombstones (Status=Closed, Priority=4). Preserves hierarchy with minimal data. Dependencies are also resurrected on best-effort basis.
 - **`skip`** - Skips orphaned children with a warning. Partial import succeeds but some issues are excluded.
-- **`allow`** - Imports orphans without parent validation. Most permissive, works around import bugs. **This is the default** because it ensures all data is imported even if hierarchy is temporarily broken.
+- **`allow`** - Imports orphans without parent validation. Most permissive. **This is the default** because it ensures all data is imported even if hierarchy is temporarily broken.
 
-**Override per command:**
+These modes apply when bootstrapping a database with `bd init --from-jsonl` or when `bd dolt pull` merges remote data:
+
 ```bash
-# Override config for a single import
-bd import -i issues.jsonl --orphan-handling strict
-
-# Auto-import (sync) uses config value
-bd sync  # Respects import.orphan_handling setting
+# Override config for a single pull
+bd config set import.orphan_handling "resurrect"
+bd dolt pull  # Respects import.orphan_handling setting
 ```
 
 **When to use each mode:**
 
-- Use `allow` (default) for daily imports and auto-sync - ensures no data loss
-- Use `resurrect` when importing from another database that had parent deletions
-- Use `strict` only for controlled imports where you need to guarantee parent existence
+- Use `allow` (default) for daily sync - ensures no data loss
+- Use `resurrect` when pulling from remotes that had parent deletions
+- Use `strict` only when you need to guarantee parent existence
 - Use `skip` rarely - only when you want to selectively import a subset
 
 ### Example: Sync Safety Options
@@ -608,7 +578,7 @@ bd config set sync.branch beads-sync
 
 # Enable mass deletion protection (optional, default: false)
 # When enabled, if >50% of issues vanish during a merge AND more than 5
-# issues existed before the merge, bd sync will:
+# issues existed before the merge, bd dolt push will:
 # 1. Show forensic info about vanished issues
 # 2. Prompt for confirmation before pushing
 bd config set sync.require_confirmation_on_mass_delete "true"

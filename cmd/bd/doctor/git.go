@@ -530,78 +530,70 @@ func gitRevListCount(ctx context.Context, path string, rangeExpr string) (int, e
 	return n, nil
 }
 
-// CheckMergeDriver verifies that the git merge driver is correctly configured.
-func CheckMergeDriver(path string) DoctorCheck {
-	// Check if we're in a git repository using worktree-aware detection
-	_, err := git.GetGitDir()
+// staleBdHookPattern matches the removed "bd hook <name>" command (not "bd hooks run").
+// This was removed in v0.58.0 and replaced by "bd hooks run".
+var staleBdHookPattern = regexp.MustCompile(`\bbd\s+hook\s+(?:pre-commit|post-merge|pre-push|post-checkout|prepare-commit-msg)\b`)
+
+// CheckStaleLegacyHooks detects *.legacy sidecar hooks (created by Python's pre-commit
+// framework) that still call the removed "bd hook" command. These cause "unknown command"
+// errors at runtime even though "bd hooks list" and "bd doctor" show green. (GH#2398)
+func CheckStaleLegacyHooks() DoctorCheck {
+	hooksDir, err := git.GetGitHooksDir()
 	if err != nil {
 		return DoctorCheck{
-			Name:    "Git Merge Driver",
+			Name:    "Stale Legacy Hooks",
 			Status:  StatusOK,
 			Message: "N/A (not a git repository)",
 		}
 	}
 
-	// Get current merge driver configuration
-	cmd := exec.Command("git", "config", "merge.beads.driver")
-	cmd.Dir = path
-	output, err := cmd.Output()
+	entries, err := os.ReadDir(hooksDir)
 	if err != nil {
-		// Merge driver not configured
 		return DoctorCheck{
-			Name:    "Git Merge Driver",
-			Status:  StatusWarning,
-			Message: "Git merge driver not configured",
-			Fix:     "Run 'bd init' to configure the merge driver, or manually: git config merge.beads.driver \"bd merge %A %O %A %B\"",
+			Name:    "Stale Legacy Hooks",
+			Status:  StatusOK,
+			Message: "N/A (cannot read hooks directory)",
 		}
 	}
 
-	currentConfig := strings.TrimSpace(string(output))
-	correctConfig := "bd merge %A %O %A %B"
-
-	// Check if using old incorrect placeholders
-	if strings.Contains(currentConfig, "%L") || strings.Contains(currentConfig, "%R") {
-		return DoctorCheck{
-			Name:    "Git Merge Driver",
-			Status:  StatusError,
-			Message: fmt.Sprintf("Incorrect merge driver config: %q (uses invalid %%L/%%R placeholders)", currentConfig),
-			Detail:  "Git only supports %O (base), %A (current), %B (other). Using %L/%R causes merge failures.",
-			Fix:     "Run 'bd doctor --fix' to update to correct config, or manually: git config merge.beads.driver \"bd merge %A %O %A %B\"",
+	var staleFiles []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".legacy") {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(hooksDir, name))
+		if err != nil {
+			continue
+		}
+		if staleBdHookPattern.Match(content) {
+			staleFiles = append(staleFiles, name)
 		}
 	}
 
-	// Check if config is correct
-	if currentConfig != correctConfig {
+	if len(staleFiles) == 0 {
 		return DoctorCheck{
-			Name:    "Git Merge Driver",
-			Status:  StatusWarning,
-			Message: fmt.Sprintf("Non-standard merge driver config: %q", currentConfig),
-			Detail:  fmt.Sprintf("Expected: %q", correctConfig),
-			Fix:     fmt.Sprintf("Run 'bd doctor --fix' to update config, or manually: git config merge.beads.driver \"%s\"", correctConfig),
+			Name:    "Stale Legacy Hooks",
+			Status:  StatusOK,
+			Message: "No stale legacy hook sidecars",
 		}
 	}
 
 	return DoctorCheck{
-		Name:    "Git Merge Driver",
-		Status:  StatusOK,
-		Message: "Correctly configured",
-		Detail:  currentConfig,
+		Name:    "Stale Legacy Hooks",
+		Status:  StatusWarning,
+		Message: fmt.Sprintf("%d stale .legacy hook(s) calling removed 'bd hook' command", len(staleFiles)),
+		Detail:  fmt.Sprintf("Files: %s", strings.Join(staleFiles, ", ")),
+		Fix:     "Remove or update these files: rm " + strings.Join(staleFilePaths(hooksDir, staleFiles), " "),
 	}
 }
 
-// FixMergeDriver sets the git merge driver configuration to the correct value.
-func FixMergeDriver() error {
-	correctConfig := "bd merge %A %O %A %B"
-	cmd := exec.Command("git", "config", "merge.beads.driver", correctConfig) // #nosec G204
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to set merge.beads.driver: %w", err)
+func staleFilePaths(hooksDir string, names []string) []string {
+	paths := make([]string, len(names))
+	for i, name := range names {
+		paths[i] = filepath.Join(hooksDir, name)
 	}
-	// Also ensure merge.beads.name is set
-	nameCmd := exec.Command("git", "config", "merge.beads.name", "Beads merge driver") // #nosec G204
-	if err := nameCmd.Run(); err != nil {
-		return fmt.Errorf("failed to set merge.beads.name: %w", err)
-	}
-	return nil
+	return paths
 }
 
 // CheckGitHooksDoltCompatibility checks if installed git hooks are compatible with Dolt backend.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage/dolt"
@@ -17,8 +18,12 @@ var exportCmd = &cobra.Command{
 	Long: `Export all issues to JSONL (newline-delimited JSON) format.
 
 Each line is a complete JSON object representing one issue, including its
-labels, dependencies, and comment count. The output is compatible with
-'bd import' for round-trip backup and restore.
+labels, dependencies, and comment count.
+
+This command is for issue export, migration, and interoperability. It does
+not produce the JSONL backup snapshot used by 'bd backup restore'. For
+supported backup/restore flows, use 'bd backup', 'bd backup export-git',
+and 'bd backup restore'.
 
 By default, exports only regular issues (excluding infrastructure beads
 like agents, rigs, roles, and messages). Use --all to include everything.
@@ -144,6 +149,11 @@ func runExport(cmd *cobra.Command, args []string) error {
 			counts = &types.DependencyCounts{}
 		}
 
+		// Sanitize zero-value timestamps that can't be marshaled to JSON.
+		// NULL datetime columns scanned as time.Time{} (year 0001) cause
+		// MarshalJSON to fail with "year outside of range [0,9999]". (GH#2488)
+		sanitizeZeroTime(issue)
+
 		record := &types.IssueWithCounts{
 			Issue:           issue,
 			DependencyCount: counts.DependencyCount,
@@ -177,6 +187,19 @@ func runExport(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// sanitizeZeroTime replaces Go zero-value time.Time fields with Unix epoch.
+// NULL datetime columns in Dolt scan as time.Time{} (year 0001-01-01), which
+// causes json.Marshal to fail with "year outside of range [0,9999]". (GH#2488)
+func sanitizeZeroTime(issue *types.Issue) {
+	epoch := time.Unix(0, 0).UTC()
+	if issue.CreatedAt.IsZero() {
+		issue.CreatedAt = epoch
+	}
+	if issue.UpdatedAt.IsZero() {
+		issue.UpdatedAt = epoch
+	}
 }
 
 // filterOutPollution removes issues that look like test/pollution records.

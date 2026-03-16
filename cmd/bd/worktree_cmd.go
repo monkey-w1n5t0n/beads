@@ -160,7 +160,7 @@ func runWorktreeCreate(cmd *cobra.Command, args []string) error {
 	// Get repository context (validates .beads exists and resolves paths)
 	rc, err := beads.GetRepoContext()
 	if err != nil {
-		return fmt.Errorf("no .beads directory found; run 'bd init' first: %w", err)
+		return fmt.Errorf("no .beads directory found; run 'bd doctor' to diagnose, or 'bd init' to create a new database: %w", err)
 	}
 
 	// Worktree operations use CWD repo (where user is working), not BEADS_DIR repo
@@ -691,11 +691,16 @@ func addToGitignore(ctx context.Context, repoRoot, entry string) error {
 		return err
 	}
 
-	// Check if already present
+	// Check if already present or covered by a parent-directory pattern.
+	// e.g. if ".worktrees" is in .gitignore, ".worktrees/my-branch" is already covered.
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
-		if strings.TrimSpace(line) == entry || strings.TrimSpace(line) == entry+"/" {
-			return nil // Already present
+		trimmed := strings.TrimSuffix(strings.TrimSpace(line), "/")
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if trimmed == entry || strings.HasPrefix(entry+"/", trimmed+"/") {
+			return nil // Already present or covered by a parent pattern
 		}
 	}
 

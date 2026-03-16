@@ -94,8 +94,8 @@ create, update, show, or close operation).`,
 		if descChanged {
 			updates["description"] = description
 		}
-		if cmd.Flags().Changed("design") {
-			design, _ := cmd.Flags().GetString("design")
+		design, designChanged := getDesignFlag(cmd)
+		if designChanged {
 			updates["design"] = design
 		}
 		if cmd.Flags().Changed("notes") && cmd.Flags().Changed("append-notes") {
@@ -221,14 +221,28 @@ create, update, show, or close operation).`,
 		// Note: storage layer uses "wisp" field name, maps to "ephemeral" column
 		ephemeralChanged := cmd.Flags().Changed("ephemeral")
 		persistentChanged := cmd.Flags().Changed("persistent")
+		noHistoryChanged := cmd.Flags().Changed("no-history")
+		historyChanged := cmd.Flags().Changed("history")
 		if ephemeralChanged && persistentChanged {
 			FatalErrorRespectJSON("cannot specify both --ephemeral and --persistent flags")
+		}
+		if noHistoryChanged && ephemeralChanged {
+			FatalErrorRespectJSON("cannot specify both --no-history and --ephemeral flags")
+		}
+		if noHistoryChanged && historyChanged {
+			FatalErrorRespectJSON("cannot specify both --no-history and --history flags")
 		}
 		if ephemeralChanged {
 			updates["wisp"] = true
 		}
 		if persistentChanged {
 			updates["wisp"] = false
+		}
+		if noHistoryChanged {
+			updates["no_history"] = true
+		}
+		if historyChanged {
+			updates["no_history"] = false
 		}
 		// Metadata flag (GH#1413)
 		if cmd.Flags().Changed("metadata") {
@@ -320,6 +334,14 @@ create, update, show, or close operation).`,
 				}
 			}
 
+			// Handle --metadata: merge with existing metadata instead of replacing
+			if newMeta, ok := regularUpdates["metadata"].(json.RawMessage); ok && len(issue.Metadata) > 0 {
+				merged, err := mergeMetadata(issue.Metadata, newMeta)
+				if err != nil {
+					FatalErrorRespectJSON("metadata merge failed for %s: %v", id, err)
+				}
+				regularUpdates["metadata"] = merged
+			}
 			// Handle incremental metadata edits (GH#1406)
 			if setMeta, ok := updates["_set_metadata"].([]string); ok {
 				unsetMeta, _ := updates["_unset_metadata"].([]string)
@@ -456,6 +478,35 @@ create, update, show, or close operation).`,
 	},
 }
 
+// mergeMetadata merges new metadata JSON into existing metadata.
+// Keys from newMeta overwrite keys in existing; keys only in existing are preserved.
+func mergeMetadata(existing, newMeta json.RawMessage) (json.RawMessage, error) {
+	base := make(map[string]json.RawMessage)
+	if len(existing) > 0 {
+		trimmed := strings.TrimSpace(string(existing))
+		if trimmed != "" && trimmed != "null" {
+			if err := json.Unmarshal(existing, &base); err != nil {
+				return nil, fmt.Errorf("existing metadata is not a JSON object: %w", err)
+			}
+		}
+	}
+
+	incoming := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(newMeta, &incoming); err != nil {
+		return nil, fmt.Errorf("new metadata is not a JSON object: %w", err)
+	}
+
+	for k, v := range incoming {
+		base[k] = v
+	}
+
+	result, err := json.Marshal(base)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal merged metadata: %w", err)
+	}
+	return json.RawMessage(result), nil
+}
+
 // applyMetadataEdits applies --set-metadata and --unset-metadata edits to existing metadata.
 // Returns the merged JSON as json.RawMessage.
 func applyMetadataEdits(existing json.RawMessage, setFlags, unsetFlags []string) (json.RawMessage, error) {
@@ -553,6 +604,8 @@ func init() {
 	// Ephemeral/persistent flags
 	updateCmd.Flags().Bool("ephemeral", false, "Mark issue as ephemeral (wisp) - not exported to JSONL")
 	updateCmd.Flags().Bool("persistent", false, "Mark issue as persistent (promote wisp to regular issue)")
+	updateCmd.Flags().Bool("no-history", false, "Mark issue as no-history (skip Dolt commits, not GC-eligible)")
+	updateCmd.Flags().Bool("history", false, "Clear no-history flag (re-enable Dolt commit history)")
 	// Metadata flag (GH#1413)
 	updateCmd.Flags().String("metadata", "", "Set custom metadata (JSON string or @file.json to read from file)")
 	// Incremental metadata edits (GH#1406)

@@ -136,7 +136,7 @@ func CheckStaleMolecules(path string) DoctorCheck {
 	// Open database using Dolt
 	ctx := context.Background()
 	doltPath := getDatabasePath(beadsDir)
-	store, err := dolt.New(ctx, &dolt.Config{Path: doltPath, ReadOnly: true, Database: doltDatabaseName(beadsDir)})
+	store, err := dolt.New(ctx, doltServerConfig(beadsDir, doltPath))
 	if err != nil {
 		return DoctorCheck{
 			Name:     "Stale Molecules",
@@ -524,7 +524,7 @@ func loadMaintenanceIssues(path string) ([]*types.Issue, error) {
 
 func loadMaintenanceIssuesFromDatabase(beadsDir string) ([]*types.Issue, error) {
 	ctx := context.Background()
-	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
+	store, err := dolt.NewFromConfigWithCLIOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}

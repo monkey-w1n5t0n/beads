@@ -14,7 +14,7 @@ import (
 //
 //nolint:unparam // path reserved for future use
 func runPollutionCheck(_ string, clean bool, yes bool) {
-	// Ensure we have a store initialized (uses direct mode, no daemon support yet)
+	// Ensure we have a store initialized
 	if err := ensureDirectMode("pollution check requires direct mode"); err != nil {
 		FatalError("%v", err)
 	}
@@ -136,7 +136,7 @@ func runPollutionCheck(_ string, clean bool, yes bool) {
 	}
 
 	fmt.Printf("%s Deleted %d test issues\n", ui.RenderPass("✓"), deleted)
-	fmt.Printf("\nCleanup complete. To restore, run: bd import %s\n", backupPath)
+	fmt.Printf("\nCleanup complete. To restore, run: bd init --from-jsonl %s\n", backupPath)
 }
 
 func init() {

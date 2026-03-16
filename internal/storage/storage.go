@@ -66,7 +66,7 @@ type Storage interface {
 	AddIssueComment(ctx context.Context, issueID, author, text string) (*types.Comment, error)
 	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
 	GetEvents(ctx context.Context, issueID string, limit int) ([]*types.Event, error)
-	GetAllEventsSince(ctx context.Context, sinceID int64) ([]*types.Event, error)
+	GetAllEventsSince(ctx context.Context, since time.Time) ([]*types.Event, error)
 
 	// Statistics
 	GetStatistics(ctx context.Context) (*types.Statistics, error)
@@ -81,6 +81,24 @@ type Storage interface {
 
 	// Lifecycle
 	Close() error
+}
+
+// DoltStorage is the full interface for Dolt-backed stores, composing the core
+// Storage interface with all capability sub-interfaces. Both DoltStore and
+// EmbeddedDoltStore satisfy this interface.
+type DoltStorage interface {
+	Storage
+	VersionControl
+	HistoryViewer
+	RemoteStore
+	SyncStore
+	FederationStore
+	BulkIssueStore
+	DependencyQueryStore
+	AnnotationStore
+	ConfigMetadataStore
+	CompactionStore
+	AdvancedQueryStore
 }
 
 // Transaction provides atomic multi-operation support within a single database transaction.

@@ -14,19 +14,19 @@ func TestIsBackupAutoEnabled(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		envVal     string // "" = not set (use default), "true"/"false" = explicit
+		envVal     string // "\x00" = not set, "" = set to empty, "true"/"false"/"0" = explicit
 		hasRemote  bool
 		wantResult bool
 	}{
 		{
 			name:       "default + git remote → enabled",
-			envVal:     "",
+			envVal:     "\x00",
 			hasRemote:  true,
 			wantResult: true,
 		},
 		{
 			name:       "default + no git remote → disabled",
-			envVal:     "",
+			envVal:     "\x00",
 			hasRemote:  false,
 			wantResult: false,
 		},
@@ -42,6 +42,18 @@ func TestIsBackupAutoEnabled(t *testing.T) {
 			hasRemote:  true,
 			wantResult: false,
 		},
+		{
+			name:       "explicit 0 + remote → disabled",
+			envVal:     "0",
+			hasRemote:  true,
+			wantResult: false,
+		},
+		{
+			name:       "empty string + remote → disabled (env set = explicit)",
+			envVal:     "",
+			hasRemote:  true,
+			wantResult: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -51,12 +63,12 @@ func TestIsBackupAutoEnabled(t *testing.T) {
 			primeHasGitRemote = func() bool { return tt.hasRemote }
 			t.Cleanup(func() { primeHasGitRemote = orig })
 
-			// Set env var if needed (simulates explicit config)
-			if tt.envVal != "" {
-				t.Setenv("BD_BACKUP_ENABLED", tt.envVal)
-			} else {
+			// Set env var: "\x00" = unset, anything else = set to that value
+			if tt.envVal == "\x00" {
 				os.Unsetenv("BD_BACKUP_ENABLED")
 				t.Cleanup(func() { os.Unsetenv("BD_BACKUP_ENABLED") })
+			} else {
+				t.Setenv("BD_BACKUP_ENABLED", tt.envVal)
 			}
 
 			config.ResetForTesting()
@@ -78,20 +90,20 @@ func TestIsBackupGitPushEnabled(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		envVal     string // "" = not set (use default), "true"/"false" = explicit
+		envVal     string // "\x00" = not set, "" = set to empty, "true"/"false" = explicit
 		hasRemote  bool
 		noGitOps   bool // simulate stealth mode
 		wantResult bool
 	}{
 		{
-			name:       "default + git remote → enabled (follows auto-enable)",
-			envVal:     "",
+			name:       "default + git remote → disabled (git-push requires explicit opt-in)",
+			envVal:     "\x00",
 			hasRemote:  true,
-			wantResult: true,
+			wantResult: false,
 		},
 		{
 			name:       "default + no remote → disabled",
-			envVal:     "",
+			envVal:     "\x00",
 			hasRemote:  false,
 			wantResult: false,
 		},
@@ -109,7 +121,7 @@ func TestIsBackupGitPushEnabled(t *testing.T) {
 		},
 		{
 			name:       "stealth mode overrides default + remote",
-			envVal:     "",
+			envVal:     "\x00",
 			hasRemote:  true,
 			noGitOps:   true,
 			wantResult: false,
@@ -130,12 +142,12 @@ func TestIsBackupGitPushEnabled(t *testing.T) {
 			primeHasGitRemote = func() bool { return tt.hasRemote }
 			t.Cleanup(func() { primeHasGitRemote = orig })
 
-			// Set env var if needed (simulates explicit config)
-			if tt.envVal != "" {
-				t.Setenv("BD_BACKUP_GIT_PUSH", tt.envVal)
-			} else {
+			// Set env var: "\x00" = unset, anything else = set to that value
+			if tt.envVal == "\x00" {
 				os.Unsetenv("BD_BACKUP_GIT_PUSH")
 				t.Cleanup(func() { os.Unsetenv("BD_BACKUP_GIT_PUSH") })
+			} else {
+				t.Setenv("BD_BACKUP_GIT_PUSH", tt.envVal)
 			}
 			// Also clear the backup.enabled env to not interfere
 			os.Unsetenv("BD_BACKUP_ENABLED")
@@ -156,6 +168,31 @@ func TestIsBackupGitPushEnabled(t *testing.T) {
 			got := isBackupGitPushEnabled()
 			if got != tt.wantResult {
 				t.Errorf("isBackupGitPushEnabled() = %v, want %v", got, tt.wantResult)
+			}
+		})
+	}
+}
+
+func TestIsDefaultBranch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		branch string
+		want   bool
+	}{
+		{"main", true},
+		{"master", true},
+		{"feature/my-work", false},
+		{"fix/backup-bug", false},
+		{"develop", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.branch, func(t *testing.T) {
+			t.Parallel()
+			if got := isDefaultBranch(tt.branch); got != tt.want {
+				t.Errorf("isDefaultBranch(%q) = %v, want %v", tt.branch, got, tt.want)
 			}
 		})
 	}

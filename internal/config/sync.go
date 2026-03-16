@@ -25,105 +25,6 @@ func logConfigWarning(format string, args ...interface{}) {
 	}
 }
 
-// SyncMode represents the sync mode configuration
-type SyncMode string
-
-const (
-	// SyncModeDoltNative uses Dolt remote directly (the only supported mode)
-	SyncModeDoltNative SyncMode = "dolt-native"
-)
-
-// validSyncModes is the set of allowed sync mode values
-var validSyncModes = map[SyncMode]bool{
-	SyncModeDoltNative: true,
-}
-
-// ValidSyncModes returns the list of valid sync mode values.
-func ValidSyncModes() []string {
-	return []string{
-		string(SyncModeDoltNative),
-	}
-}
-
-// IsValidSyncMode returns true if the given string is a valid sync mode.
-func IsValidSyncMode(mode string) bool {
-	return validSyncModes[SyncMode(strings.ToLower(strings.TrimSpace(mode)))]
-}
-
-// ConflictStrategy represents the conflict resolution strategy
-type ConflictStrategy string
-
-const (
-	// ConflictStrategyNewest uses last-write-wins (default)
-	ConflictStrategyNewest ConflictStrategy = "newest"
-	// ConflictStrategyOurs prefers local changes
-	ConflictStrategyOurs ConflictStrategy = "ours"
-	// ConflictStrategyTheirs prefers remote changes
-	ConflictStrategyTheirs ConflictStrategy = "theirs"
-	// ConflictStrategyManual requires manual resolution
-	ConflictStrategyManual ConflictStrategy = "manual"
-)
-
-// FieldStrategy represents the merge strategy for a specific field
-type FieldStrategy string
-
-const (
-	// FieldStrategyNewest uses last-write-wins (default for scalar fields)
-	FieldStrategyNewest FieldStrategy = "newest"
-	// FieldStrategyMax takes the maximum value (for counters like compaction_level)
-	FieldStrategyMax FieldStrategy = "max"
-	// FieldStrategyUnion performs set union (for arrays like labels, waiters)
-	FieldStrategyUnion FieldStrategy = "union"
-	// FieldStrategyManual flags conflict for user resolution (for fields like estimated_minutes)
-	FieldStrategyManual FieldStrategy = "manual"
-)
-
-// validConflictStrategies is the set of allowed conflict strategy values
-var validConflictStrategies = map[ConflictStrategy]bool{
-	ConflictStrategyNewest: true,
-	ConflictStrategyOurs:   true,
-	ConflictStrategyTheirs: true,
-	ConflictStrategyManual: true,
-}
-
-// validFieldStrategies is the set of allowed per-field strategy values
-var validFieldStrategies = map[FieldStrategy]bool{
-	FieldStrategyNewest: true,
-	FieldStrategyMax:    true,
-	FieldStrategyUnion:  true,
-	FieldStrategyManual: true,
-}
-
-// ValidConflictStrategies returns the list of valid conflict strategy values.
-func ValidConflictStrategies() []string {
-	return []string{
-		string(ConflictStrategyNewest),
-		string(ConflictStrategyOurs),
-		string(ConflictStrategyTheirs),
-		string(ConflictStrategyManual),
-	}
-}
-
-// IsValidConflictStrategy returns true if the given string is a valid conflict strategy.
-func IsValidConflictStrategy(strategy string) bool {
-	return validConflictStrategies[ConflictStrategy(strings.ToLower(strings.TrimSpace(strategy)))]
-}
-
-// ValidFieldStrategies returns the list of valid per-field strategy values.
-func ValidFieldStrategies() []string {
-	return []string{
-		string(FieldStrategyNewest),
-		string(FieldStrategyMax),
-		string(FieldStrategyUnion),
-		string(FieldStrategyManual),
-	}
-}
-
-// IsValidFieldStrategy returns true if the given string is a valid per-field strategy.
-func IsValidFieldStrategy(strategy string) bool {
-	return validFieldStrategies[FieldStrategy(strings.ToLower(strings.TrimSpace(strategy)))]
-}
-
 // Sovereignty represents the federation sovereignty tier
 type Sovereignty string
 
@@ -167,34 +68,6 @@ func IsValidSovereignty(sovereignty string) bool {
 	return validSovereigntyTiers[Sovereignty(strings.ToUpper(strings.TrimSpace(sovereignty)))]
 }
 
-// GetSyncMode always returns SyncModeDoltNative.
-// The sync mode config key is deprecated; Dolt-native is the only supported mode.
-func GetSyncMode() SyncMode {
-	return SyncModeDoltNative
-}
-
-// GetConflictStrategy retrieves the conflict resolution strategy configuration.
-// Returns the configured strategy, or ConflictStrategyNewest (default) if not set or invalid.
-// Logs a warning if an invalid value is configured (unless ConfigWarnings is false).
-//
-// Config key: conflict.strategy
-// Valid values: newest, ours, theirs, manual
-func GetConflictStrategy() ConflictStrategy {
-	value := GetString("conflict.strategy")
-	if value == "" {
-		return ConflictStrategyNewest // Default
-	}
-
-	strategy := ConflictStrategy(strings.ToLower(strings.TrimSpace(value)))
-	if !validConflictStrategies[strategy] {
-		logConfigWarning("Warning: invalid conflict.strategy %q in config (valid: %s), using default 'newest'\n",
-			value, strings.Join(ValidConflictStrategies(), ", "))
-		return ConflictStrategyNewest
-	}
-
-	return strategy
-}
-
 // GetSovereignty retrieves the federation sovereignty tier configuration.
 // Returns the configured tier, or SovereigntyNone (empty, no restriction) if not set.
 // Returns SovereigntyT1 and logs a warning if an invalid non-empty value is configured.
@@ -218,22 +91,7 @@ func GetSovereignty() Sovereignty {
 	return tier
 }
 
-// String returns the string representation of the SyncMode.
-func (m SyncMode) String() string {
-	return string(m)
-}
-
-// String returns the string representation of the ConflictStrategy.
-func (s ConflictStrategy) String() string {
-	return string(s)
-}
-
 // String returns the string representation of the Sovereignty.
 func (s Sovereignty) String() string {
 	return string(s)
-}
-
-// String returns the string representation of the FieldStrategy.
-func (f FieldStrategy) String() string {
-	return string(f)
 }
