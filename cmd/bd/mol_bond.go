@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/formula"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -52,7 +51,7 @@ Dynamic bonding (Christmas Ornament pattern):
   This creates IDs like "parent.child-ref" instead of random hashes.
 
   Example:
-    bd mol bond mol-polecat-arm bd-patrol --ref arm-{{polecat_name}} --var polecat_name=ace
+    bd mol bond mol-worker-arm bd-patrol --ref arm-{{worker_name}} --var worker_name=ace
     # Creates: bd-patrol.arm-ace (and children like bd-patrol.arm-ace.capture)
 
 Use cases:
@@ -283,7 +282,7 @@ func operandType(isProtoIssue bool) string {
 }
 
 // bondProtoProto bonds two protos to create a compound proto
-func bondProtoProto(ctx context.Context, s *dolt.DoltStore, protoA, protoB *types.Issue, bondType, customTitle, actorName string) (*BondResult, error) {
+func bondProtoProto(ctx context.Context, s storage.DoltStorage, protoA, protoB *types.Issue, bondType, customTitle, actorName string) (*BondResult, error) {
 	// Create compound proto: a new root that references both protos as children
 	// The compound root will be a new issue that ties them together
 	compoundTitle := fmt.Sprintf("Compound: %s + %s", protoA.Title, protoB.Title)
@@ -370,12 +369,12 @@ func bondProtoProto(ctx context.Context, s *dolt.DoltStore, protoA, protoB *type
 // bondProtoMol bonds a proto to an existing molecule by spawning the proto.
 // If childRef is provided, generates custom IDs like "parent.childref" (dynamic bonding).
 // protoSubgraph can be nil if proto is from DB (will be loaded), or pre-loaded for formulas.
-func bondProtoMol(ctx context.Context, s *dolt.DoltStore, proto, mol *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
+func bondProtoMol(ctx context.Context, s storage.DoltStorage, proto, mol *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
 	return bondProtoMolWithSubgraph(ctx, s, nil, proto, mol, bondType, vars, childRef, actorName, ephemeralFlag, pourFlag)
 }
 
 // bondProtoMolWithSubgraph is the internal implementation that accepts a pre-loaded subgraph.
-func bondProtoMolWithSubgraph(ctx context.Context, s *dolt.DoltStore, protoSubgraph *TemplateSubgraph, proto, mol *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
+func bondProtoMolWithSubgraph(ctx context.Context, s storage.DoltStorage, protoSubgraph *TemplateSubgraph, proto, mol *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
 	// Use provided subgraph or load from DB
 	subgraph := protoSubgraph
 	if subgraph == nil {
@@ -453,19 +452,74 @@ func bondProtoMolWithSubgraph(ctx context.Context, s *dolt.DoltStore, protoSubgr
 }
 
 // bondMolProto bonds a molecule to a proto (symmetric with bondProtoMol)
-func bondMolProto(ctx context.Context, s *dolt.DoltStore, mol, proto *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
+func bondMolProto(ctx context.Context, s storage.DoltStorage, mol, proto *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
 	// Same as bondProtoMol but with arguments swapped
 	return bondProtoMol(ctx, s, proto, mol, bondType, vars, childRef, actorName, ephemeralFlag, pourFlag)
 }
 
-// bondMolMol bonds two molecules together
-func bondMolMol(ctx context.Context, s *dolt.DoltStore, molA, molB *types.Issue, bondType, actorName string) (*BondResult, error) {
+// wouldCreateCycle checks whether adding an edge (newDepID depends on newDependsOnID)
+// would create a cycle in the dependency graph. It does a BFS from newDependsOnID
+// following "depends on" edges; if newDepID is reachable, a cycle would be formed.
+// Returns (hasCycle, cyclePath) where cyclePath shows the chain if found.
+func wouldCreateCycle(ctx context.Context, s storage.DoltStorage, newDepID, newDependsOnID string) (bool, []string) {
+	visited := map[string]bool{newDependsOnID: true}
+	// parent tracks how we reached each node, for path reconstruction.
+	parent := map[string]string{newDependsOnID: ""}
+	queue := []string{newDependsOnID}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		deps, err := s.GetDependencyRecords(ctx, current)
+		if err != nil {
+			// If we can't query deps for a node, skip it rather than failing.
+			continue
+		}
+		for _, dep := range deps {
+			next := dep.DependsOnID
+			if next == newDepID {
+				// Found the cycle. Reconstruct the path.
+				path := []string{newDepID}
+				for node := current; node != ""; node = parent[node] {
+					path = append(path, node)
+				}
+				// Reverse to get forward direction.
+				for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+					path[i], path[j] = path[j], path[i]
+				}
+				// Append newDepID again to show the cycle closing.
+				path = append(path, newDepID)
+				return true, path
+			}
+			if !visited[next] {
+				visited[next] = true
+				parent[next] = current
+				queue = append(queue, next)
+			}
+		}
+	}
+	return false, nil
+}
+
+// bondMolMol bonds two molecules together.
+// It checks for transitive cycles in the dependency graph (GH#2719).
+func bondMolMol(ctx context.Context, s storage.DoltStorage, molA, molB *types.Issue, bondType, actorName string) (*BondResult, error) {
+	// The bond creates: molB depends on molA (IssueID=molB.ID, DependsOnID=molA.ID).
+	// A cycle exists if molA already transitively depends on molB, because then
+	// adding molB→molA would close the loop: molA→...→molB→molA.
+	hasCycle, cyclePath := wouldCreateCycle(ctx, s, molB.ID, molA.ID)
+	if hasCycle {
+		return nil, fmt.Errorf("cannot bond %s → %s: would create a transitive dependency cycle: %s",
+			molA.ID, molB.ID, strings.Join(cyclePath, " → "))
+	}
+
 	err := transact(ctx, s, fmt.Sprintf("bd: bond molecules %s + %s", molA.ID, molB.ID), func(tx storage.Transaction) error {
 		// Add dependency: B links to A
 		// Sequential: use blocks (B runs after A completes)
 		// Conditional: use conditional-blocks (B runs only if A fails)
 		// Parallel: use parent-child (organizational, no blocking)
-		// Note: Schema only allows one dependency per (issue_id, depends_on_id) pair
+		// Note: Schema only allows one dependency per (issue_id, target) pair (target = typed column)
 		var depType types.DependencyType
 		switch bondType {
 		case types.BondTypeSequential:
@@ -511,7 +565,7 @@ func minPriority(a, b int) int {
 // resolveOrDescribe checks if an operand is an issue or formula without cooking.
 // Used for dry-run mode. Returns (issue, formulaName, error).
 // If it's an issue, issue is set. If it's a formula, formulaName is set.
-func resolveOrDescribe(ctx context.Context, s *dolt.DoltStore, operand string) (*types.Issue, string, error) {
+func resolveOrDescribe(ctx context.Context, s storage.DoltStorage, operand string) (*types.Issue, string, error) {
 	// First, try to resolve as an existing issue
 	id, err := utils.ResolvePartialID(ctx, s, operand)
 	if err == nil {
@@ -542,7 +596,7 @@ func resolveOrDescribe(ctx context.Context, s *dolt.DoltStore, operand string) (
 //
 // The vars parameter is used for step condition filtering (bd-7zka.1).
 // This implements gt-4v1eo: formulas are cooked to in-memory subgraphs (no DB storage).
-func resolveOrCookToSubgraph(ctx context.Context, s *dolt.DoltStore, operand string, vars map[string]string) (*TemplateSubgraph, bool, error) {
+func resolveOrCookToSubgraph(ctx context.Context, s storage.DoltStorage, operand string, vars map[string]string) (*TemplateSubgraph, bool, error) {
 	// First, try to resolve as an existing issue
 	id, err := utils.ResolvePartialID(ctx, s, operand)
 	if err == nil {

@@ -1,6 +1,7 @@
 package dolt
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -17,7 +18,7 @@ func TestCircuitBreaker_InitiallyAllows(t *testing.T) {
 }
 
 func TestMaybeNewCircuitBreaker_PortZeroDisabled(t *testing.T) {
-	if cb := maybeNewCircuitBreaker("127.0.0.1", 0); cb != nil {
+	if cb := maybeNewCircuitBreaker("127.0.0.1", 0, "test"); cb != nil {
 		t.Fatalf("maybeNewCircuitBreaker(0) = %#v, want nil", cb)
 	}
 }
@@ -218,8 +219,8 @@ func TestCircuitBreaker_DifferentHostsSeparateState(t *testing.T) {
 	t.Setenv("BEADS_TEST_MODE", "")
 	// Two breakers for the same port but different hosts should have independent state.
 	// This is the core fix: previously keyed on port only, which caused cross-host blocking.
-	cb1 := newCircuitBreaker("127.0.0.1", 99999)
-	cb2 := newCircuitBreaker("10.0.0.1", 99999)
+	cb1 := newCircuitBreaker("127.0.0.1", 99999, "")
+	cb2 := newCircuitBreaker("10.0.0.1", 99999, "")
 	t.Cleanup(func() {
 		os.Remove(cb1.filePath)
 		os.Remove(cb2.filePath)
@@ -228,6 +229,39 @@ func TestCircuitBreaker_DifferentHostsSeparateState(t *testing.T) {
 	// Verify different file paths
 	if cb1.filePath == cb2.filePath {
 		t.Fatalf("different hosts should have different file paths: %s vs %s", cb1.filePath, cb2.filePath)
+	}
+
+	// Trip cb1
+	for i := 0; i < circuitFailureThreshold; i++ {
+		cb1.RecordFailure()
+	}
+	if cb1.State() != circuitOpen {
+		t.Fatal("cb1 should be open")
+	}
+
+	// cb2 should be unaffected
+	if cb2.State() != circuitClosed {
+		t.Fatalf("cb2 should be closed (independent of cb1), got %q", cb2.State())
+	}
+	if !cb2.Allow() {
+		t.Fatal("cb2 should allow requests (independent of cb1)")
+	}
+}
+
+func TestCircuitBreaker_DifferentDatabasesSeparateState(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	// Two breakers for the same host:port but different databases should have
+	// independent state. This prevents one degraded project from tripping the
+	// breaker for all worktrees on a shared server (GH#3140).
+	cb1 := newCircuitBreaker("127.0.0.1", 99999, "project_alpha")
+	cb2 := newCircuitBreaker("127.0.0.1", 99999, "project_beta")
+	t.Cleanup(func() {
+		os.Remove(cb1.filePath)
+		os.Remove(cb2.filePath)
+	})
+
+	if cb1.filePath == cb2.filePath {
+		t.Fatalf("different databases should have different file paths: %s vs %s", cb1.filePath, cb2.filePath)
 	}
 
 	// Trip cb1
@@ -263,6 +297,135 @@ func TestCircuitBreaker_FileDeleted(t *testing.T) {
 	}
 	if !cb.Allow() {
 		t.Fatal("should allow when state file is missing")
+	}
+}
+
+func TestCircuitBreaker_StaleStateAutoResets(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	cb := newTestCircuitBreaker(t)
+
+	// Trip the breaker
+	for i := 0; i < circuitFailureThreshold; i++ {
+		cb.RecordFailure()
+	}
+	if cb.State() != circuitOpen {
+		t.Fatal("expected open state after tripping")
+	}
+
+	// Simulate a stale breaker by backdating TrippedAt beyond the TTL
+	cb.mu.Lock()
+	state := cb.readState()
+	state.TrippedAt = time.Now().Add(-circuitStaleTTL - time.Minute)
+	state.LastFailure = state.TrippedAt
+	cb.writeState(state)
+	cb.mu.Unlock()
+
+	// readState should auto-reset the stale open state to closed
+	if cb.State() != circuitClosed {
+		t.Fatalf("stale open breaker should auto-reset to closed, got %q", cb.State())
+	}
+	if !cb.Allow() {
+		t.Fatal("stale breaker should allow requests after auto-reset")
+	}
+}
+
+func TestCircuitBreaker_RecentStateNotReset(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	cb := newTestCircuitBreaker(t)
+
+	// Trip the breaker
+	for i := 0; i < circuitFailureThreshold; i++ {
+		cb.RecordFailure()
+	}
+	if cb.State() != circuitOpen {
+		t.Fatal("expected open state after tripping")
+	}
+
+	// The breaker was just tripped (TrippedAt is recent) — it should NOT auto-reset
+	// (Allow returns false because cooldown hasn't elapsed and probe fails)
+	if cb.Allow() {
+		t.Fatal("recently-tripped breaker should NOT auto-reset or allow")
+	}
+}
+
+func TestCleanStaleCircuitBreakerFiles(t *testing.T) {
+	// Create a temp directory to simulate /tmp
+	dir := t.TempDir()
+
+	// Create a legacy port-0 file
+	port0File := filepath.Join(dir, "beads-dolt-circuit-0.json")
+	if err := os.WriteFile(port0File, []byte(`{"state":"open"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a stale open breaker file
+	staleFile := filepath.Join(dir, "beads-dolt-circuit-127-0-0-1-3307.json")
+	staleState := circuitState{
+		State:     circuitOpen,
+		TrippedAt: time.Now().Add(-circuitStaleTTL - time.Hour),
+	}
+	staleData, _ := json.Marshal(staleState)
+	if err := os.WriteFile(staleFile, staleData, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a fresh (non-stale) open breaker file
+	freshFile := filepath.Join(dir, "beads-dolt-circuit-127-0-0-1-5555.json")
+	freshState := circuitState{
+		State:     circuitOpen,
+		TrippedAt: time.Now(),
+	}
+	freshData, _ := json.Marshal(freshState)
+	if err := os.WriteFile(freshFile, freshData, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a closed breaker file (should be left alone)
+	closedFile := filepath.Join(dir, "beads-dolt-circuit-127-0-0-1-9999.json")
+	closedData, _ := json.Marshal(circuitState{State: circuitClosed})
+	if err := os.WriteFile(closedFile, closedData, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call the cleanup function with the test directory
+	cleanStaleCircuitBreakerFilesIn(dir)
+
+	// Legacy port-0 file should be removed
+	if _, err := os.Stat(port0File); !os.IsNotExist(err) {
+		t.Errorf("legacy port-0 file should have been removed: %s", port0File)
+	}
+
+	// Stale open file should be removed
+	if _, err := os.Stat(staleFile); !os.IsNotExist(err) {
+		t.Errorf("stale open breaker file should have been removed: %s", staleFile)
+	}
+
+	// Fresh open file should still exist
+	if _, err := os.Stat(freshFile); err != nil {
+		t.Errorf("fresh open breaker file should NOT have been removed: %s", freshFile)
+	}
+
+	// Closed file should still exist
+	if _, err := os.Stat(closedFile); err != nil {
+		t.Errorf("closed breaker file should NOT have been removed: %s", closedFile)
+	}
+}
+
+func TestCircuitBreakerDir_UsesSubdirectory(t *testing.T) {
+	// Verify that circuit breaker files are created in the dedicated
+	// subdirectory, not directly in /tmp (which can have millions of entries).
+	cb := newCircuitBreaker("127.0.0.1", 44444, "")
+	t.Cleanup(func() { os.Remove(cb.filePath) })
+
+	if filepath.Dir(cb.filePath) != filepath.Clean(circuitBreakerDir) {
+		t.Errorf("circuit breaker file should be in %s, got dir %s",
+			circuitBreakerDir, filepath.Dir(cb.filePath))
+	}
+
+	// Write state and verify file lands in the subdirectory
+	cb.writeState(circuitState{State: circuitClosed})
+	if _, err := os.Stat(cb.filePath); err != nil {
+		t.Errorf("circuit breaker file should exist at %s: %v", cb.filePath, err)
 	}
 }
 

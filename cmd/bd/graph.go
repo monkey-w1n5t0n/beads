@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -102,13 +103,19 @@ Examples:
 				return
 			}
 
+			// HTML: merge all components into one graph for a single document
+			if graphHTML {
+				merged := mergeSubgraphsForHTML(subgraphs)
+				layout := computeLayout(merged)
+				renderGraphHTML(layout, merged)
+				return
+			}
+
 			// Render all subgraphs
 			for i, subgraph := range subgraphs {
 				layout := computeLayout(subgraph)
 				if graphDOT {
 					renderGraphDOT(layout, subgraph)
-				} else if graphHTML {
-					renderGraphHTML(layout, subgraph)
 				} else if graphCompact {
 					renderGraphCompact(layout, subgraph)
 				} else if graphBox {
@@ -116,7 +123,7 @@ Examples:
 				} else {
 					renderGraphVisual(layout, subgraph)
 				}
-				if !graphDOT && !graphHTML && i < len(subgraphs)-1 {
+				if !graphDOT && i < len(subgraphs)-1 {
 					fmt.Println(strings.Repeat("─", 60))
 				}
 			}
@@ -162,6 +169,77 @@ Examples:
 	},
 }
 
+var graphCheckCmd = &cobra.Command{
+	Use:   "check",
+	Short: "Check dependency graph integrity",
+	Long: `Check the dependency graph for cycles, orphans, and other integrity issues.
+
+Returns exit code 0 if the graph is clean, 1 if issues are found.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		ctx := rootCtx
+
+		type GraphCheckResult struct {
+			Clean   bool       `json:"clean"`
+			Cycles  [][]string `json:"cycles"`
+			Summary struct {
+				CycleCount int `json:"cycle_count"`
+			} `json:"summary"`
+		}
+
+		result := GraphCheckResult{Clean: true}
+
+		// Detect cycles
+		cycles, err := store.DetectCycles(ctx)
+		if err != nil {
+			FatalErrorRespectJSON("cycle detection failed: %v", err)
+		}
+
+		for _, cycle := range cycles {
+			ids := make([]string, len(cycle))
+			for i, issue := range cycle {
+				ids[i] = issue.ID
+			}
+			result.Cycles = append(result.Cycles, ids)
+		}
+		result.Summary.CycleCount = len(cycles)
+
+		if len(cycles) > 0 {
+			result.Clean = false
+		}
+
+		if jsonOutput {
+			outputJSON(result)
+			if !result.Clean {
+				os.Exit(1)
+			}
+			return
+		}
+
+		// Human-readable output
+		if result.Clean {
+			fmt.Printf("\n%s Graph integrity check passed\n\n", ui.RenderPass("✓"))
+		} else {
+			fmt.Printf("\n%s Graph integrity issues found\n\n", ui.RenderFail("✗"))
+		}
+
+		if len(result.Cycles) > 0 {
+			fmt.Printf("%s Cycles (%d):\n\n", ui.RenderFail("⚠"), len(result.Cycles))
+			for _, cycle := range result.Cycles {
+				fmt.Printf("  %s → %s\n", strings.Join(cycle, " → "), cycle[0])
+			}
+			fmt.Println()
+		} else {
+			fmt.Printf("  %s No dependency cycles\n", ui.RenderPass("✓"))
+		}
+
+		fmt.Println()
+
+		if !result.Clean {
+			os.Exit(1)
+		}
+	},
+}
+
 func init() {
 	graphCmd.Flags().BoolVar(&graphAll, "all", false, "Show graph for all open issues")
 	graphCmd.Flags().BoolVar(&graphCompact, "compact", false, "Tree format, one line per issue, more scannable")
@@ -170,11 +248,12 @@ func init() {
 	graphCmd.Flags().BoolVar(&graphHTML, "html", false, "Output self-contained interactive HTML (redirect to file)")
 	graphCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(graphCmd)
+	graphCmd.AddCommand(graphCheckCmd)
 }
 
 // loadGraphSubgraph loads an issue and its subgraph for visualization
 // Unlike template loading, this includes ALL dependency types (not just parent-child)
-func loadGraphSubgraph(ctx context.Context, s *dolt.DoltStore, issueID string) (*TemplateSubgraph, error) {
+func loadGraphSubgraph(ctx context.Context, s storage.DoltStorage, issueID string) (*TemplateSubgraph, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -275,7 +354,7 @@ func loadGraphSubgraph(ctx context.Context, s *dolt.DoltStore, issueID string) (
 
 // loadAllGraphSubgraphs loads all open issues and groups them by connected component
 // Each component is a subgraph of issues that share dependencies
-func loadAllGraphSubgraphs(ctx context.Context, s *dolt.DoltStore) ([]*TemplateSubgraph, error) {
+func loadAllGraphSubgraphs(ctx context.Context, s storage.DoltStorage) ([]*TemplateSubgraph, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -448,10 +527,40 @@ func loadAllGraphSubgraphs(ctx context.Context, s *dolt.DoltStore) ([]*TemplateS
 }
 
 // computeLayout assigns layers to nodes using topological sort
+// mergeSubgraphsForHTML joins disconnected components into one subgraph so
+// `bd graph --all --html` emits a single valid HTML document.
+func mergeSubgraphsForHTML(subgraphs []*TemplateSubgraph) *TemplateSubgraph {
+	switch len(subgraphs) {
+	case 0:
+		return &TemplateSubgraph{IssueMap: make(map[string]*types.Issue)}
+	case 1:
+		return subgraphs[0]
+	}
+	merged := &TemplateSubgraph{
+		IssueMap: make(map[string]*types.Issue),
+	}
+	for _, sg := range subgraphs {
+		for _, issue := range sg.Issues {
+			merged.IssueMap[issue.ID] = issue
+		}
+		merged.Dependencies = append(merged.Dependencies, sg.Dependencies...)
+	}
+	merged.Issues = make([]*types.Issue, 0, len(merged.IssueMap))
+	for _, issue := range merged.IssueMap {
+		merged.Issues = append(merged.Issues, issue)
+	}
+	sort.Slice(merged.Issues, func(i, j int) bool {
+		return merged.Issues[i].ID < merged.Issues[j].ID
+	})
+	return merged
+}
+
 func computeLayout(subgraph *TemplateSubgraph) *GraphLayout {
 	layout := &GraphLayout{
-		Nodes:  make(map[string]*GraphNode),
-		RootID: subgraph.Root.ID,
+		Nodes: make(map[string]*GraphNode),
+	}
+	if subgraph.Root != nil {
+		layout.RootID = subgraph.Root.ID
 	}
 
 	// Build dependency map (only "blocks" dependencies, not parent-child)
@@ -695,7 +804,7 @@ func renderGraphCompact(layout *GraphLayout, subgraph *TemplateSubgraph) {
 			if nodeI.Issue.Priority != nodeJ.Issue.Priority {
 				return nodeI.Issue.Priority < nodeJ.Issue.Priority
 			}
-			return nodeI.Issue.ID < nodeJ.Issue.ID
+			return utils.NaturalCompareIDs(nodeI.Issue.ID, nodeJ.Issue.ID) < 0
 		})
 	}
 

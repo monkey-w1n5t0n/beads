@@ -4,13 +4,14 @@
 // This package exports only the essential types and functions needed for
 // Go-based extensions that want to use bd's storage layer programmatically.
 //
-// For detailed guidance on extending bd, see docs/EXTENDING.md.
+// For a working extension example, see examples/bd-example-extension-go.
 package beads
 
 import (
 	"context"
 
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -21,6 +22,40 @@ type Storage = beads.Storage
 // Transaction provides atomic multi-operation support within a database transaction.
 // Use Storage.RunInTransaction() to obtain a Transaction instance.
 type Transaction = beads.Transaction
+
+// RemoteStore provides dolt remote management and replication operations.
+// Use type assertion on a Storage value to access these methods:
+//
+//	if rs, ok := store.(beads.RemoteStore); ok {
+//	    rs.Push(ctx)
+//	}
+type RemoteStore = storage.RemoteStore
+
+// SyncStore provides high-level sync operations with peers.
+type SyncStore = storage.SyncStore
+
+// VersionControlReader provides read-only version control operations.
+// Write operations (Branch, Checkout, Merge, DeleteBranch) are not yet
+// part of the public API. If you need them, please open an issue.
+type VersionControlReader interface {
+	CurrentBranch(ctx context.Context) (string, error)
+	ListBranches(ctx context.Context) ([]string, error)
+	CommitExists(ctx context.Context, commitHash string) (bool, error)
+	GetCurrentCommit(ctx context.Context) (string, error)
+	Status(ctx context.Context) (*VCStatus, error)
+	Log(ctx context.Context, limit int) ([]CommitInfo, error)
+}
+
+// Replication and version control types from internal/storage
+type (
+	RemoteInfo  = storage.RemoteInfo
+	SyncResult  = storage.SyncResult
+	SyncStatus  = storage.SyncStatus
+	Conflict    = storage.Conflict
+	CommitInfo  = storage.CommitInfo
+	VCStatus    = storage.Status
+	StatusEntry = storage.StatusEntry
+)
 
 // Open opens a Dolt-backed beads database at the given path.
 // This always opens in embedded mode. Use OpenFromConfig to respect
@@ -86,6 +121,7 @@ type (
 	IssueWithDependencyMetadata = types.IssueWithDependencyMetadata
 	SortPolicy                  = types.SortPolicy
 	EpicStatus                  = types.EpicStatus
+	WispFilter                  = types.WispFilter
 )
 
 // Status constants

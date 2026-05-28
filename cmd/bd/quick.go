@@ -43,6 +43,7 @@ Example:
 			Status:    types.StatusOpen,
 			Priority:  priority,
 			IssueType: types.IssueType(issueType).Normalize(),
+			Labels:    mergeCreateLabels(labels, nil),
 		}
 
 		ctx := rootCtx
@@ -50,10 +51,7 @@ Example:
 			FatalError("%v", err)
 		}
 
-		// Add labels if specified (silently ignore failures)
-		for _, label := range labels {
-			_ = store.AddLabel(ctx, issue.ID, label, actor)
-		}
+		commandDidWrite.Store(true)
 
 		// Output only the ID
 		fmt.Println(issue.ID)

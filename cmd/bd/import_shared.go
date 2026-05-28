@@ -40,6 +40,8 @@ type ImportResult struct {
 	PrefixMismatch      bool
 	ExpectedPrefix      string
 	MismatchPrefixes    map[string]int
+	ImportedIDs         []string
+	StaleSkippedIDs     []string
 	SkippedDependencies []string
 }
 
@@ -50,41 +52,164 @@ func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, 
 		return &ImportResult{Skipped: len(issues)}, nil
 	}
 
-	err := store.CreateIssuesWithFullOptions(ctx, issues, getActorWithGit(), storage.BatchCreateOptions{
-		OrphanHandling:       storage.OrphanAllow,
-		SkipPrefixValidation: opts.SkipPrefixValidation,
+	filtered, staleSkippedIDs, err := filterStaleImportIssues(ctx, store, issues)
+	if err != nil {
+		return nil, err
+	}
+	issues = filtered
+	if len(issues) == 0 {
+		return &ImportResult{Skipped: len(staleSkippedIDs), StaleSkippedIDs: staleSkippedIDs}, nil
+	}
+
+	var skippedDependencies []string
+	skippedDependencySet := make(map[string]struct{})
+	err = store.CreateIssuesWithFullOptions(ctx, issues, getActorWithGit(), storage.BatchCreateOptions{
+		OrphanHandling:                 storage.OrphanAllow,
+		SkipPrefixValidation:           opts.SkipPrefixValidation,
+		SkipDependencyValidationErrors: true,
+		OnSkippedDependency: func(issueID, dependsOnID, reason string) {
+			skipped := fmt.Sprintf("%s -> %s: %s", issueID, dependsOnID, reason)
+			if _, ok := skippedDependencySet[skipped]; ok {
+				return
+			}
+			skippedDependencySet[skipped] = struct{}{}
+			skippedDependencies = append(skippedDependencies, skipped)
+		},
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return &ImportResult{Created: len(issues)}, nil
+	importedIDs := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		importedIDs = append(importedIDs, issue.ID)
+	}
+	return &ImportResult{
+		Created:             len(issues),
+		Skipped:             len(staleSkippedIDs),
+		ImportedIDs:         importedIDs,
+		StaleSkippedIDs:     staleSkippedIDs,
+		SkippedDependencies: skippedDependencies,
+	}, nil
 }
 
-// importFromLocalJSONL imports issues from a local JSONL file on disk into the Dolt store.
-// Unlike git-based import, this reads from the current working tree, preserving
-// any manual cleanup done to the JSONL file (e.g., via bd compact --purge-tombstones).
-// Returns the number of issues imported and any error.
-func importFromLocalJSONL(ctx context.Context, store storage.DoltStorage, localPath string) (int, error) {
-	//nolint:gosec // G304: path from user-provided CLI argument
-	data, err := os.ReadFile(localPath)
+func filterStaleImportIssues(ctx context.Context, store storage.DoltStorage, issues []*types.Issue) ([]*types.Issue, []string, error) {
+	ids := make([]string, 0, len(issues))
+	seen := make(map[string]struct{}, len(issues))
+	for _, issue := range issues {
+		if issue == nil || issue.ID == "" {
+			continue
+		}
+		if _, ok := seen[issue.ID]; ok {
+			continue
+		}
+		seen[issue.ID] = struct{}{}
+		ids = append(ids, issue.ID)
+	}
+	if len(ids) == 0 {
+		return issues, nil, nil
+	}
+
+	localIssues, err := store.GetIssuesByIDs(ctx, ids)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read JSONL file %s: %w", localPath, err)
+		return nil, nil, fmt.Errorf("check existing issues before import: %w", err)
+	}
+	localUpdatedAt := make(map[string]time.Time, len(localIssues))
+	for _, issue := range localIssues {
+		if issue != nil && issue.ID != "" && !issue.UpdatedAt.IsZero() {
+			localUpdatedAt[issue.ID] = issue.UpdatedAt
+		}
+	}
+	if len(localUpdatedAt) == 0 {
+		return issues, nil, nil
+	}
+
+	filtered := make([]*types.Issue, 0, len(issues))
+	skippedIDs := make([]string, 0)
+	for _, issue := range issues {
+		if issue == nil || issue.ID == "" || issue.UpdatedAt.IsZero() {
+			filtered = append(filtered, issue)
+			continue
+		}
+		if local, ok := localUpdatedAt[issue.ID]; ok && issue.UpdatedAt.UTC().Before(local.UTC()) {
+			skippedIDs = append(skippedIDs, issue.ID)
+			continue
+		}
+		filtered = append(filtered, issue)
+	}
+	return filtered, skippedIDs, nil
+}
+
+// importLocalResult holds counts from a local JSONL import.
+type importLocalResult struct {
+	Issues   int
+	Memories int
+}
+
+// memoryRecord represents a memory entry in the JSONL export.
+type memoryRecord struct {
+	Type  string `json:"_type"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// importFromLocalJSONL imports issues (and memories) from a local JSONL file on disk
+// into the Dolt store. Returns the number of issues imported and any error.
+// This is a convenience wrapper around importFromLocalJSONLFull.
+func importFromLocalJSONL(ctx context.Context, store storage.DoltStorage, localPath string) (int, error) {
+	result, err := importFromLocalJSONLFull(ctx, store, localPath)
+	if err != nil {
+		return 0, err
+	}
+	return result.Issues, nil
+}
+
+// parseJSONLFile reads a JSONL file and returns parsed issues and config
+// entries (memories). Pure function — no store I/O.
+func parseJSONLFile(path string) ([]*types.Issue, map[string]string, error) {
+	//nolint:gosec // G304: path from user-provided CLI argument
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read JSONL file %s: %w", path, err)
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
 	// Allow up to 64MB per line for large descriptions
 	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
 	var issues []*types.Issue
+	configEntries := make(map[string]string)
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
 			continue
 		}
+
+		// Peek at the record to check for _type field
+		var peek map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &peek); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse JSONL line: %w", err)
+		}
+
+		// Check if this is a memory record
+		if rawType, ok := peek["_type"]; ok {
+			var typeStr string
+			if err := json.Unmarshal(rawType, &typeStr); err == nil && typeStr == "memory" {
+				var mem memoryRecord
+				if err := json.Unmarshal([]byte(line), &mem); err != nil {
+					return nil, nil, fmt.Errorf("failed to parse memory record: %w", err)
+				}
+				if mem.Key != "" && mem.Value != "" {
+					configEntries[kvPrefix+memoryPrefix+mem.Key] = mem.Value
+				}
+				continue
+			}
+		}
+
+		// Regular issue record
 		var issue types.Issue
 		if err := json.Unmarshal([]byte(line), &issue); err != nil {
-			return 0, fmt.Errorf("failed to parse issue from JSONL: %w", err)
+			return nil, nil, fmt.Errorf("failed to parse issue from JSONL: %w", err)
 		}
 		// Skip tombstone entries: these are deleted issues exported by older
 		// versions (pre-v0.50) with status "tombstone" and deleted_at set.
@@ -92,35 +217,67 @@ func importFromLocalJSONL(ctx context.Context, store storage.DoltStorage, localP
 		if issue.Status == "tombstone" {
 			continue
 		}
+
+		// v0.35–v0.37 exported "wisp" (bool), renamed to "ephemeral" in v0.38+.
+		// map old field name so the flag is preserved on import.
+		if _, hasWisp := peek["wisp"]; hasWisp && !issue.Ephemeral {
+			var wisp bool
+			if err := json.Unmarshal(peek["wisp"], &wisp); err == nil && wisp {
+				issue.Ephemeral = true
+			}
+		}
+
 		issue.SetDefaults()
 		issues = append(issues, &issue)
 	}
 	if err := scanner.Err(); err != nil {
-		return 0, fmt.Errorf("failed to scan JSONL: %w", err)
+		return nil, nil, fmt.Errorf("failed to scan JSONL: %w", err)
 	}
 
-	if len(issues) == 0 {
-		return 0, nil
+	return issues, configEntries, nil
+}
+
+// importFromLocalJSONLFull imports issues and memories from a local JSONL file.
+// It detects memory records (lines with "_type":"memory") and imports them
+// via SetConfig, while routing regular issue records through the normal path.
+func importFromLocalJSONLFull(ctx context.Context, store storage.DoltStorage, localPath string) (*importLocalResult, error) {
+	issues, configEntries, err := parseJSONLFile(localPath)
+	if err != nil {
+		return nil, err
 	}
 
-	// Auto-detect prefix from first issue if not already configured
-	configuredPrefix, err := store.GetConfig(ctx, "issue_prefix")
-	if err == nil && strings.TrimSpace(configuredPrefix) == "" {
-		firstPrefix := utils.ExtractIssuePrefix(issues[0].ID)
-		if firstPrefix != "" {
-			if err := store.SetConfig(ctx, "issue_prefix", firstPrefix); err != nil {
-				return 0, fmt.Errorf("failed to set issue_prefix from imported issues: %w", err)
+	result := &importLocalResult{}
+
+	// Import memories
+	for key, value := range configEntries {
+		if err := store.SetConfig(ctx, key, value); err != nil {
+			return nil, fmt.Errorf("failed to import config %q: %w", key, err)
+		}
+		result.Memories++
+	}
+
+	// Import issues
+	if len(issues) > 0 {
+		// Auto-detect prefix from first issue if not already configured
+		configuredPrefix, err := store.GetConfig(ctx, "issue_prefix")
+		if err == nil && strings.TrimSpace(configuredPrefix) == "" {
+			firstPrefix := utils.ExtractIssuePrefix(issues[0].ID)
+			if firstPrefix != "" {
+				if err := store.SetConfig(ctx, "issue_prefix", firstPrefix); err != nil {
+					return nil, fmt.Errorf("failed to set issue_prefix from imported issues: %w", err)
+				}
 			}
 		}
+
+		opts := ImportOptions{
+			SkipPrefixValidation: true,
+		}
+		importResult, err := importIssuesCore(ctx, "", store, issues, opts)
+		if err != nil {
+			return nil, err
+		}
+		result.Issues = importResult.Created
 	}
 
-	opts := ImportOptions{
-		SkipPrefixValidation: true,
-	}
-	_, err = importIssuesCore(ctx, "", store, issues, opts)
-	if err != nil {
-		return 0, err
-	}
-
-	return len(issues), nil
+	return result, nil
 }

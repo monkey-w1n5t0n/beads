@@ -9,7 +9,7 @@ A curated list of community-built UIs, extensions, and integrations for Beads. R
 
 ## Terminal UIs
 
-- **[Mardi Gras](https://github.com/quietpublish/mardi-gras)** - Parade-themed terminal UI with real-time updates, Gas Town agent orchestration, tmux integration, and Claude Code dispatch. Uses `bd list --json`. Built by [@matt-wright86](https://github.com/matt-wright86). (Go)
+- **[Mardi Gras](https://github.com/quietpublish/mardi-gras)** - Parade-themed terminal UI with real-time updates, multi-agent orchestration, tmux integration, and Claude Code dispatch. Uses `bd list --json`. Built by [@matt-wright86](https://github.com/matt-wright86). (Go)
 
 - **[perles](https://github.com/zjrosen/perles)** - Terminal UI search, dependency and kanban viewer powered by a custom BQL (Beads Query Language). Built by [@zjrosen](https://github.com/zjrosen). (Go)
 
@@ -17,7 +17,7 @@ A curated list of community-built UIs, extensions, and integrations for Beads. R
 
 - **[beads-ui](https://github.com/mantoni/beads-ui)** - Local web interface with live updates and kanban board. Uses the `bd` CLI for Dolt compatibility. Run with `npx beads-ui start`. Built by [@mantoni](https://github.com/mantoni). (Node.js)
 
-- **[BeadBoard](https://github.com/zenchantlive/beadboard)** - Windows-native control center with multi-project registry, dependency graph explorer, agent sessions hub, and timeline. Built by [@zenchantlive](https://github.com/zenchantlive). (Next.js/TypeScript)
+- **[BeadBoard](https://github.com/zenchantlive/beadboard)** - Multi-agent orchestration and communication system with a live dashboard. Agent-to-agent messaging (HANDOFF/BLOCKED/DECISION/INFO), DAG dependency graph, swarm coordination with archetypes and templates, scope-based work reservations, and an embedded execution runtime (bb-pi) built on [Pi](https://github.com/badlogic/pi-mono) that spawns typed worker agents. Cross-platform (macOS, Linux, Windows). Includes the `beadboard-driver` skill for agent integration (`npx skills add zenchantlive/beadboard --skill beadboard-driver`). Built by [@zenchantlive](https://github.com/zenchantlive). (Next.js/TypeScript)
 
 - **[beads-web](https://github.com/weselow/beads-web)** - Actively maintained fork of beads-kanban-ui. Cross-platform single-binary distribution (macOS, Linux, Windows), 7 visual themes, Dolt direct SQL integration, Windows multi-drive path support, drag-and-drop status updates. Download from [GitHub Releases](https://github.com/weselow/beads-web/releases). Built by [@weselow](https://github.com/weselow). (TypeScript/Rust)
 
@@ -26,6 +26,8 @@ A curated list of community-built UIs, extensions, and integrations for Beads. R
 - **[vscode-beads](https://marketplace.visualstudio.com/items?itemName=planet57.vscode-beads)** - VS Code extension with issues panel and server management. Built by [@jdillon](https://github.com/jdillon). (TypeScript)
 
 - **[opencode-beads](https://github.com/joshuadavidthomas/opencode-beads)** - OpenCode plugin with automatic context injection, `/bd-*` slash commands, and autonomous task agent. Built by [@joshuadavidthomas](https://github.com/joshuadavidthomas). (Node.js)
+
+- **[Lista Beads](https://marketplace.visualstudio.com/items?itemName=ListaDev.lista-beads)** - Full-featured VS Code extension: filterable tree view, issue detail panel, dashboard with metrics, dependency graph, Dolt push/pull, CodeLens for bead references, wisps & formula support, stale issue management, and multi-tracker sync (Azure DevOps, GitHub, Jira, Linear, GitLab). Built by [@harry-miller-trimble](https://github.com/harry-miller-trimble). (TypeScript)
 
 - **[nvim-beads (fancypantalons)](https://github.com/fancypantalons/nvim-beads)** - Neovim plugin for managing Beads issues. By [@fancypantalons](https://github.com/fancypantalons). (Lua)
 
@@ -41,6 +43,12 @@ A curated list of community-built UIs, extensions, and integrations for Beads. R
 
 - **[stringer](https://github.com/davetashner/stringer)** - Codebase archaeology CLI that mines git repos for TODOs, churn hotspots, lottery-risk files, dependency health, and more. Outputs JSONL compatible with `bd init --from-jsonl`. Install with `brew install davetashner/tap/stringer`. Built by [@davetashner](https://github.com/davetashner). (Go)
 
+## Analytics & Observability
+
+* **[Thread](https://github.com/jklenk/thread)** - Read-only forensics and analytics layer for Beads. Reads local Dolt history and produces fidelity scores, rework cost metrics, session compliance scoring, and a self-contained HTML report. Add `Run 'thread prime --json' at session start` to your `AGENTS.md` to give agents project health context before they claim their first bead. 
+
+Install with `uv tool install git+https://github.com/jklenk/thread`. Built by [@jklenk](https://github.com/jklenk). (Python/DuckDB)
+
 ## SDKs & Libraries
 
 - **[beads-sdk](https://github.com/HerbCaudill/beads-sdk)** - Typed TypeScript SDK with zero runtime dependencies. High-level `BeadsClient` for CRUD, filtering, search, labels, dependencies, comments, epics, and sync. Install with `pnpm add @herbcaudill/beads-sdk`. Built by [@HerbCaudill](https://github.com/HerbCaudill). (TypeScript)
@@ -51,6 +59,8 @@ A curated list of community-built UIs, extensions, and integrations for Beads. R
 
 - **[beads-compound](https://github.com/roberto-mello/beads-compound-plugin)** - Claude Code plugin marketplace with persistent memory and compound-engineering workflows. Hooks auto-capture knowledge from `bd comments add` at session end and inject relevant entries at session start based on open beads. Includes 28 specialized agents, 26 commands, and 15 skills for planning, review, research, and parallel work. Also supports OpenCode and Gemini CLI. Built by [@roberto-mello](https://github.com/roberto-mello). (Bash/TypeScript)
 
+- **[claude-handoff](https://github.com/REMvisual/claude-handoff)** - Session handoff skills for Claude Code. Captures decisions, failed approaches, measurements, and next steps into structured files so the next session picks up where you left off. Uses bead IDs as chain tags for multi-session continuity, auto-detects active beads, and updates bead notes on close. Includes `/handoff`, `/handoffplan`, and a PreCompact safety-net hook. Built by [@REMvisual](https://github.com/REMvisual). (Markdown/Bash)
+- **[claude-workspace-snapshot](https://github.com/REMvisual/claude-workspace-snapshot)** - Snapshot and restore live Claude Code sessions as named, color-coded Windows Terminal tabs. Detects running sessions via process inspection and .jsonl file activity. Restores tab layout after any restart. Pairs with claude-handoff for full session continuity. Built by [@REMvisual](https://github.com/REMvisual). (PowerShell/Batch)
 - **[claude-protocol](https://github.com/weselow/claude-protocol)** - Actively maintained fork of beads-orchestration. Ground-up rewrite optimized for Claude 4.6 family models: trigger-based dev rules (TDD, logging, resilience), cross-platform Node.js hooks (replaced 19 bash scripts with 8 .cjs hooks), mandatory checklist verification, session-start dashboard, knowledge base with auto-capture. Install via `npx claude-protocol init`. Built by [@weselow](https://github.com/weselow). (Node.js/Python)
 
 ## Coordination Servers
@@ -101,7 +111,7 @@ A curated list of community-built UIs, extensions, and integrations for Beads. R
 
 ## Discussion
 
-See [GitHub Discussions #276](https://github.com/steveyegge/beads/discussions/276) for ongoing UI development conversations, design decisions, and community contributions.
+See [GitHub Discussions #276](https://github.com/gastownhall/beads/discussions/276) for ongoing UI development conversations, design decisions, and community contributions.
 
 ## Contributing
 

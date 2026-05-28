@@ -2,13 +2,10 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 var (
@@ -48,53 +45,36 @@ Examples:
 		ctx := rootCtx
 		start := time.Now()
 
-		beadsDir := beads.FindBeadsDir()
-		if beadsDir == "" {
-			FatalError("could not find .beads directory")
-		}
-		doltPath := filepath.Join(beadsDir, "dolt")
-
-		if _, err := os.Stat(doltPath); os.IsNotExist(err) {
-			FatalError("Dolt directory not found at %s", doltPath)
+		flattener, ok := storage.UnwrapStore(store).(storage.Flattener)
+		if !ok {
+			FatalError("storage backend does not support flatten")
 		}
 
-		if _, err := exec.LookPath("dolt"); err != nil {
-			FatalErrorWithHint("dolt command not found in PATH",
-				"Install Dolt from https://github.com/dolthub/dolt")
+		// Get commit count and initial hash for reporting.
+		// Use store.Log() which works across both backends.
+		logEntries, logErr := store.Log(ctx, 0)
+		if logErr != nil {
+			FatalError("failed to read commit log: %v", logErr)
 		}
+		commitCount := len(logEntries)
 
-		// Count commits
-		var commitCount int
-		if err := store.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_log").Scan(&commitCount); err != nil {
-			FatalError("failed to count commits: %v", err)
-		}
-
-		// Get initial commit hash (oldest ancestor)
 		var initialHash string
-		if err := store.DB().QueryRowContext(ctx,
-			"SELECT commit_hash FROM dolt_log ORDER BY date ASC LIMIT 1",
-		).Scan(&initialHash); err != nil {
-			FatalError("failed to find initial commit: %v", err)
+		if commitCount > 0 {
+			initialHash = logEntries[commitCount-1].Hash // oldest is last
 		}
-
-		sizeBefore, _ := getDirSize(doltPath)
 
 		if flattenDryRun {
 			if jsonOutput {
-				outputJSON(map[string]interface{}{
+				result := map[string]interface{}{
 					"dry_run":       true,
 					"commit_count":  commitCount,
 					"initial_hash":  initialHash,
-					"dolt_path":     doltPath,
-					"size_before":   sizeBefore,
-					"size_display":  formatBytes(sizeBefore),
 					"would_flatten": commitCount > 1,
-				})
+				}
+				outputJSON(result)
 				return
 			}
 			fmt.Printf("DRY RUN — Flatten preview\n\n")
-			fmt.Printf("  Dolt directory: %s\n", doltPath)
-			fmt.Printf("  Current size:   %s\n", formatBytes(sizeBefore))
 			fmt.Printf("  Commits:        %d\n", commitCount)
 			fmt.Printf("  Initial commit: %s\n", initialHash)
 			if commitCount <= 1 {
@@ -129,53 +109,17 @@ Examples:
 			fmt.Printf("Flattening %d commits...\n", commitCount)
 		}
 
-		// Tim Sehn recipe (via dolt CLI since we need branch operations):
-		//
-		// 1. dolt branch flatten-tmp
-		// 2. dolt checkout flatten-tmp
-		// 3. dolt reset --soft <initial-commit>
-		// 4. dolt add .
-		// 5. dolt commit -m "flatten: squash all history"
-		// 6. dolt checkout main
-		// 7. dolt reset --hard flatten-tmp
-		// 8. dolt branch -D flatten-tmp
-		// 9. dolt gc
-
-		// We need to close the store connection before running CLI operations
-		// that manipulate branches, to avoid locked database issues.
-		if store != nil {
-			_ = store.Close()
+		if err := flattener.Flatten(ctx); err != nil {
+			FatalError("flatten failed: %v", err)
 		}
 
-		steps := []struct {
-			name string
-			args []string
-		}{
-			{"create temp branch", []string{"branch", "flatten-tmp"}},
-			{"checkout temp branch", []string{"checkout", "flatten-tmp"}},
-			{"soft reset to initial", []string{"reset", "--soft", initialHash}},
-			{"stage all changes", []string{"add", "."}},
-			{"commit flattened snapshot", []string{"commit", "-Am", "flatten: squash all history into single commit"}},
-			{"checkout main", []string{"checkout", "main"}},
-			{"reset main to flattened", []string{"reset", "--hard", "flatten-tmp"}},
-			{"delete temp branch", []string{"branch", "-D", "flatten-tmp"}},
-			{"garbage collect", []string{"gc"}},
-		}
-
-		for _, step := range steps {
-			cmd := exec.Command("dolt", step.args...) // #nosec G204 -- fixed commands
-			cmd.Dir = doltPath
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				FatalError("flatten step '%s' failed: %v\nOutput: %s", step.name, err, string(output))
+		// Reclaim disk space from the now-orphaned old history.
+		if gc, ok := storage.UnwrapStore(store).(storage.GarbageCollector); ok {
+			if err := gc.DoltGC(ctx); err != nil {
+				WarnError("dolt gc after flatten failed: %v", err)
 			}
 		}
 
-		sizeAfter, _ := getDirSize(doltPath)
-		freed := sizeBefore - sizeAfter
-		if freed < 0 {
-			freed = 0
-		}
 		elapsed := time.Since(start)
 
 		if jsonOutput {
@@ -183,17 +127,11 @@ Examples:
 				"success":        true,
 				"commits_before": commitCount,
 				"commits_after":  1,
-				"size_before":    sizeBefore,
-				"size_after":     sizeAfter,
-				"freed_bytes":    freed,
-				"freed_display":  formatBytes(freed),
 				"elapsed_ms":     elapsed.Milliseconds(),
 			})
 			return
 		}
-
 		fmt.Printf("✓ Flattened %d commits → 1\n", commitCount)
-		fmt.Printf("  %s → %s (freed %s)\n", formatBytes(sizeBefore), formatBytes(sizeAfter), formatBytes(freed))
 		fmt.Printf("  Time: %v\n", elapsed.Round(time.Millisecond))
 	},
 }

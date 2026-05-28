@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -39,6 +40,7 @@ type Issue struct {
 	CreatedAt       time.Time  `json:"created_at"`
 	CreatedBy       string     `json:"created_by,omitempty"` // Who created this issue (GH#748)
 	UpdatedAt       time.Time  `json:"updated_at"`
+	StartedAt       *time.Time `json:"started_at,omitempty"` // When this issue transitioned to in_progress (GH#2796)
 	ClosedAt        *time.Time `json:"closed_at,omitempty"`
 	CloseReason     string     `json:"close_reason,omitempty"`      // Reason provided when closing
 	ClosedBySession string     `json:"closed_by_session,omitempty"` // Claude Code session that closed this issue
@@ -87,32 +89,15 @@ type Issue struct {
 	// ===== Bonding Fields (compound molecule lineage) =====
 	BondedFrom []BondRef `json:"bonded_from,omitempty"` // For compounds: constituent protos
 
-	// ===== HOP Fields (entity tracking for CV chains) =====
-	Creator      *EntityRef   `json:"creator,omitempty"`       // Who created (human, agent, or org)
-	Validations  []Validation `json:"validations,omitempty"`   // Who validated/approved
-	QualityScore *float32     `json:"quality_score,omitempty"` // Aggregate quality (0.0-1.0), set by Refineries on merge
-	Crystallizes bool         `json:"crystallizes,omitempty"`  // Work that compounds (true: code, features) vs evaporates (false: ops, support) - affects CV weighting per Decision 006
-
 	// ===== Gate Fields (async coordination primitives) =====
 	AwaitType string        `json:"await_type,omitempty"` // Condition type: gh:run, gh:pr, timer, human, mail
 	AwaitID   string        `json:"await_id,omitempty"`   // Condition identifier (run ID, PR number, etc.)
 	Timeout   time.Duration `json:"timeout,omitempty"`    // Max wait time before escalation
 	Waiters   []string      `json:"waiters,omitempty"`    // Mail addresses to notify when gate clears
 
-	// ===== Slot Fields (exclusive access primitives) =====
-	Holder string `json:"holder,omitempty"` // Who currently holds the slot (empty = available)
-
 	// ===== Source Tracing Fields (formula cooking origin) =====
 	SourceFormula  string `json:"source_formula,omitempty"`  // Formula name where step was defined
 	SourceLocation string `json:"source_location,omitempty"` // Path: "steps[0]", "advice[0].after"
-
-	// ===== Agent Identity Fields (agent-as-bead support) =====
-	HookBead     string     `json:"hook_bead,omitempty"`     // Current work on agent's hook (0..1)
-	RoleBead     string     `json:"role_bead,omitempty"`     // Role definition bead (required for agents)
-	AgentState   AgentState `json:"agent_state,omitempty"`   // Agent state: idle|running|stuck|stopped
-	LastActivity *time.Time `json:"last_activity,omitempty"` // Updated on each action (timeout detection)
-	RoleType     string     `json:"role_type,omitempty"`     // Agent role type (application-defined)
-	Rig          string     `json:"rig,omitempty"`           // Rig name (empty for town-level agents)
 
 	// ===== Molecule Type Fields (swarm coordination) =====
 	MolType MolType `json:"mol_type,omitempty"` // Molecule type: swarm|patrol|work (empty = work)
@@ -162,21 +147,6 @@ func (i *Issue) ComputeContentHash() string {
 		w.str(br.BondPoint)
 	}
 
-	// HOP entity tracking
-	w.entityRef(i.Creator)
-
-	// HOP validations
-	for _, v := range i.Validations {
-		w.entityRef(v.Validator)
-		w.str(v.Outcome)
-		w.str(v.Timestamp.Format(time.RFC3339))
-		w.float32Ptr(v.Score)
-	}
-
-	// HOP aggregate quality score and crystallizes
-	w.float32Ptr(i.QualityScore)
-	w.flag(i.Crystallizes, "crystallizes")
-
 	// Gate fields for async coordination
 	w.str(i.AwaitType)
 	w.str(i.AwaitID)
@@ -184,16 +154,6 @@ func (i *Issue) ComputeContentHash() string {
 	for _, waiter := range i.Waiters {
 		w.str(waiter)
 	}
-
-	// Slot fields for exclusive access
-	w.str(i.Holder)
-
-	// Agent identity fields
-	w.str(i.HookBead)
-	w.str(i.RoleBead)
-	w.str(string(i.AgentState))
-	w.str(i.RoleType)
-	w.str(i.Rig)
 
 	// Molecule type
 	w.str(string(i.MolType))
@@ -233,13 +193,6 @@ func (w hashFieldWriter) strPtr(p *string) {
 	w.h.Write([]byte{0})
 }
 
-func (w hashFieldWriter) float32Ptr(p *float32) {
-	if p != nil {
-		w.h.Write([]byte(fmt.Sprintf("%f", *p)))
-	}
-	w.h.Write([]byte{0})
-}
-
 func (w hashFieldWriter) duration(d time.Duration) {
 	w.h.Write([]byte(fmt.Sprintf("%d", d)))
 	w.h.Write([]byte{0})
@@ -250,15 +203,6 @@ func (w hashFieldWriter) flag(b bool, label string) {
 		w.h.Write([]byte(label))
 	}
 	w.h.Write([]byte{0})
-}
-
-func (w hashFieldWriter) entityRef(e *EntityRef) {
-	if e != nil {
-		w.str(e.Name)
-		w.str(e.Platform)
-		w.str(e.Org)
-		w.str(e.ID)
-	}
 }
 
 // Validate checks if the issue has valid field values (built-in statuses only)
@@ -299,10 +243,6 @@ func (i *Issue) ValidateWithCustom(customStatuses, customTypes []string) error {
 	}
 	if i.Status != StatusClosed && i.ClosedAt != nil {
 		return fmt.Errorf("non-closed issues cannot have closed_at timestamp")
-	}
-	// Validate agent state if set
-	if !i.AgentState.IsValid() {
-		return fmt.Errorf("invalid agent state: %s", i.AgentState)
 	}
 	// Validate metadata is well-formed JSON if set (GH#1406)
 	if len(i.Metadata) > 0 {
@@ -352,10 +292,6 @@ func (i *Issue) ValidateForImport(customStatuses []string) error {
 	if i.Status != StatusClosed && i.ClosedAt != nil {
 		return fmt.Errorf("non-closed issues cannot have closed_at timestamp")
 	}
-	// Validate agent state if set
-	if !i.AgentState.IsValid() {
-		return fmt.Errorf("invalid agent state: %s", i.AgentState)
-	}
 	// Validate metadata is well-formed JSON if set (GH#1406)
 	if len(i.Metadata) > 0 {
 		if !json.Valid(i.Metadata) {
@@ -394,7 +330,7 @@ const (
 	StatusDeferred   Status = "deferred" // Deliberately put on ice for later
 	StatusClosed     Status = "closed"
 	StatusPinned     Status = "pinned" // Persistent bead that stays open indefinitely
-	StatusHooked     Status = "hooked" // Work attached to an agent's hook (GUPP)
+	StatusHooked     Status = "hooked" // Work actively claimed by a worker
 )
 
 // IsValid checks if the status value is valid (built-in statuses only)
@@ -422,40 +358,205 @@ func (s Status) IsValidWithCustom(customStatuses []string) bool {
 	return false
 }
 
+// IsValidWithCustomStatuses checks if the status is valid, including typed custom statuses.
+func (s Status) IsValidWithCustomStatuses(customStatuses []CustomStatus) bool {
+	if s.IsValid() {
+		return true
+	}
+	for _, cs := range customStatuses {
+		if string(s) == cs.Name {
+			return true
+		}
+	}
+	return false
+}
+
+// StatusCategory defines how a custom status behaves in views and commands.
+type StatusCategory string
+
+const (
+	// CategoryActive statuses appear in bd ready and default bd list.
+	CategoryActive StatusCategory = "active"
+	// CategoryWIP statuses are excluded from bd ready but visible in default bd list.
+	CategoryWIP StatusCategory = "wip"
+	// CategoryDone statuses are excluded from bd ready and default bd list.
+	CategoryDone StatusCategory = "done"
+	// CategoryFrozen statuses are excluded from bd ready and default bd list.
+	CategoryFrozen StatusCategory = "frozen"
+	// CategoryUnspecified is assigned when no category is provided (backward compat).
+	// Behaves like current behavior: valid, visible in default bd list, absent from bd ready.
+	CategoryUnspecified StatusCategory = "unspecified"
+)
+
+// validCategories is the set of user-assignable categories (excludes CategoryUnspecified).
+var validCategories = map[StatusCategory]bool{
+	CategoryActive: true,
+	CategoryWIP:    true,
+	CategoryDone:   true,
+	CategoryFrozen: true,
+}
+
+// CustomStatus represents a user-defined status with its behavioral category.
+type CustomStatus struct {
+	Name     string         `json:"name"`
+	Category StatusCategory `json:"category"`
+}
+
+// statusNameRegexp validates custom status names: letter-first, lowercase alphanumeric with hyphens/underscores.
+var statusNameRegexp = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
+
+// maxCustomStatuses is the maximum number of custom statuses allowed.
+const maxCustomStatuses = 50
+
+// builtInStatusNames contains all built-in status names in lowercase for collision detection.
+var builtInStatusNames = map[string]bool{
+	"open": true, "in_progress": true, "blocked": true,
+	"deferred": true, "closed": true, "pinned": true, "hooked": true,
+}
+
+// ParseCustomStatusConfig parses a status.custom config value into typed CustomStatus entries.
+// Supports both legacy flat format ("foo,bar") and category-annotated format ("foo:active,bar:wip").
+// Statuses without a category annotation get CategoryUnspecified (backward compatible).
+func ParseCustomStatusConfig(value string) ([]CustomStatus, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(value, ",")
+	var result []CustomStatus
+	seen := make(map[string]bool)
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		var name string
+		var category StatusCategory
+
+		// Split on first colon only
+		if idx := strings.IndexByte(part, ':'); idx >= 0 {
+			name = part[:idx]
+			catStr := part[idx+1:]
+			if catStr == "" {
+				return nil, fmt.Errorf("invalid custom status %q: trailing colon with empty category", part)
+			}
+			category = StatusCategory(catStr)
+			if !validCategories[category] {
+				return nil, fmt.Errorf("invalid category %q for status %q: must be one of active, wip, done, frozen", catStr, name)
+			}
+		} else {
+			name = part
+			category = CategoryUnspecified
+		}
+
+		if !statusNameRegexp.MatchString(name) {
+			return nil, fmt.Errorf("invalid status name %q: must match [a-z][a-z0-9_-]* (lowercase, letter-first, no spaces)", name)
+		}
+
+		if builtInStatusNames[strings.ToLower(name)] {
+			return nil, fmt.Errorf("custom status %q collides with built-in status", name)
+		}
+
+		if seen[name] {
+			return nil, fmt.Errorf("duplicate custom status name %q", name)
+		}
+		seen[name] = true
+
+		result = append(result, CustomStatus{Name: name, Category: category})
+	}
+
+	if len(result) > maxCustomStatuses {
+		return nil, fmt.Errorf("too many custom statuses (%d): maximum is %d", len(result), maxCustomStatuses)
+	}
+
+	return result, nil
+}
+
+// CustomStatusNames extracts just the name strings from a slice of CustomStatus.
+// Useful for backward-compatible callers that only need names for validation.
+func CustomStatusNames(statuses []CustomStatus) []string {
+	if len(statuses) == 0 {
+		return nil
+	}
+	names := make([]string, len(statuses))
+	for i, s := range statuses {
+		names[i] = s.Name
+	}
+	return names
+}
+
+// CustomStatusesByCategory returns custom statuses filtered by the given category.
+func CustomStatusesByCategory(statuses []CustomStatus, category StatusCategory) []CustomStatus {
+	var result []CustomStatus
+	for _, s := range statuses {
+		if s.Category == category {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// BuiltInStatusCategory returns the category for a built-in status.
+func BuiltInStatusCategory(status Status) StatusCategory {
+	switch status {
+	case StatusOpen:
+		return CategoryActive
+	case StatusInProgress, StatusBlocked, StatusHooked:
+		return CategoryWIP
+	case StatusClosed:
+		return CategoryDone
+	case StatusDeferred, StatusPinned:
+		return CategoryFrozen
+	default:
+		return CategoryUnspecified
+	}
+}
+
 // IssueType categorizes the kind of work
 type IssueType string
 
 // Core work type constants - these are the built-in types that beads validates.
 // All other types require configuration via types.custom in config.yaml.
 const (
-	TypeBug      IssueType = "bug"
-	TypeFeature  IssueType = "feature"
-	TypeTask     IssueType = "task"
-	TypeEpic     IssueType = "epic"
-	TypeChore    IssueType = "chore"
-	TypeDecision IssueType = "decision"
-	TypeMessage  IssueType = "message"
-	TypeMolecule IssueType = "molecule" // Molecule type for swarm coordination (internal use)
+	TypeBug       IssueType = "bug"
+	TypeFeature   IssueType = "feature"
+	TypeTask      IssueType = "task"
+	TypeEpic      IssueType = "epic"
+	TypeChore     IssueType = "chore"
+	TypeDecision  IssueType = "decision"
+	TypeMessage   IssueType = "message"
+	TypeMolecule  IssueType = "molecule"  // Molecule type for swarm coordination (internal use)
+	TypeGate      IssueType = "gate"      // Gate type for async coordination (bd gate, formula gates)
+	TypeSpike     IssueType = "spike"     // Timeboxed investigation to reduce uncertainty
+	TypeStory     IssueType = "story"     // User story describing a feature from the user's perspective
+	TypeMilestone IssueType = "milestone" // Marks completion of a set of related issues (no work itself)
 )
 
 // TypeEvent is a system-internal type used by set-state for audit trail beads.
-// Originally a Gas Town type, promoted to built-in internal type. It is not a
+// Originally an orchestrator type, promoted to built-in internal type. It is not a
 // core work type (not in IsValid) but is accepted by IsValidWithCustom /
 // ValidateWithCustom and treated as built-in for hydration trust (GH#1356).
 const TypeEvent IssueType = "event"
 
-// Note: Gas Town types (molecule, gate, convoy, merge-request, slot, agent, role, rig)
+// Note: Most orchestrator types (convoy, merge-request, slot, agent, role, rig)
 // were removed from beads core. They are now purely custom types with no built-in constants.
-// Use string literals like types.IssueType("molecule") if needed, and configure types.custom.
-// (event was also a Gas Town type but was promoted to a built-in internal type above.)
+// Use string literals like types.IssueType("convoy") if needed, and configure types.custom.
+// molecule, gate, and event were re-promoted to built-in because bd commands rely on them:
+//   - molecule: bd mol pour/wisp/bond (swarm coordination)
+//   - gate: bd gate create/check/resolve, formula gate steps (GH#3213)
+//   - event: set-state audit trail beads (GH#1356)
 // (message was re-promoted to built-in for inter-agent communication — GH#1347.)
 
 // IsValid checks if the issue type is a core work type.
-// Core work types (bug, feature, task, epic, chore, decision, message) and molecule type are built-in.
-// Other types (gate, convoy, etc.) require types.custom configuration.
+// Core work types (bug, feature, task, epic, chore, decision, message, spike, story, milestone)
+// and internal types (molecule, gate) are built-in. Other types require types.custom configuration.
 func (t IssueType) IsValid() bool {
 	switch t {
-	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeDecision, TypeMessage, TypeMolecule:
+	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeDecision, TypeMessage, TypeMolecule,
+		TypeGate, TypeSpike, TypeStory, TypeMilestone:
 		return true
 	}
 	return false
@@ -493,6 +594,12 @@ func (t IssueType) Normalize() IssueType {
 		return TypeFeature
 	case "dec", "adr":
 		return TypeDecision
+	case "investigation", "timebox":
+		return TypeSpike
+	case "user-story", "user_story":
+		return TypeStory
+	case "ms":
+		return TypeMilestone
 	default:
 		return t
 	}
@@ -514,7 +621,7 @@ func (t IssueType) RequiredSections() []RequiredSection {
 			{Heading: "## Steps to Reproduce", Hint: "Describe how to reproduce the bug"},
 			{Heading: "## Acceptance Criteria", Hint: "Define criteria to verify the fix"},
 		}
-	case TypeTask, TypeFeature:
+	case TypeTask, TypeFeature, TypeStory:
 		return []RequiredSection{
 			{Heading: "## Acceptance Criteria", Hint: "Define criteria to verify completion"},
 		}
@@ -528,34 +635,15 @@ func (t IssueType) RequiredSections() []RequiredSection {
 			{Heading: "## Rationale", Hint: "Explain why this option was chosen"},
 			{Heading: "## Alternatives Considered", Hint: "List alternatives and why they were rejected"},
 		}
+	case TypeSpike:
+		return []RequiredSection{
+			{Heading: "## Goal", Hint: "What question does this spike answer?"},
+			{Heading: "## Findings", Hint: "What was learned? (fill in when complete)"},
+		}
 	default:
-		// Chore and custom types have no required sections
+		// Chore, milestone, and custom types have no required sections
 		return nil
 	}
-}
-
-// AgentState represents the self-reported state of an agent
-type AgentState string
-
-// Agent state constants
-const (
-	StateIdle     AgentState = "idle"     // Agent is waiting for work
-	StateSpawning AgentState = "spawning" // Agent is starting up
-	StateRunning  AgentState = "running"  // Agent is executing (general)
-	StateWorking  AgentState = "working"  // Agent is actively working on a task
-	StateStuck    AgentState = "stuck"    // Agent is blocked and needs help
-	StateDone     AgentState = "done"     // Agent completed its current work
-	StateStopped  AgentState = "stopped"  // Agent has cleanly shut down
-	StateDead     AgentState = "dead"     // Agent died without clean shutdown (timeout detection)
-)
-
-// IsValid checks if the agent state value is valid
-func (s AgentState) IsValid() bool {
-	switch s {
-	case StateIdle, StateSpawning, StateRunning, StateWorking, StateStuck, StateDone, StateStopped, StateDead, "":
-		return true // empty is valid (non-agent beads)
-	}
-	return false
 }
 
 // MolType categorizes the molecule type for swarm coordination
@@ -563,9 +651,9 @@ type MolType string
 
 // MolType constants
 const (
-	MolTypeSwarm  MolType = "swarm"  // Swarm molecule: coordinated multi-polecat work
-	MolTypePatrol MolType = "patrol" // Patrol molecule: recurring operational work (Witness, Deacon, etc.)
-	MolTypeWork   MolType = "work"   // Work molecule: regular polecat work (default)
+	MolTypeSwarm  MolType = "swarm"  // Swarm molecule: coordinated multi-worker work
+	MolTypePatrol MolType = "patrol" // Patrol molecule: recurring operational work
+	MolTypeWork   MolType = "work"   // Work molecule: regular assigned work (default)
 )
 
 // IsValid checks if the mol type value is valid
@@ -671,6 +759,13 @@ type IssueDetails struct {
 	Comments     []*Comment                     `json:"comments,omitempty"`
 	Parent       *string                        `json:"parent,omitempty"`
 
+	// Cardinality fields — emitted by default (count-only mode).
+	// Slice fields (Dependents, Comments) are nil when count-only is active.
+	// Use --include-dependents / --include-comments to populate the slices.
+	DependentCount  *int64 `json:"dependent_count,omitempty"`
+	DependencyCount *int64 `json:"dependency_count,omitempty"`
+	CommentCount    *int64 `json:"comment_count,omitempty"`
+
 	// Epic progress fields (populated only for issue_type=epic with children)
 	EpicTotalChildren  *int  `json:"epic_total_children,omitempty"`
 	EpicClosedChildren *int  `json:"epic_closed_children,omitempty"`
@@ -723,15 +818,24 @@ func (d DependencyType) IsValid() bool {
 	return len(d) > 0 && len(d) <= 50
 }
 
+// WellKnownDependencyTypes returns the built-in dependency types accepted by
+// user-facing commands that intentionally reject custom dependency types.
+func WellKnownDependencyTypes() []DependencyType {
+	return []DependencyType{
+		DepBlocks, DepParentChild, DepConditionalBlocks, DepWaitsFor, DepRelated, DepDiscoveredFrom,
+		DepRepliesTo, DepRelatesTo, DepDuplicates, DepSupersedes,
+		DepAuthoredBy, DepAssignedTo, DepApprovedBy, DepAttests, DepTracks,
+		DepUntil, DepCausedBy, DepValidates, DepDelegatedFrom,
+	}
+}
+
 // IsWellKnown checks if the dependency type is a well-known constant.
 // Returns false for custom/user-defined types (which are still valid).
 func (d DependencyType) IsWellKnown() bool {
-	switch d {
-	case DepBlocks, DepParentChild, DepConditionalBlocks, DepWaitsFor, DepRelated, DepDiscoveredFrom,
-		DepRepliesTo, DepRelatesTo, DepDuplicates, DepSupersedes,
-		DepAuthoredBy, DepAssignedTo, DepApprovedBy, DepAttests, DepTracks,
-		DepUntil, DepCausedBy, DepValidates, DepDelegatedFrom:
-		return true
+	for _, wellKnown := range WellKnownDependencyTypes() {
+		if d == wellKnown {
+			return true
+		}
 	}
 	return false
 }
@@ -740,6 +844,13 @@ func (d DependencyType) IsWellKnown() bool {
 // Only blocking types affect the ready work calculation.
 func (d DependencyType) AffectsReadyWork() bool {
 	return d == DepBlocks || d == DepParentChild || d == DepConditionalBlocks || d == DepWaitsFor
+}
+
+// IsBlockingEdge returns true if this dependency type represents a hard blocker.
+// Unlike AffectsReadyWork, this excludes parent-child (structural, not blocking).
+// Used by dep tree rendering to decide whether the [BLOCKED] badge applies.
+func (d DependencyType) IsBlockingEdge() bool {
+	return d == DepBlocks || d == DepConditionalBlocks || d == DepWaitsFor
 }
 
 // WaitsForMeta holds metadata for waits-for dependencies (fanout gates).
@@ -840,6 +951,33 @@ type Comment struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// UnmarshalJSON handles backward compatibility for Comment.
+// Pre-v1.0 exported Comment.ID as int64; current schema uses string.
+func (c *Comment) UnmarshalJSON(data []byte) error {
+	type commentAlias Comment // avoid recursion
+	var raw struct {
+		commentAlias
+		RawID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*c = Comment(raw.commentAlias)
+	if len(raw.RawID) > 0 {
+		// try string first, fall back to number
+		var s string
+		if err := json.Unmarshal(raw.RawID, &s); err == nil {
+			c.ID = s
+		} else {
+			var n json.Number
+			if err := json.Unmarshal(raw.RawID, &n); err == nil {
+				c.ID = n.String()
+			}
+		}
+	}
+	return nil
+}
+
 // Event represents an audit trail entry
 type Event struct {
 	ID        string    `json:"id"`
@@ -877,12 +1015,145 @@ type BlockedIssue struct {
 	BlockedBy      []string `json:"blocked_by"`
 }
 
+// ReadyExplanation provides reasoning for why issues are ready or blocked.
+type ReadyExplanation struct {
+	Ready   []ReadyItem    `json:"ready"`
+	Blocked []BlockedItem  `json:"blocked"`
+	Cycles  [][]string     `json:"cycles,omitempty"`
+	Summary ExplainSummary `json:"summary"`
+}
+
+// ReadyItem explains why a specific issue is ready for work.
+type ReadyItem struct {
+	*Issue
+	Reason           string   `json:"reason"`
+	ResolvedBlockers []string `json:"resolved_blockers"`
+	DependencyCount  int      `json:"dependency_count"`
+	DependentCount   int      `json:"dependent_count"`
+	Parent           *string  `json:"parent,omitempty"`
+}
+
+// BlockedItem explains why a specific issue is blocked.
+type BlockedItem struct {
+	Issue
+	BlockedBy      []BlockerInfo `json:"blocked_by"`
+	BlockedByCount int           `json:"blocked_by_count"`
+}
+
+// BlockerInfo provides details about a single blocker.
+type BlockerInfo struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Status   Status `json:"status"`
+	Priority int    `json:"priority"`
+}
+
+// ExplainSummary provides aggregate statistics.
+type ExplainSummary struct {
+	TotalReady   int `json:"total_ready"`
+	TotalBlocked int `json:"total_blocked"`
+	CycleCount   int `json:"cycle_count"`
+}
+
+// BuildReadyExplanation constructs a ReadyExplanation from pre-fetched data.
+// This pure function is separated from CLI concerns for testability.
+func BuildReadyExplanation(
+	readyIssues []*Issue,
+	blockedIssues []*BlockedIssue,
+	depCounts map[string]*DependencyCounts,
+	allDeps map[string][]*Dependency,
+	blockerMap map[string]*Issue,
+	cycles [][]*Issue,
+) ReadyExplanation {
+	// Build ready items with explanations
+	readyItems := make([]ReadyItem, 0, len(readyIssues))
+	for _, issue := range readyIssues {
+		counts := depCounts[issue.ID]
+		if counts == nil {
+			counts = &DependencyCounts{}
+		}
+
+		// Find resolved blockers (closed issues that this depended on)
+		var resolvedBlockers []string
+		reason := "no blocking dependencies"
+		deps := allDeps[issue.ID]
+		for _, dep := range deps {
+			if dep.Type == DepBlocks || dep.Type == DepConditionalBlocks || dep.Type == DepWaitsFor {
+				resolvedBlockers = append(resolvedBlockers, dep.DependsOnID)
+			}
+		}
+		if len(resolvedBlockers) > 0 {
+			reason = fmt.Sprintf("%d blocker(s) resolved", len(resolvedBlockers))
+		}
+
+		// Compute parent
+		var parent *string
+		for _, dep := range deps {
+			if dep.Type == DepParentChild {
+				parent = &dep.DependsOnID
+				break
+			}
+		}
+
+		readyItems = append(readyItems, ReadyItem{
+			Issue:            issue,
+			Reason:           reason,
+			ResolvedBlockers: resolvedBlockers,
+			DependencyCount:  counts.DependencyCount,
+			DependentCount:   counts.DependentCount,
+			Parent:           parent,
+		})
+	}
+
+	// Build blocked items with blocker details
+	blockedItems := make([]BlockedItem, 0, len(blockedIssues))
+	for _, bi := range blockedIssues {
+		blockers := make([]BlockerInfo, 0, len(bi.BlockedBy))
+		for _, blockerID := range bi.BlockedBy {
+			info := BlockerInfo{ID: blockerID}
+			if blocker, ok := blockerMap[blockerID]; ok {
+				info.Title = blocker.Title
+				info.Status = blocker.Status
+				info.Priority = blocker.Priority
+			}
+			blockers = append(blockers, info)
+		}
+		blockedItems = append(blockedItems, BlockedItem{
+			Issue:          bi.Issue,
+			BlockedBy:      blockers,
+			BlockedByCount: bi.BlockedByCount,
+		})
+	}
+
+	// Build cycle info
+	var cycleIDs [][]string
+	for _, cycle := range cycles {
+		ids := make([]string, len(cycle))
+		for i, issue := range cycle {
+			ids[i] = issue.ID
+		}
+		cycleIDs = append(cycleIDs, ids)
+	}
+
+	return ReadyExplanation{
+		Ready:   readyItems,
+		Blocked: blockedItems,
+		Cycles:  cycleIDs,
+		Summary: ExplainSummary{
+			TotalReady:   len(readyItems),
+			TotalBlocked: len(blockedItems),
+			CycleCount:   len(cycleIDs),
+		},
+	}
+}
+
 // TreeNode represents a node in a dependency tree
 type TreeNode struct {
 	Issue
-	Depth     int    `json:"depth"`
-	ParentID  string `json:"parent_id"`
-	Truncated bool   `json:"truncated"`
+	Depth          int            `json:"depth"`
+	ParentID       string         `json:"parent_id"`
+	EdgeFromParent DependencyType `json:"edge_from_parent,omitempty"`
+	Truncated      bool           `json:"truncated"`
 }
 
 // MoleculeProgressStats provides efficient progress info for large molecules.
@@ -922,19 +1193,21 @@ type Statistics struct {
 
 // IssueFilter is used to filter issue queries
 type IssueFilter struct {
-	Status       *Status
-	Priority     *int
-	IssueType    *IssueType
-	Assignee     *string
-	Labels       []string // AND semantics: issue must have ALL these labels
-	LabelsAny    []string // OR semantics: issue must have AT LEAST ONE of these labels
-	LabelPattern string   // Glob pattern for label matching (e.g., "tech-*")
-	LabelRegex   string   // Regex pattern for label matching (e.g., "tech-(debt|legacy)")
-	TitleSearch  string
-	IDs          []string // Filter by specific issue IDs
-	IDPrefix     string   // Filter by ID prefix (e.g., "bd-" to match "bd-abc123")
-	SpecIDPrefix string   // Filter by spec_id prefix
-	Limit        int
+	Status        *Status
+	Statuses      []Status // Multiple status OR filter (from comma-separated --status)
+	Priority      *int
+	IssueType     *IssueType
+	Assignee      *string
+	Labels        []string // AND semantics: issue must have ALL these labels
+	LabelsAny     []string // OR semantics: issue must have AT LEAST ONE of these labels
+	ExcludeLabels []string // Exclusion: issue must NOT have ANY of these labels
+	LabelPattern  string   // Glob pattern for label matching (e.g., "tech-*")
+	LabelRegex    string   // Regex pattern for label matching (e.g., "tech-(debt|legacy)")
+	TitleSearch   string
+	IDs           []string // Filter by specific issue IDs
+	IDPrefix      string   // Filter by ID prefix (e.g., "bd-" to match "bd-abc123")
+	SpecIDPrefix  string   // Filter by spec_id prefix
+	Limit         int
 
 	// Pattern matching
 	TitleContains       string
@@ -949,6 +1222,8 @@ type IssueFilter struct {
 	UpdatedBefore *time.Time
 	ClosedAfter   *time.Time
 	ClosedBefore  *time.Time
+	StartedAfter  *time.Time
+	StartedBefore *time.Time
 
 	// Empty/null checks
 	EmptyDescription bool
@@ -988,7 +1263,7 @@ type IssueFilter struct {
 	ExcludeTypes []IssueType // Exclude issues with these types
 
 	// Time-based scheduling filters (GH#820)
-	Deferred    bool       // Filter issues with defer_until set (any value)
+	Deferred    bool       // Filter issues that are scheduled later: defer_until set OR status is deferred
 	DeferAfter  *time.Time // Filter issues with defer_until > this time
 	DeferBefore *time.Time // Filter issues with defer_until < this time
 	DueAfter    *time.Time // Filter issues with due_at > this time
@@ -998,6 +1273,15 @@ type IssueFilter struct {
 	// Metadata field filtering (GH#1406)
 	MetadataFields map[string]string // Top-level key=value equality; AND semantics (all must match)
 	HasMetadataKey string            // Existence check: issue has this top-level key set (non-null)
+
+	// Hydration options — control which relational data is populated on returned issues.
+	// Labels are always hydrated. Dependencies are not by default (for performance).
+	IncludeDependencies bool // When true, populate Issue.Dependencies with []*Dependency records
+
+	// SkipLabels suppresses label hydration. When true, the labels JOIN is
+	// skipped and Issue.Labels is left nil (callers MUST treat as empty).
+	// Opt-in performance flag for the bd list --skip-labels code path.
+	SkipLabels bool
 }
 
 // SortPolicy determines how ready work is ordered
@@ -1030,20 +1314,24 @@ func (s SortPolicy) IsValid() bool {
 
 // WorkFilter is used to filter ready work queries
 type WorkFilter struct {
-	Status       Status
-	Type         string // Filter by issue type (task, bug, feature, epic, merge-request, etc.)
-	Priority     *int
-	Assignee     *string
-	Unassigned   bool     // Filter for issues with no assignee
-	Labels       []string // AND semantics: issue must have ALL these labels
-	LabelsAny    []string // OR semantics: issue must have AT LEAST ONE of these labels
-	LabelPattern string   // Glob pattern for label matching (e.g., "tech-*")
-	LabelRegex   string   // Regex pattern for label matching (e.g., "tech-(debt|legacy)")
-	Limit        int
-	SortPolicy   SortPolicy
+	Status        Status
+	Type          string // Filter by issue type (task, bug, feature, epic, merge-request, etc.)
+	Priority      *int
+	Assignee      *string
+	Unassigned    bool     // Filter for issues with no assignee
+	Labels        []string // AND semantics: issue must have ALL these labels
+	LabelsAny     []string // OR semantics: issue must have AT LEAST ONE of these labels
+	ExcludeLabels []string // Exclusion: issue must NOT have ANY of these labels
+	LabelPattern  string   // Glob pattern for label matching (e.g., "tech-*")
+	LabelRegex    string   // Regex pattern for label matching (e.g., "tech-(debt|legacy)")
+	Limit         int
+	SortPolicy    SortPolicy
 
 	// Parent filtering: filter to descendants of a bead/epic (recursive)
 	ParentID *string // Show all descendants of this issue
+
+	// Molecule filtering: filter to direct children of this molecule
+	MoleculeID string // If set, only return issues that are children of this molecule
 
 	// Molecule type filtering
 	MolType *MolType // Filter by molecule type (nil = any, swarm/patrol/work)
@@ -1055,9 +1343,15 @@ type WorkFilter struct {
 	IncludeDeferred bool // If true, include issues with future defer_until timestamps
 
 	// Ephemeral issue filtering
-	// By default, GetReadyWork excludes ephemeral issues (wisps).
-	// Set to true to include them (e.g., for merge-request processing).
+	// By default, GetReadyWork excludes ephemeral wisps but includes
+	// no-history wisps because they are durable work items without Dolt history.
+	// Set to true to include ephemeral wisps too (e.g., for merge-request processing).
 	IncludeEphemeral bool
+
+	// Type exclusion: exclude issues with these types from results.
+	// Appended to the default exclusion list (merge-request, gate, molecule, etc.).
+	// When Type is set, ExcludeTypes is ignored (explicit type inclusion wins).
+	ExcludeTypes []IssueType
 
 	// Metadata field filtering (GH#1406)
 	MetadataFields map[string]string // Top-level key=value equality; AND semantics (all must match)
@@ -1069,6 +1363,34 @@ type StaleFilter struct {
 	Days   int    // Issues not updated in this many days
 	Status string // Filter by status (open|in_progress|blocked), empty = all non-closed
 	Limit  int    // Maximum issues to return
+}
+
+// WispFilter is used to filter ListWisps queries.
+// All fields are optional (zero value = no filter).
+// ListWisps always restricts to ephemeral issues (Ephemeral=true).
+type WispFilter struct {
+	// Type filters by issue type (e.g., "agent", "task", "patrol").
+	// nil = any type.
+	Type *IssueType
+
+	// Status filters by issue status.
+	// nil = non-closed only (open, in_progress, blocked).
+	Status *Status
+
+	// UpdatedAfter excludes wisps last updated before this time.
+	// Use this for age-based filtering (e.g., only wisps updated in the last hour).
+	UpdatedAfter *time.Time
+
+	// UpdatedBefore excludes wisps last updated after this time.
+	// Use this for staleness detection.
+	UpdatedBefore *time.Time
+
+	// IncludeClosed includes closed wisps in the results.
+	// When true and Status is nil, all statuses are returned.
+	IncludeClosed bool
+
+	// Limit caps the number of results returned (0 = no limit).
+	Limit int
 }
 
 // EpicStatus represents an epic with its completion status
@@ -1086,6 +1408,24 @@ type BondRef struct {
 	SourceID  string `json:"source_id"`            // Source proto or molecule ID
 	BondType  string `json:"bond_type"`            // sequential, parallel, conditional
 	BondPoint string `json:"bond_point,omitempty"` // Attachment site (issue ID or empty for root)
+}
+
+// UnmarshalJSON handles backward compatibility for BondRef.
+// Pre-v0.63 used "proto_id" instead of "source_id".
+func (b *BondRef) UnmarshalJSON(data []byte) error {
+	type bondAlias BondRef // avoid recursion
+	var raw struct {
+		bondAlias
+		ProtoID string `json:"proto_id"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*b = BondRef(raw.bondAlias)
+	if b.SourceID == "" && raw.ProtoID != "" {
+		b.SourceID = raw.ProtoID
+	}
+	return nil
 }
 
 // Bond type constants for compound molecules
@@ -1113,127 +1453,4 @@ func (i *Issue) IsCompound() bool {
 // Returns nil for non-compound issues.
 func (i *Issue) GetConstituents() []BondRef {
 	return i.BondedFrom
-}
-
-// EntityRef is a structured reference to an entity (human, agent, or org).
-// This is the foundation for HOP entity tracking and CV chains.
-// Can be rendered as a URI: hop://<platform>/<org>/<id>
-//
-// Example usage:
-//
-//	ref := &EntityRef{
-//	    Name:     "polecat/Nux",
-//	    Platform: "gastown",
-//	    Org:      "steveyegge",
-//	    ID:       "polecat-nux",
-//	}
-//	uri := ref.URI() // "hop://gastown/steveyegge/polecat-nux"
-type EntityRef struct {
-	// Name is the human-readable identifier (e.g., "polecat/Nux", "mayor")
-	Name string `json:"name,omitempty"`
-
-	// Platform identifies the execution context (e.g., "gastown", "github")
-	Platform string `json:"platform,omitempty"`
-
-	// Org identifies the organization (e.g., "steveyegge", "anthropics")
-	Org string `json:"org,omitempty"`
-
-	// ID is the unique identifier within the platform/org (e.g., "polecat-nux")
-	ID string `json:"id,omitempty"`
-}
-
-// IsEmpty returns true if all fields are empty.
-func (e *EntityRef) IsEmpty() bool {
-	if e == nil {
-		return true
-	}
-	return e.Name == "" && e.Platform == "" && e.Org == "" && e.ID == ""
-}
-
-// URI returns the entity as a HOP URI.
-// Format: hop://<platform>/<org>/<id>
-// Returns empty string if Platform, Org, or ID is missing.
-func (e *EntityRef) URI() string {
-	if e == nil || e.Platform == "" || e.Org == "" || e.ID == "" {
-		return ""
-	}
-	return fmt.Sprintf("hop://%s/%s/%s", e.Platform, e.Org, e.ID)
-}
-
-// String returns a human-readable representation.
-// Prefers Name if set, otherwise returns URI or ID.
-func (e *EntityRef) String() string {
-	if e == nil {
-		return ""
-	}
-	if e.Name != "" {
-		return e.Name
-	}
-	if uri := e.URI(); uri != "" {
-		return uri
-	}
-	return e.ID
-}
-
-// Validation records who validated/approved work completion.
-// This is core to HOP's proof-of-stake concept - validators stake
-// their reputation on approvals.
-type Validation struct {
-	// Validator is who approved/rejected the work
-	Validator *EntityRef `json:"validator"`
-
-	// Outcome is the validation result: accepted, rejected, revision_requested
-	Outcome string `json:"outcome"`
-
-	// Timestamp is when the validation occurred
-	Timestamp time.Time `json:"timestamp"`
-
-	// Score is an optional quality score (0.0-1.0)
-	Score *float32 `json:"score,omitempty"`
-}
-
-// Validation outcome constants
-const (
-	ValidationAccepted          = "accepted"
-	ValidationRejected          = "rejected"
-	ValidationRevisionRequested = "revision_requested"
-)
-
-// IsValidOutcome checks if the outcome is a known validation outcome.
-func (v *Validation) IsValidOutcome() bool {
-	switch v.Outcome {
-	case ValidationAccepted, ValidationRejected, ValidationRevisionRequested:
-		return true
-	}
-	return false
-}
-
-// ParseEntityURI parses a HOP entity URI into an EntityRef.
-// Format: hop://<platform>/<org>/<id>
-// Also accepts legacy entity://hop/<platform>/<org>/<id> for backward compatibility.
-// Returns nil and error if the URI is invalid.
-func ParseEntityURI(uri string) (*EntityRef, error) {
-	const hopPrefix = "hop://"
-	const legacyPrefix = "entity://hop/"
-
-	var rest string
-	switch {
-	case strings.HasPrefix(uri, hopPrefix):
-		rest = uri[len(hopPrefix):]
-	case strings.HasPrefix(uri, legacyPrefix):
-		rest = uri[len(legacyPrefix):]
-	default:
-		return nil, fmt.Errorf("invalid entity URI: must start with %q (or legacy %q)", hopPrefix, legacyPrefix)
-	}
-
-	parts := strings.SplitN(rest, "/", 3)
-	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return nil, fmt.Errorf("invalid entity URI: expected hop://<platform>/<org>/<id>, got %q", uri)
-	}
-
-	return &EntityRef{
-		Platform: parts[0],
-		Org:      parts[1],
-		ID:       parts[2],
-	}, nil
 }

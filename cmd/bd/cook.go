@@ -10,7 +10,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/formula"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -443,14 +442,14 @@ func cookFormulaToSubgraph(f *formula.Formula, protoID string) (*TemplateSubgrap
 		rootDesc = "{{desc}}"
 	}
 
-	// Create root proto epic
+	// Create root proto molecule
 	rootIssue := &types.Issue{
 		ID:          protoID,
 		Title:       rootTitle,
 		Description: rootDesc,
 		Status:      types.StatusOpen,
 		Priority:    2,
-		IssueType:   types.TypeEpic,
+		IssueType:   types.TypeMolecule,
 		IsTemplate:  true,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
@@ -489,8 +488,9 @@ func createGateIssue(step *formula.Step, parentID string) *types.Issue {
 
 	// Build title from gate type and ID
 	title := fmt.Sprintf("Gate: %s", step.Gate.Type)
-	if step.Gate.ID != "" {
-		title = fmt.Sprintf("Gate: %s %s", step.Gate.Type, step.Gate.ID)
+	awaitID := gateAwaitID(step.Gate)
+	if awaitID != "" {
+		title = fmt.Sprintf("Gate: %s %s", step.Gate.Type, awaitID)
 	}
 
 	// Parse timeout if specified
@@ -509,12 +509,22 @@ func createGateIssue(step *formula.Step, parentID string) *types.Issue {
 		Priority:    2,
 		IssueType:   "gate",
 		AwaitType:   step.Gate.Type,
-		AwaitID:     step.Gate.ID,
+		AwaitID:     awaitID,
 		Timeout:     timeout,
 		IsTemplate:  true,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 	}
+}
+
+func gateAwaitID(gate *formula.Gate) string {
+	if gate == nil {
+		return ""
+	}
+	if gate.AwaitID != "" {
+		return gate.AwaitID
+	}
+	return gate.ID
 }
 
 // processStepToIssue converts a formula.Step to a types.Issue.
@@ -559,6 +569,13 @@ func processStepToIssue(step *formula.Step, parentID string) *types.Issue {
 	if step.WaitsFor != "" {
 		gateLabel := fmt.Sprintf("gate:%s", step.WaitsFor)
 		issue.Labels = append(issue.Labels, gateLabel)
+	}
+
+	// Carry step metadata through to the issue (GH#3341).
+	if len(step.Metadata) > 0 {
+		if metaJSON, err := json.Marshal(step.Metadata); err == nil {
+			issue.Metadata = metaJSON
+		}
 	}
 
 	return issue
@@ -786,7 +803,7 @@ func cookFormulaToSubgraphWithVars(f *formula.Formula, protoID string, vars map[
 
 // cookFormula creates a proto bead from a resolved formula.
 // protoID is the final ID for the proto (may include a prefix).
-func cookFormula(ctx context.Context, s *dolt.DoltStore, f *formula.Formula, protoID string) (*cookFormulaResult, error) {
+func cookFormula(ctx context.Context, s storage.DoltStorage, f *formula.Formula, protoID string) (*cookFormulaResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -813,14 +830,14 @@ func cookFormula(ctx context.Context, s *dolt.DoltStore, f *formula.Formula, pro
 		rootDesc = "{{desc}}"
 	}
 
-	// Create root proto epic using provided protoID (may include prefix)
+	// Create root proto molecule using provided protoID (may include prefix)
 	rootIssue := &types.Issue{
 		ID:          protoID,
 		Title:       rootTitle,
 		Description: rootDesc,
 		Status:      types.StatusOpen,
 		Priority:    2,
-		IssueType:   types.TypeEpic,
+		IssueType:   types.TypeMolecule,
 		IsTemplate:  true,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
@@ -944,7 +961,7 @@ func collectDependencies(step *formula.Step, idMapping map[string]string, deps *
 }
 
 // deleteProtoSubgraph deletes a proto and all its children.
-func deleteProtoSubgraph(ctx context.Context, s *dolt.DoltStore, protoID string) error {
+func deleteProtoSubgraph(ctx context.Context, s storage.DoltStorage, protoID string) error {
 	// Load the subgraph
 	subgraph, err := loadTemplateSubgraph(ctx, s, protoID)
 	if err != nil {
@@ -1023,12 +1040,18 @@ func substituteFormulaVars(f *formula.Formula, vars map[string]string) {
 	substituteStepVars(f.Steps, vars)
 }
 
-// substituteStepVars recursively substitutes variables in step titles and descriptions.
+// substituteStepVars recursively substitutes variables in step fields.
 func substituteStepVars(steps []*formula.Step, vars map[string]string) {
 	for _, step := range steps {
 		step.Title = substituteVariables(step.Title, vars)
 		step.Description = substituteVariables(step.Description, vars)
 		step.Notes = substituteVariables(step.Notes, vars)
+		if step.Gate != nil {
+			step.Gate.Type = substituteVariables(step.Gate.Type, vars)
+			step.Gate.ID = substituteVariables(step.Gate.ID, vars)
+			step.Gate.AwaitID = substituteVariables(step.Gate.AwaitID, vars)
+			step.Gate.Timeout = substituteVariables(step.Gate.Timeout, vars)
+		}
 		if len(step.Children) > 0 {
 			substituteStepVars(step.Children, vars)
 		}

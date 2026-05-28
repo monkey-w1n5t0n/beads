@@ -11,7 +11,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/github"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -153,6 +152,7 @@ func init() {
 	githubSyncCmd.Flags().BoolVar(&githubPreferLocal, "prefer-local", false, "On conflict, keep local beads version")
 	githubSyncCmd.Flags().BoolVar(&githubPreferGitHub, "prefer-github", false, "On conflict, use GitHub version")
 	githubSyncCmd.Flags().BoolVar(&githubPreferNewer, "prefer-newer", false, "On conflict, use most recent version (default)")
+	registerSelectiveSyncFlags(githubSyncCmd)
 
 	// Register github command with root
 	rootCmd.AddCommand(githubCmd)
@@ -187,6 +187,22 @@ func getGitHubConfig() GitHubConfig {
 
 // getGitHubConfigValue reads a GitHub configuration value from store or environment.
 func getGitHubConfigValue(ctx context.Context, key string) string {
+	// Secret keys (e.g. github.token) are stored in config.yaml, not the
+	// Dolt database, to avoid leaking secrets when pushing to remotes.
+	if config.IsYamlOnlyKey(key) {
+		if value := config.GetString(key); value != "" {
+			return value
+		}
+		// Fall back to environment variable
+		envKey := githubConfigToEnvVar(key)
+		if envKey != "" {
+			if value := os.Getenv(envKey); value != "" {
+				return value
+			}
+		}
+		return ""
+	}
+
 	// Try to read from store (works in direct mode)
 	if store != nil {
 		value, _ := store.GetConfig(ctx, key)
@@ -194,7 +210,7 @@ func getGitHubConfigValue(ctx context.Context, key string) string {
 			return value
 		}
 	} else if dbPath != "" {
-		tempStore, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+		tempStore, err := openReadOnlyStoreForDBPath(ctx, dbPath)
 		if err == nil {
 			defer func() { _ = tempStore.Close() }()
 			value, _ := tempStore.GetConfig(ctx, key)
@@ -236,13 +252,13 @@ func githubConfigToEnvVar(key string) string {
 // validateGitHubConfig checks that required configuration is present.
 func validateGitHubConfig(config GitHubConfig) error {
 	if config.Token == "" {
-		return fmt.Errorf("github.token is not configured. Set via 'bd config github.token <token>' or GITHUB_TOKEN environment variable")
+		return fmt.Errorf("github.token is not configured. Set via 'bd config set github.token <token>' or GITHUB_TOKEN environment variable")
 	}
 	if config.Owner == "" {
-		return fmt.Errorf("github.owner is not configured. Set via 'bd config github.owner <owner>' or GITHUB_OWNER environment variable")
+		return fmt.Errorf("github.owner is not configured. Set via 'bd config set github.owner <owner>' or GITHUB_OWNER environment variable")
 	}
 	if config.Repo == "" {
-		return fmt.Errorf("github.repo is not configured. Set via 'bd config github.repo <repo>' or GITHUB_REPO environment variable")
+		return fmt.Errorf("github.repo is not configured. Set via 'bd config set github.repo <repo>' or GITHUB_REPO environment variable")
 	}
 	return nil
 }
@@ -298,7 +314,7 @@ func runGitHubStatus(cmd *cobra.Command, args []string) error {
 func runGitHubRepos(cmd *cobra.Command, args []string) error {
 	config := getGitHubConfig()
 	if config.Token == "" {
-		return fmt.Errorf("github.token is not configured. Set via 'bd config github.token <token>' or GITHUB_TOKEN environment variable")
+		return fmt.Errorf("github.token is not configured. Set via 'bd config set github.token <token>' or GITHUB_TOKEN environment variable")
 	}
 
 	out := cmd.OutOrStdout()
@@ -379,6 +395,10 @@ func runGitHubSync(cmd *cobra.Command, args []string) error {
 		Pull:   pull,
 		Push:   push,
 		DryRun: githubSyncDryRun,
+	}
+
+	if err := applySelectiveSyncFlags(cmd, &opts, push); err != nil {
+		return err
 	}
 
 	// Map conflict resolution

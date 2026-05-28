@@ -15,16 +15,47 @@ func TestEmbeddedDefault(t *testing.T) {
 	required := []string{
 		"# Agent Instructions",
 		"## Quick Reference",
-		"bd onboard",
+		"bd prime",
 		"BEGIN BEADS INTEGRATION",
 		"END BEADS INTEGRATION",
-		"## Landing the Plane",
+		"## Session Completion",
 		"git push",
 	}
 	for _, want := range required {
 		if !strings.Contains(content, want) {
 			t.Errorf("EmbeddedDefault() missing %q", want)
 		}
+	}
+}
+
+// TestEmbeddedDefaultArchitectureSummary guards GH#3683: agents reading the
+// generated AGENTS.md need an architecture statement at the top so they don't
+// build wrong mental models (treating JSONL as source of truth, manually
+// running bd import, etc.) and have to discover the four deeper architecture
+// docs the hard way. The summary must appear before the Quick Reference and
+// link to the canonical SYNC_CONCEPTS.md entry-point.
+func TestEmbeddedDefaultArchitectureSummary(t *testing.T) {
+	content := EmbeddedDefault()
+
+	required := []string{
+		"Architecture in one line",
+		"refs/dolt/data",
+		"passive export",
+		"SYNC_CONCEPTS.md",
+	}
+	for _, want := range required {
+		if !strings.Contains(content, want) {
+			t.Errorf("EmbeddedDefault() missing architecture-summary fragment %q", want)
+		}
+	}
+
+	archIdx := strings.Index(content, "Architecture in one line")
+	quickRefIdx := strings.Index(content, "## Quick Reference")
+	if archIdx == -1 || quickRefIdx == -1 {
+		t.Fatal("missing required anchors")
+	}
+	if archIdx > quickRefIdx {
+		t.Error("architecture summary should appear before Quick Reference (so agents see it first)")
 	}
 }
 
@@ -60,8 +91,8 @@ func TestEmbeddedBeadsSection(t *testing.T) {
 
 func TestBeadsSectionContainsLanding(t *testing.T) {
 	section := EmbeddedBeadsSection()
-	if !strings.Contains(section, "Landing the Plane") {
-		t.Error("beads section should contain landing-the-plane content within markers")
+	if !strings.Contains(section, "Session Completion") {
+		t.Error("beads section should contain session completion content within markers")
 	}
 }
 
@@ -69,15 +100,15 @@ func TestDefaultContainsBothSections(t *testing.T) {
 	content := EmbeddedDefault()
 
 	beadsIdx := strings.Index(content, "BEGIN BEADS INTEGRATION")
-	landingIdx := strings.Index(content, "Landing the Plane")
+	completionIdx := strings.Index(content, "Session Completion")
 
 	if beadsIdx == -1 {
 		t.Fatal("missing beads integration section")
 	}
-	if landingIdx == -1 {
-		t.Fatal("missing landing the plane section")
+	if completionIdx == -1 {
+		t.Fatal("missing session completion section")
 	}
-	if beadsIdx > landingIdx {
-		t.Error("beads section should come before landing-the-plane section")
+	if beadsIdx > completionIdx {
+		t.Error("beads section should come before session completion section")
 	}
 }

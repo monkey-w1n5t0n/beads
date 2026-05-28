@@ -8,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -67,7 +66,7 @@ func runMolSquash(cmd *cobra.Command, args []string) {
 
 	// mol squash requires direct store access
 	if store == nil {
-		FatalErrorWithHint("no database connection", "run 'bd doctor' to diagnose, or 'bd init' to create a new database")
+		FatalErrorWithHint("no database connection", diagHint())
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
@@ -209,7 +208,7 @@ func generateDigest(root *types.Issue, children []*types.Issue) string {
 // If summary is provided (non-empty), it's used as the digest content.
 // Otherwise, generateDigest() creates a basic concatenation.
 // This enables agents to provide AI-generated summaries while keeping bd as a pure tool.
-func squashMolecule(ctx context.Context, s *dolt.DoltStore, root *types.Issue, children []*types.Issue, keepChildren bool, summary string, actorName string) (*SquashResult, error) {
+func squashMolecule(ctx context.Context, s storage.DoltStorage, root *types.Issue, children []*types.Issue, keepChildren bool, summary string, actorName string) (*SquashResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -282,6 +281,10 @@ func squashMolecule(ctx context.Context, s *dolt.DoltStore, root *types.Issue, c
 			reason := fmt.Sprintf("Squashed: %d steps → digest %s", len(children), result.DigestID)
 			if err := tx.CloseIssue(ctx, root.ID, reason, actorName, ""); err != nil {
 				return fmt.Errorf("failed to close wisp root %s: %w", root.ID, err)
+			}
+			// Clear ephemeral so the closed root stops being re-emitted by every wisp-table export cycle.
+			if err := tx.UpdateIssue(ctx, root.ID, map[string]interface{}{"wisp": false}, actorName); err != nil {
+				return fmt.Errorf("failed to clear ephemeral flag on root %s: %w", root.ID, err)
 			}
 			result.WispSquash = true
 		}

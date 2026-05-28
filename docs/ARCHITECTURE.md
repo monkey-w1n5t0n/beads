@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes bd's overall architecture - the data model, sync mechanism, and how components fit together. For internal implementation details (FlushManager, Blocked Cache), see [INTERNALS.md](INTERNALS.md).
+This document describes bd's overall architecture - the data model, sync mechanism, and how components fit together. For product scope boundaries, see [PROJECT_CHARTER.md](PROJECT_CHARTER.md). For internal implementation details (FlushManager, Blocked Cache), see [INTERNALS.md](INTERNALS.md).
 
 ## The Two-Layer Data Model
 
@@ -49,7 +49,7 @@ bd's core design enables a distributed, Dolt-powered issue tracker that feels li
 
 **Dolt for distribution:** Native push/pull to Dolt remotes (DoltHub, S3, GCS). No special sync server needed. Issues travel with your code. Offline work just works.
 
-**Export and backup:** `bd export` outputs issue JSONL for data migration and interoperability. Use `bd backup` and `bd backup restore` for supported JSONL backup snapshots, and `bd backup export-git` / `bd backup fetch-git` when you want those snapshots stored in a git branch.
+**Export and backup:** `bd export` outputs issue JSONL for data migration and interoperability. Use `bd backup init` / `bd backup sync` to push Dolt-native backups (preserving full commit history) to a filesystem path or DoltHub, and `bd backup restore` to restore from them.
 
 ## Write Path
 
@@ -85,7 +85,7 @@ All queries run directly against the local Dolt database:
 2. **Sync:** Use `bd dolt pull` to fetch updates from Dolt remotes
 
 Key implementation:
-- JSONL backup restore: `cmd/bd/backup_restore.go`
+- Backup restore: `cmd/bd/backup_restore.go`
 - Issue bootstrap/migration: `cmd/bd/init.go`
 - Dolt storage: `internal/storage/dolt/`
 
@@ -213,6 +213,10 @@ open ──▶ in_progress ──▶ closed
 
 Each issue in the Dolt database (and in JSONL exports via `bd export`) has the following fields. Fields marked with `(optional)` use `omitempty` and are excluded when empty/zero.
 
+The schema is stable by default. Prefer issue metadata for integration,
+orchestration, or team-specific data before adding new first-class fields; see
+[Project Charter: Schema Boundary](PROJECT_CHARTER.md#schema-boundary).
+
 **Core Identification:**
 
 | Field | Type | Description |
@@ -297,7 +301,7 @@ Each issue in the Dolt database (and in JSONL exports via `bd export`) has the f
 | Dolt implementation | `internal/storage/dolt/` |
 | RPC protocol | `internal/rpc/protocol.go`, `server_*.go` |
 | Export logic (portability) | `cmd/bd/export.go` |
-| JSONL backup restore | `cmd/bd/backup_restore.go` |
+| Backup restore | `cmd/bd/backup_restore.go` |
 | Issue bootstrap/migration | `cmd/bd/init.go` |
 
 ## Wisps and Molecules
@@ -354,6 +358,7 @@ The `bd mol squash` command uses hard delete intentionally - tombstones would be
 
 ## Related Documentation
 
+- [PROJECT_CHARTER.md](PROJECT_CHARTER.md) - Product scope and boundaries
 - [MOLECULES.md](MOLECULES.md) - Molecular chemistry metaphor (protos, pour, bond, squash, burn)
 - [INTERNALS.md](INTERNALS.md) - FlushManager, Blocked Cache implementation details
 - [ADVANCED.md](ADVANCED.md) - Advanced features and configuration

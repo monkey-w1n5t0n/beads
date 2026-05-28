@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +39,18 @@ func acquireTestSlot() { testSem <- struct{}{} }
 // releaseTestSlot returns a semaphore slot.
 func releaseTestSlot() { <-testSem }
 
+func acquireAllTestSlots() {
+	for i := 0; i < cap(testSem); i++ {
+		acquireTestSlot()
+	}
+}
+
+func releaseAllTestSlots() {
+	for i := 0; i < cap(testSem); i++ {
+		releaseTestSlot()
+	}
+}
+
 // testContext returns a context with timeout for test operations
 func testContext(t *testing.T) (context.Context, context.CancelFunc) {
 	t.Helper()
@@ -52,9 +63,7 @@ func testContext(t *testing.T) (context.Context, context.CancelFunc) {
 // TestMain in testmain_test.go.
 func skipIfNoDolt(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("Dolt not installed, skipping test")
-	}
+	testutil.RequireDoltBinary(t)
 	if testServerPort == 0 {
 		t.Skip("Test Dolt server not running, skipping test")
 	}
@@ -116,15 +125,11 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 
 	// Create an isolated branch for this test
 	_, branchCleanup := testutil.StartTestBranch(t, store.db, testSharedDB)
-
-	// Re-create dolt_ignore'd tables (wisps, etc.) on the branch.
-	// These tables are in dolt_ignore so they only exist in the working set,
-	// not in commits. Branching from main doesn't inherit them.
-	if err := createIgnoredTables(store.db); err != nil {
+	if _, err := initSchemaOnDB(ctx, store.db); err != nil {
 		branchCleanup()
 		store.Close()
 		os.RemoveAll(tmpDir)
-		t.Fatalf("createIgnoredTables on branch failed: %v", err)
+		t.Fatalf("failed to initialize branch-local ignored schema: %v", err)
 	}
 
 	cleanup := func() {
@@ -644,6 +649,13 @@ func TestClosePromotedWisp(t *testing.T) {
 	if err := store.CreateIssue(ctx, wisp, "tester"); err != nil {
 		t.Fatalf("CreateIssue (wisp) failed: %v", err)
 	}
+	got, err := store.GetIssue(ctx, wisp.ID)
+	if err != nil {
+		t.Fatalf("GetIssue failed for promoted wisp: %v", err)
+	}
+	if got.ID != wisp.ID {
+		t.Fatalf("GetIssue returned wrong ID: %q vs %q", got.ID, wisp.ID)
+	}
 	if !IsEphemeralID(wisp.ID) {
 		t.Fatalf("expected wisp ID to match ephemeral pattern, got %q", wisp.ID)
 	}
@@ -657,7 +669,7 @@ func TestClosePromotedWisp(t *testing.T) {
 	if store.isActiveWisp(ctx, wisp.ID) {
 		t.Fatal("promoted wisp should not be active in wisps table")
 	}
-	got, err := store.GetIssue(ctx, wisp.ID)
+	got, err = store.GetIssue(ctx, wisp.ID)
 	if err != nil {
 		t.Fatalf("GetIssue failed for promoted wisp: %v", err)
 	}
@@ -1430,7 +1442,7 @@ func TestDeleteIssuesCircularDeps(t *testing.T) {
 	// the cycle detection in AddDependency -- this test exercises DeleteIssues'
 	// ability to handle cycles that may exist in the database, not AddDependency.
 	if _, err := store.execContext(ctx, `
-		INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata)
+		INSERT INTO dependencies (issue_id, depends_on_issue_id, type, created_at, created_by, metadata)
 		VALUES (?, ?, 'blocks', NOW(), 'tester', '{}')
 	`, "circ-a", "circ-c"); err != nil {
 		t.Fatalf("failed to insert cycle-completing dep circ-a->circ-c: %v", err)
@@ -2136,6 +2148,40 @@ func TestEphemeralExplicitID_GetIssue(t *testing.T) {
 	}
 }
 
+func TestGetIssue_WispLabelTableErrorPropagates(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	wisp := &types.Issue{
+		ID:        "test-wisp-label-error",
+		Title:     "Wisp with missing labels table",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, wisp, "tester"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "DROP TABLE wisp_labels"); err != nil {
+		t.Fatalf("drop wisp_labels: %v", err)
+	}
+
+	_, err := store.GetIssue(ctx, wisp.ID)
+	if err == nil {
+		t.Fatal("expected error for missing wisp_labels table")
+	}
+	if errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected table error, got ErrNotFound: %v", err)
+	}
+	if !strings.Contains(err.Error(), "wisp_labels") {
+		t.Fatalf("expected error to mention wisp_labels, got: %v", err)
+	}
+}
+
 // TestEphemeralExplicitID_UpdateIssue verifies that UpdateIssue works on
 // ephemeral beads created with explicit IDs. Regression test for GH#2053.
 func TestEphemeralExplicitID_UpdateIssue(t *testing.T) {
@@ -2146,8 +2192,8 @@ func TestEphemeralExplicitID_UpdateIssue(t *testing.T) {
 	defer cancel()
 
 	issue := &types.Issue{
-		ID:        "test-agent-max",
-		Title:     "Agent: test-agent-max",
+		ID:        "test-ephemeral-update",
+		Title:     "Ephemeral: test-ephemeral-update",
 		Status:    types.StatusOpen,
 		Priority:  2,
 		IssueType: types.TypeTask,
@@ -2159,19 +2205,19 @@ func TestEphemeralExplicitID_UpdateIssue(t *testing.T) {
 
 	// UpdateIssue should work (this was broken per GH#2053)
 	updates := map[string]interface{}{
-		"agent_state": "running",
+		"title": "Updated ephemeral title",
 	}
-	if err := store.UpdateIssue(ctx, "test-agent-max", updates, "test-user"); err != nil {
+	if err := store.UpdateIssue(ctx, "test-ephemeral-update", updates, "test-user"); err != nil {
 		t.Fatalf("UpdateIssue failed for ephemeral bead with explicit ID: %v", err)
 	}
 
 	// Verify the update persisted
-	got, err := store.GetIssue(ctx, "test-agent-max")
+	got, err := store.GetIssue(ctx, "test-ephemeral-update")
 	if err != nil {
 		t.Fatalf("GetIssue after update failed: %v", err)
 	}
-	if got.AgentState != "running" {
-		t.Errorf("Expected agent_state %q, got %q", "running", got.AgentState)
+	if got.Title != "Updated ephemeral title" {
+		t.Errorf("Expected title %q, got %q", "Updated ephemeral title", got.Title)
 	}
 }
 

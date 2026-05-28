@@ -90,6 +90,9 @@ Example:
 				}
 			}
 		}
+		if autoMerge && !dryRun {
+			commandDidWrite.Store(true)
+		}
 		// Output results
 		if jsonOutput {
 			output := map[string]interface{}{

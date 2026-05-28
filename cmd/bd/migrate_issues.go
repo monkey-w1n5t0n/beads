@@ -8,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -231,7 +230,7 @@ func executeMigrateIssues(ctx context.Context, p migrateIssuesParams) error {
 	return nil
 }
 
-func validateRepos(ctx context.Context, s *dolt.DoltStore, from, to string, strict bool) error {
+func validateRepos(ctx context.Context, s storage.DoltStorage, from, to string, strict bool) error {
 	// Check if source repo has any issues
 	fromIssues, err := s.SearchIssues(ctx, "", types.IssueFilter{
 		SourceRepo: &from,
@@ -267,7 +266,7 @@ func validateRepos(ctx context.Context, s *dolt.DoltStore, from, to string, stri
 	return nil
 }
 
-func findCandidateIssues(ctx context.Context, s *dolt.DoltStore, p migrateIssuesParams) ([]string, error) {
+func findCandidateIssues(ctx context.Context, s storage.DoltStorage, p migrateIssuesParams) ([]string, error) {
 	// Build filter from params
 	filter := types.IssueFilter{
 		SourceRepo: &p.from,
@@ -318,7 +317,7 @@ type dependencyStats struct {
 	outgoingEdges int
 }
 
-func expandMigrationSet(ctx context.Context, s *dolt.DoltStore, candidates []string, p migrateIssuesParams) ([]string, dependencyStats, error) {
+func expandMigrationSet(ctx context.Context, s storage.DoltStorage, candidates []string, p migrateIssuesParams) ([]string, dependencyStats, error) {
 	if p.include == "none" || p.include == "" {
 		return candidates, dependencyStats{}, nil
 	}
@@ -393,7 +392,7 @@ func expandMigrationSet(ctx context.Context, s *dolt.DoltStore, candidates []str
 
 // getUpstreamDependencies returns IDs of issues that the given issue depends on.
 // If withinFromOnly is true, only returns dependencies whose issues are in fromRepo.
-func getUpstreamDependencies(ctx context.Context, s *dolt.DoltStore, issueID, fromRepo string, withinFromOnly bool) ([]string, error) {
+func getUpstreamDependencies(ctx context.Context, s storage.DoltStorage, issueID, fromRepo string, withinFromOnly bool) ([]string, error) {
 	// GetDependencyRecords returns deps where issue_id = issueID
 	depRecords, err := s.GetDependencyRecords(ctx, issueID)
 	if err != nil {
@@ -420,7 +419,7 @@ func getUpstreamDependencies(ctx context.Context, s *dolt.DoltStore, issueID, fr
 
 // getDownstreamDependencies returns IDs of issues that depend on the given issue.
 // If withinFromOnly is true, only returns dependents whose issues are in fromRepo.
-func getDownstreamDependencies(ctx context.Context, s *dolt.DoltStore, issueID, fromRepo string, withinFromOnly bool) ([]string, error) {
+func getDownstreamDependencies(ctx context.Context, s storage.DoltStorage, issueID, fromRepo string, withinFromOnly bool) ([]string, error) {
 	// GetDependents returns full Issue objects that depend on issueID
 	dependents, err := s.GetDependents(ctx, issueID)
 	if err != nil {
@@ -438,7 +437,7 @@ func getDownstreamDependencies(ctx context.Context, s *dolt.DoltStore, issueID, 
 	return deps, nil
 }
 
-func countCrossRepoEdges(ctx context.Context, s *dolt.DoltStore, migrationSet []string) (dependencyStats, error) {
+func countCrossRepoEdges(ctx context.Context, s storage.DoltStorage, migrationSet []string) (dependencyStats, error) {
 	if len(migrationSet) == 0 {
 		return dependencyStats{}, nil
 	}
@@ -464,8 +463,10 @@ func countCrossRepoEdges(ctx context.Context, s *dolt.DoltStore, migrationSet []
 		}
 	}
 
-	// For incoming edges, we need to find all deps where depends_on_id is in
-	// the migration set but issue_id is not. Use GetAllDependencyRecords.
+	// For incoming edges, we need to find all deps whose resolved target is in
+	// the migration set but whose issue_id is not. Use GetAllDependencyRecords;
+	// the returned records expose the target via dep.DependsOnID (resolved from
+	// the typed columns).
 	allDeps, err := s.GetAllDependencyRecords(ctx)
 	if err != nil {
 		return dependencyStats{}, fmt.Errorf("failed to get all dependency records: %w", err)
@@ -489,7 +490,7 @@ func countCrossRepoEdges(ctx context.Context, s *dolt.DoltStore, migrationSet []
 	}, nil
 }
 
-func checkOrphanedDependencies(ctx context.Context, s *dolt.DoltStore) ([]string, error) {
+func checkOrphanedDependencies(ctx context.Context, s storage.DoltStorage) ([]string, error) {
 	// Get all dependency records to check for orphans
 	allDeps, err := s.GetAllDependencyRecords(ctx)
 	if err != nil {
@@ -614,7 +615,7 @@ func confirmMigration(plan migrationPlan) bool {
 	return strings.ToLower(strings.TrimSpace(response)) == "y"
 }
 
-func executeMigration(ctx context.Context, s *dolt.DoltStore, migrationSet []string, to string) error {
+func executeMigration(ctx context.Context, s storage.DoltStorage, migrationSet []string, to string) error {
 	return transact(ctx, s, fmt.Sprintf("bd: migrate %d issues to %s", len(migrationSet), to), func(tx storage.Transaction) error {
 		for _, id := range migrationSet {
 			if err := tx.UpdateIssue(ctx, id, map[string]interface{}{

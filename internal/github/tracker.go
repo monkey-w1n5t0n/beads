@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
@@ -21,6 +22,10 @@ func init() {
 
 // issueNumberPattern matches GitHub issue URLs: .../issues/42
 var issueNumberPattern = regexp.MustCompile(`/issues/(\d+)`)
+
+// ghShorthandPattern matches the "github:{digits}" shorthand produced by BuildExternalRef
+// when a full URL is unavailable.
+var ghShorthandPattern = regexp.MustCompile(`^github:([1-9]\d*)$`)
 
 // Tracker implements tracker.IssueTracker for GitHub.
 type Tracker struct {
@@ -160,11 +165,21 @@ func (t *Tracker) FieldMapper() tracker.FieldMapper {
 	return &githubFieldMapper{config: t.config}
 }
 
+// IsExternalRef checks if a ref belongs to this GitHub tracker.
+// It recognizes both full GitHub URLs and the "github:{id}" shorthand format
+// produced by BuildExternalRef when a URL is unavailable.
 func (t *Tracker) IsExternalRef(ref string) bool {
+	if ghShorthandPattern.MatchString(ref) {
+		return true
+	}
 	return strings.Contains(ref, "github.com") && issueNumberPattern.MatchString(ref)
 }
 
+// ExtractIdentifier extracts the issue number from a GitHub URL or shorthand ref.
 func (t *Tracker) ExtractIdentifier(ref string) string {
+	if m := ghShorthandPattern.FindStringSubmatch(ref); len(m) >= 2 {
+		return m[1]
+	}
 	matches := issueNumberPattern.FindStringSubmatch(ref)
 	if len(matches) < 2 {
 		return ""
@@ -180,7 +195,23 @@ func (t *Tracker) BuildExternalRef(issue *tracker.TrackerIssue) string {
 }
 
 // getConfig reads a config value from storage, falling back to env var.
+// For yaml-only keys (e.g. github.token), reads from config.yaml first
+// to match the behavior of cmd/bd/github.go:getGitHubConfigValue().
 func (t *Tracker) getConfig(ctx context.Context, key, envVar string) string {
+	// Secret keys are stored in config.yaml, not the Dolt database,
+	// to avoid leaking secrets when pushing to remotes.
+	if config.IsYamlOnlyKey(key) {
+		if val := config.GetString(key); val != "" {
+			return val
+		}
+		if envVar != "" {
+			if envVal := os.Getenv(envVar); envVal != "" {
+				return envVal
+			}
+		}
+		return ""
+	}
+
 	val, err := t.store.GetConfig(ctx, key)
 	if err == nil && val != "" {
 		return val

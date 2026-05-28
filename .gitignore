@@ -24,8 +24,18 @@ pkg/
 *.swo
 *~
 
-# Claude Code local state (skills, settings, etc.)
-.claude/
+# Agent local state (skills, settings, etc.)
+.amp/
+
+# Claude Code - local/runtime state
+.claude/settings.local.json
+.claude/worktrees/
+.claude/*.log
+.claude/*.lock
+
+# Codex CLI - local marker
+.codex
+
 
 # OS
 .DS_Store
@@ -116,6 +126,15 @@ bd_test
 .beads/export-state/
 .beads/beads.db
 
-# Gas Town (added by gt)
+# Orchestrator (added by gt)
 .logs/
-.beads/
+.beads/*
+!.beads/formulas/
+!.beads/formulas/**
+.opencode/
+
+# Beads / Dolt files (added by bd init)
+.beads-credential-key
+
+# Beads / Dolt files (added by bd init)
+.beads/proxieddb/

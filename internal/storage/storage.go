@@ -7,6 +7,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"time"
 
@@ -16,6 +17,11 @@ import (
 // ErrAlreadyClaimed is returned when attempting to claim an issue that is already
 // claimed by another user. The error message contains the current assignee.
 var ErrAlreadyClaimed = errors.New("issue already claimed")
+
+// ErrNotClaimable is returned when attempting to claim an issue that is not in a
+// claimable state, such as closed, deferred, or already in progress without the
+// same actor owning the claim.
+var ErrNotClaimable = errors.New("issue not claimable")
 
 // ErrNotFound is returned when a requested entity does not exist in the database.
 var ErrNotFound = errors.New("not found")
@@ -38,9 +44,12 @@ type Storage interface {
 	GetIssueByExternalRef(ctx context.Context, externalRef string) (*types.Issue, error)
 	GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.Issue, error)
 	UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error
+	ReopenIssue(ctx context.Context, id string, reason string, actor string) error
+	UpdateIssueType(ctx context.Context, id string, issueType string, actor string) error
 	CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error
 	DeleteIssue(ctx context.Context, id string) error
 	SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error)
+	SearchIssuesWithCounts(ctx context.Context, query string, filter types.IssueFilter) ([]*types.IssueWithCounts, error)
 
 	// Dependencies
 	AddDependency(ctx context.Context, dep *types.Dependency, actor string) error
@@ -59,14 +68,68 @@ type Storage interface {
 
 	// Work queries
 	GetReadyWork(ctx context.Context, filter types.WorkFilter) ([]*types.Issue, error)
+	GetReadyWorkWithCounts(ctx context.Context, filter types.WorkFilter) ([]*types.IssueWithCounts, error)
 	GetBlockedIssues(ctx context.Context, filter types.WorkFilter) ([]*types.BlockedIssue, error)
 	GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error)
+
+	// Wisp queries
+	// ListWisps returns ephemeral issues matching the filter.
+	// It always restricts to Ephemeral=true; callers do not need to set that flag.
+	ListWisps(ctx context.Context, filter types.WispFilter) ([]*types.Issue, error)
 
 	// Comments and events
 	AddIssueComment(ctx context.Context, issueID, author, text string) (*types.Comment, error)
 	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
 	GetEvents(ctx context.Context, issueID string, limit int) ([]*types.Event, error)
 	GetAllEventsSince(ctx context.Context, since time.Time) ([]*types.Event, error)
+
+	// Aggregate counts — cheaper than materializing rows when only cardinality is needed.
+	// Filter.Limit and Filter.Offset are ignored by CountIssues; all others apply.
+
+	// CountIssues returns the number of issues matching query and filter.
+	CountIssues(ctx context.Context, query string, filter types.IssueFilter) (int64, error)
+	// CountDependents returns the number of issues that depend on issueID.
+	CountDependents(ctx context.Context, issueID string) (int64, error)
+	// CountDependencies returns the number of issues that issueID depends on.
+	CountDependencies(ctx context.Context, issueID string) (int64, error)
+	// CountIssueComments returns the number of comments on an issue.
+	CountIssueComments(ctx context.Context, issueID string) (int64, error)
+	// CountEvents returns the number of audit events for an issue, capped at limit
+	// (or unbounded if limit == 0).
+	CountEvents(ctx context.Context, issueID string, limit int) (int64, error)
+
+	// Streaming iterators (be-jaavsb / be-yinl4d).
+	//
+	// IterIssues streams issues matching the filter. Use this in place of
+	// SearchIssues when the result set is potentially unbounded
+	// (filter.Limit == 0 or absent). For bounded queries SearchIssues
+	// remains the right call.
+	IterIssues(ctx context.Context, query string, filter types.IssueFilter) (Iter[types.Issue], error)
+	// IterDependentsWithMetadata streams dependents (issues that depend on
+	// issueID) with the relationship metadata attached. Replaces the slice
+	// path for bd show --json --include-dependents on hub beads.
+	IterDependentsWithMetadata(ctx context.Context, issueID string) (Iter[types.IssueWithDependencyMetadata], error)
+	// IterDependenciesWithMetadata is the inverse direction — issues that
+	// issueID depends on, with metadata.
+	IterDependenciesWithMetadata(ctx context.Context, issueID string) (Iter[types.IssueWithDependencyMetadata], error)
+	// IterIssueComments streams comments on an issue, ordered by created_at.
+	IterIssueComments(ctx context.Context, issueID string) (Iter[types.Comment], error)
+	// IterEvents streams the audit-trail events for an issue, ordered by
+	// created_at descending. limit==0 means unbounded.
+	IterEvents(ctx context.Context, issueID string, limit int) (Iter[types.Event], error)
+	// IterAllEventsSince streams every audit-trail event in the rig newer
+	// than `since`. There is no bounded variant — full-rig event scans are
+	// inherently unbounded.
+	IterAllEventsSince(ctx context.Context, since time.Time) (Iter[types.Event], error)
+	// IterReadyWork streams issues that are ready for work (no open
+	// blockers), matching the filter.
+	IterReadyWork(ctx context.Context, filter types.WorkFilter) (Iter[types.Issue], error)
+	// IterBlockedIssues streams blocked issues (with the blockers surfaced
+	// in BlockedIssue), matching the filter.
+	IterBlockedIssues(ctx context.Context, filter types.WorkFilter) (Iter[types.BlockedIssue], error)
+	// IterWisps streams ephemeral issues matching the filter. Always
+	// restricts to Ephemeral=true; callers do not need to set that flag.
+	IterWisps(ctx context.Context, filter types.WispFilter) (Iter[types.Issue], error)
 
 	// Statistics
 	GetStatistics(ctx context.Context) (*types.Statistics, error)
@@ -76,11 +139,56 @@ type Storage interface {
 	GetConfig(ctx context.Context, key string) (string, error)
 	GetAllConfig(ctx context.Context) (map[string]string, error)
 
+	// Local metadata operations (dolt-ignored, clone-local state).
+	// Used for tip timestamps, version stamps, tracker sync cursors, etc.
+	// Data is ephemeral — callers must handle ("", nil) as the normal case.
+	SetLocalMetadata(ctx context.Context, key, value string) error
+	GetLocalMetadata(ctx context.Context, key string) (string, error)
+
 	// Transactions
 	RunInTransaction(ctx context.Context, commitMsg string, fn func(tx Transaction) error) error
 
+	// MergeSlot — serialized conflict resolution primitive.
+	// Each rig has one merge slot bead (<prefix>-merge-slot, labeled gt:slot).
+	// The slot ID is derived from the issue_prefix config key.
+	MergeSlotCreate(ctx context.Context, actor string) (*types.Issue, error)
+	MergeSlotCheck(ctx context.Context) (*MergeSlotStatus, error)
+	MergeSlotAcquire(ctx context.Context, holder, actor string, wait bool) (*MergeSlotResult, error)
+	MergeSlotRelease(ctx context.Context, holder, actor string) error
+
+	// Metadata slots — key-value pairs stored in issue metadata JSON.
+	// Used by gt for delegation tracking, hook state, and other per-issue data.
+	SlotSet(ctx context.Context, issueID, key, value, actor string) error
+	SlotGet(ctx context.Context, issueID, key string) (string, error)
+	SlotClear(ctx context.Context, issueID, key, actor string) error
+
 	// Lifecycle
 	Close() error
+}
+
+// MergeSlotStatus is returned by MergeSlotCheck and describes the current
+// state of the merge slot bead.
+type MergeSlotStatus struct {
+	SlotID    string
+	Available bool
+	Holder    string
+	Waiters   []string
+}
+
+// MergeSlotResult is returned by MergeSlotAcquire.
+type MergeSlotResult struct {
+	// SlotID is the bead ID of the merge slot.
+	SlotID string
+	// Acquired is true when the slot was successfully acquired by the caller.
+	Acquired bool
+	// Waiting is true when --wait was passed and the caller was added to the
+	// waiters queue (the slot was held by someone else).
+	Waiting bool
+	// Holder is the current holder of the slot. When Acquired is true this
+	// is the caller; when Waiting is true this is the previous holder.
+	Holder string
+	// Position is the 1-based position in the waiters queue when Waiting is true.
+	Position int
 }
 
 // DoltStorage is the full interface for Dolt-backed stores, composing the core
@@ -99,6 +207,68 @@ type DoltStorage interface {
 	ConfigMetadataStore
 	CompactionStore
 	AdvancedQueryStore
+}
+
+// RawDBAccessor provides raw *sql.DB access for diagnostics and migrations.
+// Callers that need raw SQL should type-assert to this interface.
+type RawDBAccessor interface {
+	DB() *sql.DB
+	UnderlyingDB() *sql.DB
+}
+
+// StoreLocator provides filesystem path information for the store.
+// Callers that need the store's on-disk location should type-assert to this interface.
+type StoreLocator interface {
+	Path() string
+	CLIDir() string
+}
+
+// GarbageCollector provides Dolt garbage collection capability.
+// Callers that need to reclaim disk space should type-assert to this interface.
+type GarbageCollector interface {
+	DoltGC(ctx context.Context) error
+}
+
+// Flattener squashes all Dolt commit history into a single commit.
+// Callers should type-assert to this interface for history compaction.
+type Flattener interface {
+	Flatten(ctx context.Context) error
+}
+
+type SchemaMigrator interface {
+	ApplySchemaMigrations(ctx context.Context) (applied int, err error)
+}
+
+// Compactor squashes old Dolt commits while preserving recent ones.
+// Callers should type-assert to this interface for selective history compaction.
+type Compactor interface {
+	Compact(ctx context.Context, initialHash, boundaryHash string, oldCommits int, recentHashes []string) error
+}
+
+// LifecycleManager provides lifecycle inspection beyond Close().
+type LifecycleManager interface {
+	IsClosed() bool
+}
+
+// PendingCommitter provides the ability to commit pending (dirty) changes.
+// Used by auto-commit and auto-push flows.
+type PendingCommitter interface {
+	CommitPending(ctx context.Context, actor string) (bool, error)
+}
+
+// BackupStore provides Dolt backup operations (CALL DOLT_BACKUP) for
+// disaster recovery.
+// Callers that need backup functionality should type-assert to this interface.
+type BackupStore interface {
+	BackupAdd(ctx context.Context, name, url string) error
+	BackupSync(ctx context.Context, name string) error
+	BackupRemove(ctx context.Context, name string) error
+	// BackupDatabase registers dir as a file:// Dolt backup remote and syncs
+	// the full database to it, preserving complete commit history.
+	BackupDatabase(ctx context.Context, dir string) error
+	// RestoreDatabase restores the database from a Dolt backup at dir.
+	// When force is true, the existing database is dropped before restoring.
+	RestoreDatabase(ctx context.Context, dir string, force bool) error
 }
 
 // Transaction provides atomic multi-operation support within a single database transaction.
@@ -144,6 +314,7 @@ type Transaction interface {
 
 	// Dependency operations
 	AddDependency(ctx context.Context, dep *types.Dependency, actor string) error
+	AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, opts DependencyAddOptions) error
 	RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error
 	GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error)
 
@@ -160,8 +331,21 @@ type Transaction interface {
 	SetMetadata(ctx context.Context, key, value string) error
 	GetMetadata(ctx context.Context, key string) (string, error)
 
+	// Local metadata operations (dolt-ignored, clone-local state).
+	// Used for tip timestamps, version stamps, tracker sync cursors, etc.
+	// Data is ephemeral — callers must handle ("", nil) as the normal case.
+	SetLocalMetadata(ctx context.Context, key, value string) error
+	GetLocalMetadata(ctx context.Context, key string) (string, error)
+
 	// Comment operations
 	AddComment(ctx context.Context, issueID, actor, comment string) error
 	ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error)
 	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
+}
+
+// DependencyAddOptions controls transaction-scoped dependency insertion.
+type DependencyAddOptions struct {
+	// SkipCycleCheck bypasses the recursive pre-insert cycle check. This is
+	// intended for bulk wiring paths that perform a final graph check separately.
+	SkipCycleCheck bool
 }

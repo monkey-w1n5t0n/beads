@@ -6,9 +6,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/internal/uimd"
 )
 
 // showIssueChildren displays only the children of the specified issue(s)
@@ -17,7 +18,7 @@ func showIssueChildren(ctx context.Context, args []string, jsonOut bool, shortMo
 	allChildren := make(map[string][]*types.IssueWithDependencyMetadata)
 
 	// Process each issue to get its children
-	processIssue := func(issueID string, issueStore *dolt.DoltStore) error {
+	processIssue := func(issueID string, issueStore storage.DoltStorage) error {
 		// Initialize entry so "no children" message can be shown
 		if _, exists := allChildren[issueID]; !exists {
 			allChildren[issueID] = []*types.IssueWithDependencyMetadata{}
@@ -116,7 +117,7 @@ func showIssueAsOf(ctx context.Context, args []string, ref string, shortMode boo
 		fmt.Println(formatIssueMetadata(issue))
 
 		if issue.Description != "" {
-			fmt.Printf("\n%s\n%s\n", ui.RenderBold("DESCRIPTION"), ui.RenderMarkdown(issue.Description))
+			fmt.Printf("\n%s\n%s\n", ui.RenderBold("DESCRIPTION"), uimd.RenderMarkdown(issue.Description))
 		}
 		fmt.Println()
 	}

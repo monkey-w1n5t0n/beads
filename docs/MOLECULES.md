@@ -115,6 +115,9 @@ bd mol bond A B --type conditional # B runs only if A fails
 
 This is how orchestrators run autonomous workflows - agents follow the dependency graph, handing off between sessions, until all work closes.
 
+Ordinary epics stay open when the last child closes. They become close-eligible
+work that can be closed explicitly once the parent outcome is actually done.
+
 ## Phase Metaphor (Templates)
 
 For reusable workflows, beads uses a chemistry metaphor:
@@ -173,9 +176,9 @@ bd dep add <aggregate> <fileA> --type waits-for
 When the number of children isn't known until runtime:
 
 ```bash
-# In a survey step, discover polecats and bond arms dynamically
-for polecat in $(gt polecat list); do
-  bd mol bond mol-polecat-arm $PATROL_ID --ref arm-$polecat --var name=$polecat
+# In a survey step, discover workers and bond arms dynamically
+for worker in $(bd agent list); do
+  bd mol bond mol-worker-arm $PATROL_ID --ref arm-$worker --var name=$worker
 done
 ```
 

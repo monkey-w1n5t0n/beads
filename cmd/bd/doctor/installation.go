@@ -37,7 +37,8 @@ func CheckInstallation(path string) DoctorCheck {
 	}
 }
 
-// CheckPermissions verifies that .beads directory and database are readable/writable
+// CheckPermissions verifies that .beads directory and database are readable/writable.
+// Opens its own store; prefer CheckPermissionsWithStore when a shared store is available.
 func CheckPermissions(path string) DoctorCheck {
 	beadsDir := ResolveBeadsDirForRepo(path)
 
@@ -89,6 +90,73 @@ func CheckPermissions(path string) DoctorCheck {
 	}
 }
 
+// CheckPermissionsWithStore verifies permissions using a shared store (GH#2636).
+// If the shared store was opened successfully, the database is accessible.
+func CheckPermissionsWithStore(path string, ss *SharedStore) DoctorCheck {
+	beadsDir := beadsDirFromSharedStore(path, ss)
+	store := ss.Store()
+
+	// Check if .beads/ is writable
+	testFile := filepath.Join(beadsDir, ".doctor-test-write")
+	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
+		return DoctorCheck{
+			Name:    "Permissions",
+			Status:  StatusError,
+			Message: ".beads/ directory is not writable",
+			Fix:     "Run 'bd doctor --fix' to fix permissions",
+		}
+	}
+	_ = os.Remove(testFile)
+
+	// Check Dolt database directory permissions
+	cfg, err := configfile.Load(beadsDir)
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendDolt {
+		if cfg.IsDoltServerMode() {
+			if store == nil {
+				return DoctorCheck{
+					Name:    "Permissions",
+					Status:  StatusError,
+					Message: "Unable to verify Dolt server-backed database permissions",
+					Fix:     "Check 'bd dolt status' for server availability, then re-run 'bd doctor'",
+				}
+			}
+			return DoctorCheck{
+				Name:    "Permissions",
+				Status:  StatusOK,
+				Message: "All permissions OK",
+			}
+		}
+
+		doltPath := getDatabasePath(beadsDir)
+		if info, err := os.Stat(doltPath); err == nil {
+			if !info.IsDir() {
+				return DoctorCheck{
+					Name:    "Permissions",
+					Status:  StatusError,
+					Message: "dolt/ is not a directory",
+					Fix:     "Run 'bd doctor --fix' to fix permissions",
+				}
+			}
+			// If shared store is nil, the database could not be opened
+			if store == nil {
+				return DoctorCheck{
+					Name:    "Permissions",
+					Status:  StatusError,
+					Message: "Dolt database exists but cannot be opened",
+					Fix:     "Run 'bd doctor --fix' to fix permissions",
+				}
+			}
+			// Shared store was opened successfully — database is accessible
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Permissions",
+		Status:  StatusOK,
+		Message: "All permissions OK",
+	}
+}
+
 // CheckUntrackedBeadsFiles checks for untracked .beads/*.jsonl files that should be committed.
 // This check only applies to legacy (non-Dolt) backends where JSONL files are the data store.
 // In sync-branch mode, JSONL files are intentionally untracked in working branches
@@ -105,7 +173,8 @@ func CheckUntrackedBeadsFiles(path string) DoctorCheck {
 		}
 	}
 
-	beadsDir := filepath.Join(path, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(path)
+	repoRoot := resolvedBeadsRepoRoot(path)
 
 	// Skip if .beads doesn't exist
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
@@ -128,7 +197,7 @@ func CheckUntrackedBeadsFiles(path string) DoctorCheck {
 
 	// Run git status --porcelain to find untracked files in .beads/
 	cmd := exec.Command("git", "status", "--porcelain", ".beads/")
-	cmd.Dir = path
+	cmd.Dir = repoRoot
 	output, err := cmd.Output()
 	if err != nil {
 		return DoctorCheck{

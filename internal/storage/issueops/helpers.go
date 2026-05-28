@@ -15,15 +15,19 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/idgen"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 // IsWisp returns true if the issue should be routed to the wisps table.
-// Matches the DoltStore check: issue.Ephemeral || issue.NoHistory || ID contains "-wisp-".
+// Routes based on flags only — not the ID pattern. The "-wisp-" ID prefix is
+// a naming convention for generated wisp IDs, but promoted wisps keep their
+// ID while moving to the issues table (Ephemeral=false). Routing on the ID
+// would send promoted wisps back to the wisps table on re-insert.
 func IsWisp(issue *types.Issue) bool {
-	return issue.Ephemeral || issue.NoHistory || strings.Contains(issue.ID, "-wisp-")
+	return issue.Ephemeral || issue.NoHistory
 }
 
 // TableRouting returns the issue and event table names for an issue,
@@ -44,24 +48,22 @@ func InsertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 		INSERT INTO %s (
 			id, content_hash, title, description, design, acceptance_criteria, notes,
 			status, priority, issue_type, assignee, estimated_minutes,
-			created_at, created_by, owner, updated_at, closed_at, external_ref, spec_id,
+			created_at, created_by, owner, updated_at, started_at, closed_at, external_ref, spec_id,
 			compaction_level, compacted_at, compacted_at_commit, original_size,
-			sender, ephemeral, no_history, wisp_type, pinned, is_template, crystallizes,
-			mol_type, work_type, quality_score, source_system, source_repo, close_reason,
+			sender, ephemeral, no_history, wisp_type, pinned, is_template,
+			mol_type, work_type, source_system, source_repo, close_reason,
 			event_kind, actor, target, payload,
 			await_type, await_id, timeout_ns, waiters,
-			hook_bead, role_bead, agent_state, last_activity, role_type, rig,
 			due_at, defer_until, metadata
 		) VALUES (
 			?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?,
+			?, ?, ?, ?,
+			?, ?, ?, ?,
 			?, ?, ?
 		)
 		ON DUPLICATE KEY UPDATE
@@ -77,6 +79,7 @@ func InsertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 			assignee = VALUES(assignee),
 			estimated_minutes = VALUES(estimated_minutes),
 			updated_at = VALUES(updated_at),
+			started_at = VALUES(started_at),
 			closed_at = VALUES(closed_at),
 			external_ref = VALUES(external_ref),
 			source_repo = VALUES(source_repo),
@@ -85,13 +88,12 @@ func InsertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 	`, table),
 		issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design, issue.AcceptanceCriteria, issue.Notes,
 		issue.Status, issue.Priority, issue.IssueType, NullString(issue.Assignee), NullInt(issue.EstimatedMinutes),
-		issue.CreatedAt, issue.CreatedBy, issue.Owner, issue.UpdatedAt, issue.ClosedAt, NullStringPtr(issue.ExternalRef), issue.SpecID,
+		issue.CreatedAt, issue.CreatedBy, issue.Owner, issue.UpdatedAt, issue.StartedAt, issue.ClosedAt, NullStringPtr(issue.ExternalRef), issue.SpecID,
 		issue.CompactionLevel, issue.CompactedAt, NullStringPtr(issue.CompactedAtCommit), NullIntVal(issue.OriginalSize),
-		issue.Sender, issue.Ephemeral, issue.NoHistory, issue.WispType, issue.Pinned, issue.IsTemplate, issue.Crystallizes,
-		issue.MolType, issue.WorkType, issue.QualityScore, issue.SourceSystem, issue.SourceRepo, issue.CloseReason,
+		issue.Sender, issue.Ephemeral, issue.NoHistory, issue.WispType, issue.Pinned, issue.IsTemplate,
+		issue.MolType, issue.WorkType, issue.SourceSystem, issue.SourceRepo, issue.CloseReason,
 		issue.EventKind, issue.Actor, issue.Target, issue.Payload,
 		issue.AwaitType, issue.AwaitID, issue.Timeout.Nanoseconds(), FormatJSONStringArray(issue.Waiters),
-		issue.HookBead, issue.RoleBead, issue.AgentState, issue.LastActivity, issue.RoleType, issue.Rig,
 		issue.DueAt, issue.DeferUntil, JSONMetadata(issue.Metadata),
 	)
 	if err != nil {
@@ -500,7 +502,11 @@ func ReadConfigPrefix(ctx context.Context, tx *sql.Tx) (string, error) {
 	var configPrefix string
 	err := tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", "issue_prefix").Scan(&configPrefix)
 	if err == sql.ErrNoRows || configPrefix == "" {
-		return "", fmt.Errorf("%w: issue_prefix config is missing (run 'bd init --prefix <prefix>' first)", storage.ErrNotInitialized)
+		yamlPrefix := strings.TrimSpace(config.GetString("issue-prefix"))
+		underscoreYamlPrefix := strings.TrimSpace(config.GetString("issue_prefix"))
+		debug.Logf("Debug: missing config.issue_prefix in database (err=%v, db value=%q, yaml issue-prefix=%q, yaml issue_prefix=%q)\n",
+			err, configPrefix, yamlPrefix, underscoreYamlPrefix)
+		return "", fmt.Errorf("%w: issue_prefix config is missing (run 'bd init --prefix <prefix>' for a new project, or 'bd bootstrap' to clone an existing remote; if using config.yaml, use key 'issue-prefix', not 'issue_prefix')", storage.ErrNotInitialized)
 	} else if err != nil {
 		return "", fmt.Errorf("failed to get config: %w", err)
 	}

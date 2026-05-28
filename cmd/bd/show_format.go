@@ -108,6 +108,9 @@ func formatIssueMetadata(issue *types.Issue) string {
 	// Line 2: Created · Updated · Due/Defer
 	timeParts := []string{}
 	timeParts = append(timeParts, fmt.Sprintf("Created: %s", issue.CreatedAt.Format("2006-01-02")))
+	if issue.StartedAt != nil {
+		timeParts = append(timeParts, fmt.Sprintf("Started: %s", issue.StartedAt.Format("2006-01-02")))
+	}
 	timeParts = append(timeParts, fmt.Sprintf("Updated: %s", issue.UpdatedAt.Format("2006-01-02")))
 
 	if issue.DueAt != nil {
@@ -292,31 +295,6 @@ func formatIssueLongExtras(issue *types.Issue, formatTime func(time.Time) string
 			ui.RenderBold("COMPACTION"), strings.Join(compactParts, "\n")))
 	}
 
-	// Agent identity fields
-	var agentParts []string
-	if issue.HookBead != "" {
-		agentParts = append(agentParts, fmt.Sprintf("  Hook bead: %s", issue.HookBead))
-	}
-	if issue.RoleBead != "" {
-		agentParts = append(agentParts, fmt.Sprintf("  Role bead: %s", issue.RoleBead))
-	}
-	if issue.AgentState != "" {
-		agentParts = append(agentParts, fmt.Sprintf("  State: %s", issue.AgentState))
-	}
-	if issue.LastActivity != nil {
-		agentParts = append(agentParts, fmt.Sprintf("  Last activity: %s", formatTime(*issue.LastActivity)))
-	}
-	if issue.RoleType != "" {
-		agentParts = append(agentParts, fmt.Sprintf("  Role type: %s", issue.RoleType))
-	}
-	if issue.Rig != "" {
-		agentParts = append(agentParts, fmt.Sprintf("  Rig: %s", issue.Rig))
-	}
-	if len(agentParts) > 0 {
-		sections = append(sections, fmt.Sprintf("%s\n%s",
-			ui.RenderBold("AGENT IDENTITY"), strings.Join(agentParts, "\n")))
-	}
-
 	// Gate fields
 	var gateParts []string
 	if issue.AwaitType != "" {
@@ -336,12 +314,6 @@ func formatIssueLongExtras(issue *types.Issue, formatTime func(time.Time) string
 			ui.RenderBold("GATE"), strings.Join(gateParts, "\n")))
 	}
 
-	// Slot fields
-	if issue.Holder != "" {
-		sections = append(sections, fmt.Sprintf("%s\n  Holder: %s",
-			ui.RenderBold("SLOT"), issue.Holder))
-	}
-
 	// Source tracing
 	var sourceParts []string
 	if issue.SourceFormula != "" {
@@ -353,29 +325,6 @@ func formatIssueLongExtras(issue *types.Issue, formatTime func(time.Time) string
 	if len(sourceParts) > 0 {
 		sections = append(sections, fmt.Sprintf("%s\n%s",
 			ui.RenderBold("SOURCE TRACING"), strings.Join(sourceParts, "\n")))
-	}
-
-	// HOP fields
-	var hopParts []string
-	if issue.Creator != nil && !issue.Creator.IsEmpty() {
-		hopParts = append(hopParts, fmt.Sprintf("  Creator: %s", issue.Creator.String()))
-	}
-	if issue.QualityScore != nil {
-		hopParts = append(hopParts, fmt.Sprintf("  Quality score: %.2f", *issue.QualityScore))
-	}
-	if issue.Crystallizes {
-		hopParts = append(hopParts, "  Crystallizes: yes")
-	}
-	if len(issue.Validations) > 0 {
-		var vals []string
-		for _, v := range issue.Validations {
-			vals = append(vals, fmt.Sprintf("%s (%s)", v.Validator.String(), v.Outcome))
-		}
-		hopParts = append(hopParts, fmt.Sprintf("  Validations: %s", strings.Join(vals, ", ")))
-	}
-	if len(hopParts) > 0 {
-		sections = append(sections, fmt.Sprintf("%s\n%s",
-			ui.RenderBold("HOP"), strings.Join(hopParts, "\n")))
 	}
 
 	// Bonded-from references

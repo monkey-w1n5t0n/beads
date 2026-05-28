@@ -84,7 +84,7 @@ func discoverChildTypes(repoPath string) []string {
 		}
 	}
 
-	beadsDir := filepath.Join(repoPath, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(repoPath)
 
 	// First try reading from database config table
 	types, err := readTypesFromDB(beadsDir)
@@ -167,7 +167,7 @@ func readTypesFromYAML(beadsDir string) ([]string, error) {
 
 // findUnknownTypesInHydratedIssues checks if any hydrated issues use types not found in any config
 func findUnknownTypesInHydratedIssues(repoPath string, multiRepo *config.MultiRepoConfig) []string {
-	beadsDir := filepath.Join(repoPath, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(repoPath)
 
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil || cfg == nil {
@@ -190,7 +190,7 @@ func findUnknownTypesInHydratedIssues(repoPath string, multiRepo *config.MultiRe
 	defer func() { _ = store.Close() }()
 
 	// Collect all known types (core work types + parent custom + all child custom)
-	// Only core work types are built-in; Gas Town types require types.custom config.
+	// Only core work types are built-in; orchestrator types require types.custom config.
 	knownTypes := map[string]bool{
 		"bug": true, "feature": true, "task": true, "epic": true, "chore": true, "decision": true,
 	}

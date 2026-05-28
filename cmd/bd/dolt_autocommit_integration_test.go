@@ -14,6 +14,30 @@ import (
 	"testing"
 )
 
+func setupGitRepoForIntegration(t *testing.T, dir string) {
+	t.Helper()
+	cmd := exec.Command("git", "init", dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v\n%s", err, out)
+	}
+	for _, args := range [][]string{
+		{"-C", dir, "config", "user.email", "test@example.com"},
+		{"-C", dir, "config", "user.name", "Test User"},
+	} {
+		cmd = exec.Command("git", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+}
+
+func isDoltBackendUnavailable(output string) bool {
+	return strings.Contains(output, "dolt backend") ||
+		strings.Contains(output, "server not available") ||
+		strings.Contains(output, "server not running") ||
+		strings.Contains(output, "connection refused")
+}
+
 func doltHeadCommit(t *testing.T, dir string, env []string) string {
 	t.Helper()
 	out, err := runBDExecAllowErrorWithEnv(t, dir, env, "--json", "vc", "status")
@@ -100,6 +124,9 @@ func TestDoltAutoCommit_On_WritesAdvanceHead(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping slow integration test in short mode")
 	}
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
+	}
 	if runtime.GOOS == windowsOS {
 		t.Skip("dolt integration test not supported on windows")
 	}
@@ -107,9 +134,7 @@ func TestDoltAutoCommit_On_WritesAdvanceHead(t *testing.T) {
 	tmpDir := createTempDirWithCleanup(t)
 	setupGitRepoForIntegration(t, tmpDir)
 
-	env := []string{
-		"BEADS_TEST_MODE=1",
-	}
+	env := append(os.Environ(), "BEADS_TEST_MODE=1")
 
 	initOut, initErr := runBDExecAllowErrorWithEnv(t, tmpDir, env, "init", "--backend", "dolt", "--prefix", "test", "--quiet")
 	if initErr != nil {
@@ -161,6 +186,9 @@ func TestDoltAutoCommit_Batch_DefersCommit(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping slow integration test in short mode")
 	}
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
+	}
 	if runtime.GOOS == windowsOS {
 		t.Skip("dolt integration test not supported on windows")
 	}
@@ -168,9 +196,7 @@ func TestDoltAutoCommit_Batch_DefersCommit(t *testing.T) {
 	tmpDir := createTempDirWithCleanup(t)
 	setupGitRepoForIntegration(t, tmpDir)
 
-	env := []string{
-		"BEADS_TEST_MODE=1",
-	}
+	env := append(os.Environ(), "BEADS_TEST_MODE=1")
 
 	initOut, initErr := runBDExecAllowErrorWithEnv(t, tmpDir, env, "init", "--backend", "dolt", "--prefix", "test", "--quiet")
 	if initErr != nil {
@@ -220,6 +246,9 @@ func TestDoltAutoCommit_Off_DoesNotAdvanceHead(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping slow integration test in short mode")
 	}
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
+	}
 	if runtime.GOOS == windowsOS {
 		t.Skip("dolt integration test not supported on windows")
 	}
@@ -227,9 +256,7 @@ func TestDoltAutoCommit_Off_DoesNotAdvanceHead(t *testing.T) {
 	tmpDir := createTempDirWithCleanup(t)
 	setupGitRepoForIntegration(t, tmpDir)
 
-	env := []string{
-		"BEADS_TEST_MODE=1",
-	}
+	env := append(os.Environ(), "BEADS_TEST_MODE=1")
 
 	initOut, initErr := runBDExecAllowErrorWithEnv(t, tmpDir, env, "init", "--backend", "dolt", "--prefix", "test", "--quiet")
 	if initErr != nil {

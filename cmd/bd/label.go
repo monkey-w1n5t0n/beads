@@ -38,6 +38,7 @@ func processBatchLabelOperation(issueIDs []string, label string, operation strin
 	if err != nil {
 		FatalErrorRespectJSON("label %s: %v", operation, err)
 	}
+	commandDidWrite.Store(true)
 	if jsonOut {
 		results := make([]map[string]interface{}, 0, len(issueIDs))
 		for _, issueID := range issueIDs {

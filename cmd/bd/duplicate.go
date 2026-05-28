@@ -1,9 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/types"
@@ -61,7 +59,9 @@ func init() {
 func runDuplicate(cmd *cobra.Command, args []string) error {
 	CheckReadonly("duplicate")
 
-	ctx := rootCtx
+	ctx := getRootContext()
+	store := getStore()
+	actor := getActor()
 
 	// Resolve partial IDs
 	var duplicateID, canonicalID string
@@ -105,15 +105,15 @@ func runDuplicate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to close duplicate: %w", err)
 	}
 
-	if jsonOutput {
-		result := map[string]interface{}{
+	commandDidWrite.Store(true)
+
+	if isJSONOutput() {
+		outputJSON(map[string]interface{}{
 			"duplicate": duplicateID,
 			"canonical": canonicalID,
 			"status":    "closed",
-		}
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(result)
+		})
+		return nil
 	}
 
 	fmt.Printf("%s Marked %s as duplicate of %s (closed)\n", ui.RenderPass("✓"), duplicateID, canonicalID)
@@ -123,7 +123,9 @@ func runDuplicate(cmd *cobra.Command, args []string) error {
 func runSupersede(cmd *cobra.Command, args []string) error {
 	CheckReadonly("supersede")
 
-	ctx := rootCtx
+	ctx := getRootContext()
+	store := getStore()
+	actor := getActor()
 
 	// Resolve partial IDs
 	var oldID, newID string
@@ -167,15 +169,15 @@ func runSupersede(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to close superseded issue: %w", err)
 	}
 
-	if jsonOutput {
-		result := map[string]interface{}{
+	commandDidWrite.Store(true)
+
+	if isJSONOutput() {
+		outputJSON(map[string]interface{}{
 			"superseded":  oldID,
 			"replacement": newID,
 			"status":      "closed",
-		}
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(result)
+		})
+		return nil
 	}
 
 	fmt.Printf("%s Marked %s as superseded by %s (closed)\n", ui.RenderPass("✓"), oldID, newID)

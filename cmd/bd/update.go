@@ -8,8 +8,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/hooks"
+	"github.com/steveyegge/beads/internal/audit"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
@@ -40,6 +39,10 @@ create, update, show, or close operation).`,
 		}
 
 		updates := make(map[string]interface{})
+		// clearDeferStatus: set per-issue in the update loop when --defer=""
+		// was given without an explicit --status, to flip status=deferred back
+		// to open (matches the help text's "show in bd ready immediately").
+		var clearDeferStatus bool
 
 		if cmd.Flags().Changed("status") {
 			status, _ := cmd.Flags().GetString("status")
@@ -92,6 +95,9 @@ create, update, show, or close operation).`,
 		}
 		description, descChanged := getDescriptionFlag(cmd)
 		if descChanged {
+			if err := validateDescriptionUpdate(cmd, description, descChanged); err != nil {
+				FatalErrorRespectJSON("%v", err)
+			}
 			updates["description"] = description
 		}
 		design, designChanged := getDesignFlag(cmd)
@@ -120,7 +126,14 @@ create, update, show, or close operation).`,
 		}
 		if cmd.Flags().Changed("external-ref") {
 			externalRef, _ := cmd.Flags().GetString("external-ref")
-			updates["external_ref"] = externalRef
+			// Empty string clears the ref to SQL NULL, mirroring buildCreateIssue's
+			// nil-when-empty pointer semantics so cleared refs round-trip as a
+			// missing field (omitempty) instead of an empty string. GH#3902.
+			if externalRef == "" {
+				updates["external_ref"] = nil
+			} else {
+				updates["external_ref"] = externalRef
+			}
 		}
 		if cmd.Flags().Changed("spec-id") {
 			specID, _ := cmd.Flags().GetString("spec-id")
@@ -135,32 +148,10 @@ create, update, show, or close operation).`,
 		}
 		if cmd.Flags().Changed("type") {
 			issueType, _ := cmd.Flags().GetString("type")
-			// Normalize aliases (e.g., "enhancement" -> "feature") before validating
+			// Normalize aliases (e.g., "enhancement" -> "feature") before validating.
+			// Type validation (including custom types) is handled by the storage
+			// layer inside the transaction, matching the create path. (GH#3030)
 			issueType = utils.NormalizeIssueType(issueType)
-			var customTypes []string
-			if store != nil {
-				ct, err := store.GetCustomTypes(cmd.Context())
-				if err != nil {
-					// Log DB error but continue with YAML fallback (GH#1499 bd-2ll)
-					if !jsonOutput {
-						fmt.Fprintf(os.Stderr, "%s Failed to get custom types from DB: %v (falling back to config.yaml)\n",
-							ui.RenderWarn("!"), err)
-					}
-				} else {
-					customTypes = ct
-				}
-			}
-			// Fallback to config.yaml when store returns no custom types.
-			if len(customTypes) == 0 {
-				customTypes = config.GetCustomTypesFromYAML()
-			}
-			if !types.IssueType(issueType).IsValidWithCustom(customTypes) {
-				validTypes := "bug, feature, task, epic, chore, decision"
-				if len(customTypes) > 0 {
-					validTypes += ", " + joinStrings(customTypes, ", ")
-				}
-				FatalErrorRespectJSON("invalid issue type %q. Valid types: %s", issueType, validTypes)
-			}
 			updates["issue_type"] = issueType
 		}
 		if cmd.Flags().Changed("add-label") {
@@ -201,20 +192,32 @@ create, update, show, or close operation).`,
 		if cmd.Flags().Changed("defer") {
 			deferStr, _ := cmd.Flags().GetString("defer")
 			if deferStr == "" {
-				// Empty string clears the defer_until
+				// Empty string clears the defer_until and restores ready-work
+				// visibility (GH#3233). Explicit --status still wins.
 				updates["defer_until"] = nil
+				if _, ok := updates["status"]; !ok {
+					clearDeferStatus = true
+				}
 			} else {
 				t, err := timeparsing.ParseRelativeTime(deferStr, time.Now())
 				if err != nil {
 					FatalErrorRespectJSON("invalid --defer format %q. Examples: +1h, tomorrow, next monday, 2025-01-15", deferStr)
 				}
 				// Warn if defer date is in the past (user probably meant future)
-				if t.Before(time.Now()) && !jsonOutput {
+				inPast := t.Before(time.Now())
+				if inPast && !jsonOutput {
 					fmt.Fprintf(os.Stderr, "%s Defer date %q is in the past. Issue will appear in bd ready immediately.\n",
 						ui.RenderWarn("!"), t.Format("2006-01-02 15:04"))
 					fmt.Fprintf(os.Stderr, "  Did you mean a future date? Use --defer=+1h or --defer=tomorrow\n")
 				}
 				updates["defer_until"] = t
+				// Align with `bd defer`: set status=deferred so the ❄ icon
+				// shows and the issue leaves the ready queue (GH#3233).
+				// Skip for past dates so the "appears in bd ready immediately"
+				// warning stays truthful, and skip if --status was set explicitly.
+				if _, ok := updates["status"]; !ok && !inPast {
+					updates["status"] = string(types.StatusDeferred)
+				}
 			}
 		}
 		// Ephemeral/persistent flags
@@ -291,7 +294,7 @@ create, update, show, or close operation).`,
 		updatedIssues := []*types.Issue{}
 		var firstUpdatedID string // Track first successful update for last-touched
 		for _, id := range args {
-			// Resolve and get issue with routing (e.g., gt-xyz routes to gastown)
+			// Resolve and get issue with routing (e.g., gt-xyz routes to another rig)
 			result, err := resolveAndGetIssueWithRouting(ctx, store, id)
 			if err != nil {
 				if result != nil {
@@ -333,6 +336,12 @@ create, update, show, or close operation).`,
 					regularUpdates[k] = v
 				}
 			}
+			// GH#3233: --defer="" restores ready visibility only if the issue
+			// was actually deferred. Other statuses (blocked, in_progress, …)
+			// shouldn't be clobbered just because defer_until was stale.
+			if clearDeferStatus && issue.Status == types.StatusDeferred {
+				regularUpdates["status"] = string(types.StatusOpen)
+			}
 
 			// Handle --metadata: merge with existing metadata instead of replacing
 			if newMeta, ok := regularUpdates["metadata"].(json.RawMessage); ok && len(issue.Metadata) > 0 {
@@ -365,6 +374,16 @@ create, update, show, or close operation).`,
 					fmt.Fprintf(os.Stderr, "Error updating %s: %v\n", id, err)
 					result.Close()
 					continue
+				}
+				// Audit log key field changes (survives Dolt GC flatten)
+				if s, ok := regularUpdates["status"].(string); ok {
+					audit.LogFieldChange(result.ResolvedID, "status", string(issue.Status), s, actor, "")
+				}
+				if a, ok := regularUpdates["assignee"].(string); ok {
+					audit.LogFieldChange(result.ResolvedID, "assignee", issue.Assignee, a, actor, "")
+				}
+				if p, ok := regularUpdates["priority"].(int); ok {
+					audit.LogFieldChange(result.ResolvedID, "priority", fmt.Sprintf("%d", issue.Priority), fmt.Sprintf("%d", p), actor, "")
 				}
 			}
 
@@ -435,12 +454,8 @@ create, update, show, or close operation).`,
 				}
 			}
 
-			// Run update hook
-			updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID) // Best effort: nil issue handled by subsequent nil check
-			if updatedIssue != nil && hookRunner != nil {
-				hookRunner.Run(hooks.EventUpdate, updatedIssue)
-			}
-
+			// Re-fetch for display
+			updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID)
 			updateTitle := ""
 			if updatedIssue != nil {
 				updateTitle = updatedIssue.Title
@@ -459,6 +474,10 @@ create, update, show, or close operation).`,
 				firstUpdatedID = result.ResolvedID
 			}
 			result.Close()
+		}
+
+		if firstUpdatedID != "" {
+			commandDidWrite.Store(true)
 		}
 
 		// Set last touched after all updates complete
@@ -578,6 +597,7 @@ func init() {
 	updateCmd.Flags().String("title", "", "New title")
 	updateCmd.Flags().StringP("type", "t", "", "New type (bug|feature|task|epic|chore|decision); custom types require types.custom config")
 	registerCommonIssueFlags(updateCmd)
+	updateCmd.Flags().Bool("allow-empty-description", false, "Allow empty description replacement when reading from stdin or file")
 	updateCmd.Flags().String("spec-id", "", "Link to specification document")
 	updateCmd.Flags().String("acceptance-criteria", "", "DEPRECATED: use --acceptance")
 	_ = updateCmd.Flags().MarkHidden("acceptance-criteria") // Only fails if flag missing (caught in tests)
@@ -586,7 +606,7 @@ func init() {
 	updateCmd.Flags().StringSlice("remove-label", nil, "Remove labels (repeatable)")
 	updateCmd.Flags().StringSlice("set-labels", nil, "Set labels, replacing all existing (repeatable)")
 	updateCmd.Flags().String("parent", "", "New parent issue ID (reparents the issue, use empty string to remove parent)")
-	updateCmd.Flags().Bool("claim", false, "Atomically claim the issue (sets assignee to you, status to in_progress; fails if already claimed)")
+	updateCmd.Flags().Bool("claim", false, "Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)")
 	updateCmd.Flags().String("session", "", "Claude Code session ID for status=closed (or set CLAUDE_SESSION_ID env var)")
 	// Time-based scheduling flags (GH#820)
 	// Examples:

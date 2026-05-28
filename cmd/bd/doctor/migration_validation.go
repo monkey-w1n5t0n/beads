@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/utils"
 )
@@ -59,12 +60,12 @@ func CheckMigrationReadiness(path string) (DoctorCheck, MigrationValidationResul
 	// Check if .beads exists
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		result.Ready = false
-		result.Errors = append(result.Errors, "No .beads directory found")
+		result.Errors = append(result.Errors, "No active beads workspace found")
 		return DoctorCheck{
 			Name:     "Migration Readiness",
 			Status:   StatusError,
-			Message:  "No beads installation found",
-			Fix:      "Run 'bd init' first to create a beads installation",
+			Message:  "No active beads workspace found",
+			Fix:      "Run 'bd where' to inspect the resolved workspace, or 'bd init' to create a beads installation",
 			Category: CategoryMaintenance,
 		}, result
 	}
@@ -172,11 +173,11 @@ func CheckMigrationCompletion(path string) (DoctorCheck, MigrationValidationResu
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		result.Ready = false
 		result.DoltHealthy = false
-		result.Errors = append(result.Errors, "No .beads directory found")
+		result.Errors = append(result.Errors, "No active beads workspace found")
 		return DoctorCheck{
 			Name:     "Migration Completion",
 			Status:   StatusError,
-			Message:  "No beads installation found",
+			Message:  "No active beads workspace found",
 			Category: CategoryMaintenance,
 		}, result
 	}
@@ -440,7 +441,7 @@ func validateJSONLForMigration(jsonlPath string) (int, int, map[string]bool, err
 
 // compareDoltWithJSONL compares Dolt database with JSONL IDs.
 // Returns IDs in JSONL but not in Dolt (sample first 100).
-func compareDoltWithJSONL(ctx context.Context, store *dolt.DoltStore, jsonlIDs map[string]bool) []string {
+func compareDoltWithJSONL(ctx context.Context, store storage.DoltStorage, jsonlIDs map[string]bool) []string {
 	ids := make([]string, 0, len(jsonlIDs))
 	for id := range jsonlIDs {
 		ids = append(ids, id)
@@ -531,12 +532,16 @@ func checkDoltLocks(beadsDir string) (bool, string, error) {
 // categorizeDoltExtras finds issues in Dolt that aren't in JSONL and categorizes them
 // as either foreign-prefix (cross-rig contamination) or ephemeral (same-prefix).
 // Returns: foreignCount, foreignPrefixes map, ephemeralCount.
-func categorizeDoltExtras(ctx context.Context, store *dolt.DoltStore, jsonlIDs map[string]bool) (int, map[string]int, int) {
+func categorizeDoltExtras(ctx context.Context, store storage.DoltStorage, jsonlIDs map[string]bool) (int, map[string]int, int) {
 	// Get the configured prefix for this rig
 	localPrefix, _ := store.GetConfig(ctx, "issue_prefix") // Best effort: empty prefix means no prefix-based validation
 
 	// Query all issue IDs from Dolt
-	db := store.UnderlyingDB()
+	accessor, ok := storage.UnwrapStore(store).(storage.RawDBAccessor)
+	if !ok {
+		return 0, nil, 0
+	}
+	db := accessor.UnderlyingDB()
 	if db == nil {
 		return 0, nil, 0
 	}

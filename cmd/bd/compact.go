@@ -13,7 +13,7 @@ import (
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/compact"
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -79,6 +79,12 @@ Examples:
   bd compact --stats                       # Show statistics
 `,
 	Run: func(_ *cobra.Command, _ []string) {
+		// Block mutating operations in embedded mode; allow --stats, --analyze, --dry-run read-only paths.
+		if !compactStats && !compactAnalyze && !compactDryRun {
+			if err := requireServerMode("compact"); err != nil {
+				FatalError("%v", err)
+			}
+		}
 		// Compact modifies data unless --stats or --analyze or --dry-run or --dolt with --dry-run
 		if !compactStats && !compactAnalyze && !compactDryRun && !(compactDolt && compactDryRun) {
 			CheckReadonly("compact")
@@ -123,7 +129,7 @@ Examples:
 		if compactAnalyze {
 			if err := ensureDirectMode("compact --analyze requires direct database access"); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Hint: run 'bd doctor' to diagnose, or 'bd init' to create a new database\n")
+				fmt.Fprintf(os.Stderr, "Hint: %s\n", diagHint())
 				os.Exit(1)
 			}
 			runCompactAnalyze(ctx, store)
@@ -134,7 +140,7 @@ Examples:
 		if compactApply {
 			if err := ensureDirectMode("compact --apply requires direct database access"); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Hint: run 'bd doctor' to diagnose, or 'bd init' to create a new database\n")
+				fmt.Fprintf(os.Stderr, "Hint: %s\n", diagHint())
 				os.Exit(1)
 			}
 			if compactID == "" {
@@ -197,7 +203,7 @@ Examples:
 	},
 }
 
-func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store *dolt.DoltStore, issueID string) {
+func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store storage.DoltStorage, issueID string) {
 	start := time.Now()
 
 	if !compactForce {
@@ -221,22 +227,43 @@ func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store *
 	originalSize := len(issue.Description) + len(issue.Design) + len(issue.Notes) + len(issue.AcceptanceCriteria)
 
 	if compactDryRun {
+		ageDays := 0
+		var closedAtStr string
+		if issue.ClosedAt != nil {
+			ageDays = int(time.Since(*issue.ClosedAt).Hours() / 24)
+			closedAtStr = issue.ClosedAt.Format(time.RFC3339)
+		}
+
+		candidate := map[string]interface{}{
+			"id":           issueID,
+			"title":        issue.Title,
+			"closed_at":    closedAtStr,
+			"age_days":     ageDays,
+			"content_size": originalSize,
+		}
+
 		if jsonOutput {
 			output := map[string]interface{}{
-				"dry_run":             true,
-				"tier":                compactTier,
-				"issue_id":            issueID,
-				"original_size":       originalSize,
-				"estimated_reduction": "70-80%",
+				"dry_run":    true,
+				"tier":       compactTier,
+				"candidates": []interface{}{candidate},
+				"summary": map[string]interface{}{
+					"total_candidates":    1,
+					"total_content_bytes": originalSize,
+				},
 			}
 			outputJSON(output)
 			return
 		}
 
 		fmt.Printf("DRY RUN - Tier %d compaction\n\n", compactTier)
-		fmt.Printf("Issue: %s\n", issueID)
-		fmt.Printf("Original size: %d bytes\n", originalSize)
-		fmt.Printf("Estimated reduction: 70-80%%\n")
+		fmt.Printf("  %-12s %-40s %8s %10s\n", "ID", "TITLE", "AGE", "SIZE")
+		title := issue.Title
+		if len(title) > 40 {
+			title = title[:37] + "..."
+		}
+		fmt.Printf("  %-12s %-40s %5dd %10d B\n", issueID, title, ageDays, originalSize)
+		fmt.Printf("\nSummary: 1 candidate, %d bytes total content\n", originalSize)
 		return
 	}
 
@@ -285,7 +312,7 @@ func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store *
 	fmt.Printf("  Time: %v\n", elapsed)
 }
 
-func runCompactAll(ctx context.Context, compactor *compact.Compactor, store *dolt.DoltStore) {
+func runCompactAll(ctx context.Context, compactor *compact.Compactor, store storage.DoltStorage) {
 	start := time.Now()
 
 	var candidates []string
@@ -323,31 +350,64 @@ func runCompactAll(ctx context.Context, compactor *compact.Compactor, store *dol
 	}
 
 	if compactDryRun {
+		type dryRunCandidate struct {
+			ID          string `json:"id"`
+			Title       string `json:"title"`
+			ClosedAt    string `json:"closed_at"`
+			AgeDays     int    `json:"age_days"`
+			ContentSize int    `json:"content_size"`
+		}
+
+		var dryCandidates []dryRunCandidate
 		totalSize := 0
 		for _, id := range candidates {
 			issue, err := store.GetIssue(ctx, id)
 			if err != nil {
 				continue
 			}
-			totalSize += len(issue.Description) + len(issue.Design) + len(issue.Notes) + len(issue.AcceptanceCriteria)
+			contentSize := len(issue.Description) + len(issue.Design) + len(issue.Notes) + len(issue.AcceptanceCriteria)
+			totalSize += contentSize
+
+			ageDays := 0
+			var closedAtStr string
+			if issue.ClosedAt != nil {
+				ageDays = int(time.Since(*issue.ClosedAt).Hours() / 24)
+				closedAtStr = issue.ClosedAt.Format(time.RFC3339)
+			}
+
+			dryCandidates = append(dryCandidates, dryRunCandidate{
+				ID:          issue.ID,
+				Title:       issue.Title,
+				ClosedAt:    closedAtStr,
+				AgeDays:     ageDays,
+				ContentSize: contentSize,
+			})
 		}
 
 		if jsonOutput {
 			output := map[string]interface{}{
-				"dry_run":             true,
-				"tier":                compactTier,
-				"candidate_count":     len(candidates),
-				"total_size_bytes":    totalSize,
-				"estimated_reduction": "70-80%",
+				"dry_run":    true,
+				"tier":       compactTier,
+				"candidates": dryCandidates,
+				"summary": map[string]interface{}{
+					"total_candidates":    len(dryCandidates),
+					"total_content_bytes": totalSize,
+				},
 			}
 			outputJSON(output)
 			return
 		}
 
 		fmt.Printf("DRY RUN - Tier %d compaction\n\n", compactTier)
-		fmt.Printf("Candidates: %d issues\n", len(candidates))
-		fmt.Printf("Total size: %d bytes\n", totalSize)
-		fmt.Printf("Estimated reduction: 70-80%%\n")
+		fmt.Printf("  %-12s %-40s %8s %10s\n", "ID", "TITLE", "AGE", "SIZE")
+		for _, c := range dryCandidates {
+			title := c.Title
+			if len(title) > 40 {
+				title = title[:37] + "..."
+			}
+			fmt.Printf("  %-12s %-40s %5dd %10d B\n", c.ID, title, c.AgeDays, c.ContentSize)
+		}
+		fmt.Printf("\nSummary: %d candidates, %d bytes total content\n", len(dryCandidates), totalSize)
 		return
 	}
 
@@ -406,7 +466,7 @@ func runCompactAll(ctx context.Context, compactor *compact.Compactor, store *dol
 	}
 }
 
-func runCompactStats(ctx context.Context, store *dolt.DoltStore) {
+func runCompactStats(ctx context.Context, store storage.DoltStorage) {
 	tier1, err := store.GetTier1Candidates(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to get Tier 1 candidates: %v\n", err)
@@ -460,7 +520,7 @@ func runCompactStats(ctx context.Context, store *dolt.DoltStore) {
 	}
 }
 
-func runCompactAnalyze(ctx context.Context, store *dolt.DoltStore) {
+func runCompactAnalyze(ctx context.Context, store storage.DoltStorage) {
 	type Candidate struct {
 		ID                 string `json:"id"`
 		Title              string `json:"title"`
@@ -546,26 +606,41 @@ func runCompactAnalyze(ctx context.Context, store *dolt.DoltStore) {
 	}
 
 	if jsonOutput {
-		outputJSON(candidates)
+		totalSize := 0
+		for _, c := range candidates {
+			totalSize += c.SizeBytes
+		}
+		output := map[string]interface{}{
+			"candidates": candidates,
+			"summary": map[string]interface{}{
+				"total_candidates":    len(candidates),
+				"total_content_bytes": totalSize,
+			},
+		}
+		outputJSON(output)
 		return
 	}
 
 	// Human-readable output
 	fmt.Printf("Compaction Candidates (Tier %d)\n\n", compactTier)
+	fmt.Printf("  %-12s %-40s %8s %10s\n", "ID", "TITLE", "AGE", "SIZE")
+	totalSize := 0
 	for _, c := range candidates {
 		compactStatus := ""
 		if c.Compacted {
-			compactStatus = " (already compacted)"
+			compactStatus = " *"
 		}
-		fmt.Printf("ID: %s%s\n", c.ID, compactStatus)
-		fmt.Printf("  Title: %s\n", c.Title)
-		fmt.Printf("  Size: %d bytes\n", c.SizeBytes)
-		fmt.Printf("  Age: %d days\n\n", c.AgeDays)
+		title := c.Title
+		if len(title) > 40 {
+			title = title[:37] + "..."
+		}
+		fmt.Printf("  %-12s %-40s %5dd %10d B%s\n", c.ID, title, c.AgeDays, c.SizeBytes, compactStatus)
+		totalSize += c.SizeBytes
 	}
-	fmt.Printf("Total: %d candidates\n", len(candidates))
+	fmt.Printf("\nSummary: %d candidates, %d bytes total content\n", len(candidates), totalSize)
 }
 
-func runCompactApply(ctx context.Context, store *dolt.DoltStore) {
+func runCompactApply(ctx context.Context, store storage.DoltStorage) {
 	start := time.Now()
 
 	// Read summary
@@ -681,22 +756,29 @@ func runCompactDolt() {
 	// Find beads directory
 	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
-		fmt.Fprintf(os.Stderr, "Error: could not find .beads directory\n")
-		os.Exit(1)
+		FatalErrorWithHint(activeWorkspaceNotFoundError(), diagHint())
 	}
 
 	// Check for dolt directory
 	doltPath := filepath.Join(beadsDir, "dolt")
 	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
+		if compactDryRun {
+			if jsonOutput {
+				output := map[string]interface{}{
+					"dry_run":   true,
+					"dolt_path": doltPath,
+					"available": false,
+				}
+				outputJSON(output)
+				return
+			}
+			fmt.Printf("DRY RUN - Dolt garbage collection\n\n")
+			fmt.Printf("Dolt directory: %s\n", doltPath)
+			fmt.Printf("No local Dolt directory found; nothing to collect.\n")
+			return
+		}
 		fmt.Fprintf(os.Stderr, "Error: Dolt directory not found at %s\n", doltPath)
 		fmt.Fprintf(os.Stderr, "Hint: --dolt flag is only for repositories using the Dolt backend\n")
-		os.Exit(1)
-	}
-
-	// Check if dolt command is available
-	if _, err := exec.LookPath("dolt"); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: dolt command not found in PATH\n")
-		fmt.Fprintf(os.Stderr, "Hint: install Dolt from https://github.com/dolthub/dolt\n")
 		os.Exit(1)
 	}
 
@@ -723,6 +805,13 @@ func runCompactDolt() {
 		fmt.Printf("Current size: %s\n", formatBytes(sizeBefore))
 		fmt.Printf("\nRun without --dry-run to perform garbage collection.\n")
 		return
+	}
+
+	// Check if dolt command is available
+	if _, err := exec.LookPath("dolt"); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: dolt command not found in PATH\n")
+		fmt.Fprintf(os.Stderr, "Hint: install Dolt from https://github.com/dolthub/dolt\n")
+		os.Exit(1)
 	}
 
 	if !jsonOutput {

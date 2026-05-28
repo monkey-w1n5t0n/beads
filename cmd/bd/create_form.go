@@ -11,7 +11,6 @@ import (
 	"charm.land/huh/v2"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -97,7 +96,7 @@ func parseCreateFormInput(raw *createFormRawInput) *createFormValues {
 // It returns the created issue and any error that occurred.
 // This function handles parent-child relationships, labels, dependencies,
 // and source_repo inheritance.
-func CreateIssueFromFormValues(ctx context.Context, s *dolt.DoltStore, fv *createFormValues, actor string) (*types.Issue, error) {
+func CreateIssueFromFormValues(ctx context.Context, s storage.DoltStorage, fv *createFormValues, actor string) (*types.Issue, error) {
 	// If parent is specified, validate it exists and generate child ID
 	var explicitID string
 	var inheritedLabels []string
@@ -114,6 +113,7 @@ func CreateIssueFromFormValues(ctx context.Context, s *dolt.DoltStore, fv *creat
 			return nil, fmt.Errorf("failed to generate child ID: %w", err)
 		}
 		explicitID = childID
+		ctx = storage.WithReservedChildCounter(ctx, fv.ParentID, childID)
 
 		// Inherit parent labels (GH#2100), matching bd create --parent behavior
 		inheritedLabels, _ = s.GetLabels(ctx, fv.ParentID)
@@ -123,6 +123,8 @@ func CreateIssueFromFormValues(ctx context.Context, s *dolt.DoltStore, fv *creat
 	if fv.ExternalRef != "" {
 		externalRefPtr = &fv.ExternalRef
 	}
+
+	labels := mergeCreateLabels(fv.Labels, inheritedLabels)
 
 	issue := &types.Issue{
 		Title:              fv.Title,
@@ -135,6 +137,7 @@ func CreateIssueFromFormValues(ctx context.Context, s *dolt.DoltStore, fv *creat
 		Assignee:           fv.Assignee,
 		ExternalRef:        externalRefPtr,
 		CreatedBy:          getActorWithGit(), // GH#748: track who created the issue
+		Labels:             labels,
 	}
 
 	if explicitID != "" {
@@ -176,10 +179,9 @@ func CreateIssueFromFormValues(ctx context.Context, s *dolt.DoltStore, fv *creat
 		return nil, fmt.Errorf("failed to create issue: %w", err)
 	}
 
-	// Track whether any post-create writes occurred. CreateIssue commits
-	// the issue to Dolt internally, but subsequent AddDependency/AddLabel
-	// calls only write to the working set. A follow-up Dolt commit is
-	// needed to persist them (GH#2009).
+	// Track whether any post-create writes occurred. In embedded mode,
+	// CreateIssue writes the SQL working set and the caller must commit it.
+	// Subsequent AddDependency calls also need a follow-up Dolt commit.
 	postCreateWrites := false
 
 	// If parent was specified, add parent-child dependency (GH#1983)
@@ -191,29 +193,6 @@ func CreateIssueFromFormValues(ctx context.Context, s *dolt.DoltStore, fv *creat
 		}
 		if err := s.AddDependency(ctx, dep, actor); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to add parent-child dependency %s -> %s: %v\n", issue.ID, fv.ParentID, err)
-		} else {
-			postCreateWrites = true
-		}
-	}
-
-	// Merge inherited parent labels with user-specified labels (GH#2100)
-	if len(inheritedLabels) > 0 {
-		seen := make(map[string]bool)
-		for _, l := range fv.Labels {
-			seen[l] = true
-		}
-		for _, l := range inheritedLabels {
-			if !seen[l] {
-				fv.Labels = append(fv.Labels, l)
-			}
-		}
-	}
-
-	// Add labels if specified
-	for _, label := range fv.Labels {
-		if err := s.AddLabel(ctx, issue.ID, label, actor); err != nil {
-			// Log warning but don't fail the entire operation
-			fmt.Fprintf(os.Stderr, "Warning: failed to add label %s: %v\n", label, err)
 		} else {
 			postCreateWrites = true
 		}
@@ -259,13 +238,13 @@ func CreateIssueFromFormValues(ctx context.Context, s *dolt.DoltStore, fv *creat
 		}
 	}
 
-	// Commit post-create metadata (deps, labels) to Dolt. CreateIssue's
-	// internal DOLT_COMMIT only covers the issue row; AddDependency and
-	// AddLabel write to the SQL working set without a Dolt commit. Without
-	// this, the metadata is visible but not durable — it can be lost on
-	// push, sync, or server restart (GH#2009).
-	if postCreateWrites {
-		commitMsg := fmt.Sprintf("bd: create %s (metadata)", issue.ID)
+	// Commit embedded creates and post-create metadata to Dolt. Without this,
+	// working-set rows are visible locally but absent from HEAD and sync.
+	if !usesSQLServer() || postCreateWrites {
+		commitMsg := fmt.Sprintf("bd: create %s", issue.ID)
+		if postCreateWrites {
+			commitMsg = fmt.Sprintf("bd: create %s (metadata)", issue.ID)
+		}
 		if err := s.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
 			WarnError("failed to commit post-create metadata: %v", err)
 		}

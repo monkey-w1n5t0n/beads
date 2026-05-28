@@ -100,9 +100,9 @@ State labels follow the convention <dimension>:<value>, for example:
   health:healthy, health:failing
 
 Examples:
-  bd set-state witness-abc patrol=muted --reason "Investigating stuck polecat"
-  bd set-state witness-abc mode=degraded --reason "High error rate detected"
-  bd set-state witness-abc health=healthy
+  bd set-state agent-abc patrol=muted --reason "Investigating stuck worker"
+  bd set-state agent-abc mode=degraded --reason "High error rate detected"
+  bd set-state agent-abc health=healthy
 
 The --reason flag provides context for the event bead (recommended).`,
 	Args: cobra.ExactArgs(2),
@@ -221,6 +221,8 @@ The --reason flag provides context for the event bead (recommended).`,
 		if err := store.AddLabel(ctx, fullID, newLabel, actor); err != nil {
 			FatalErrorRespectJSON("adding label: %v", err)
 		}
+
+		commandDidWrite.Store(true)
 
 		if jsonOutput {
 			result := map[string]interface{}{

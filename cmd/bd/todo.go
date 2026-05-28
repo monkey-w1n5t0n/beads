@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 var todoCmd = &cobra.Command{
@@ -64,6 +65,8 @@ var addTodoCmd = &cobra.Command{
 		if err := getStore().CreateIssue(ctx, issue, getActorWithGit()); err != nil {
 			FatalError("failed to create TODO: %v", err)
 		}
+
+		commandDidWrite.Store(true)
 
 		if jsonOutput {
 			data, err := json.MarshalIndent(issue, "", "  ")
@@ -166,6 +169,10 @@ var doneTodoCmd = &cobra.Command{
 			closedIDs = append(closedIDs, issueID)
 		}
 
+		if len(closedIDs) > 0 {
+			commandDidWrite.Store(true)
+		}
+
 		if jsonOutput {
 			data, err := json.MarshalIndent(map[string]interface{}{
 				"closed": closedIDs,
@@ -215,6 +222,6 @@ func todoSortIssues(issues []*types.Issue) {
 		if a.Priority != b.Priority {
 			return a.Priority - b.Priority
 		}
-		return strings.Compare(a.ID, b.ID)
+		return utils.NaturalCompareIDs(a.ID, b.ID)
 	})
 }

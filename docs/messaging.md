@@ -4,7 +4,7 @@ Beads supports messaging as a first-class issue type, enabling inter-agent and h
 
 ## Architecture
 
-Mail commands (`bd mail`) delegate to an external mail provider (typically `gt mail` in Gas Town). Beads stores messages as issues with `type: message`, threading via `replies_to` dependencies, and ephemeral lifecycle via the `ephemeral` flag.
+Mail commands (`bd mail`) delegate to an external mail provider (typically `gt mail` in an orchestrator). Beads stores messages as issues with `type: message`, threading via `replies_to` dependencies, and ephemeral lifecycle via the `ephemeral` flag.
 
 This design separates concerns:
 - **Beads** = data plane (stores messages as issues)
@@ -93,8 +93,8 @@ Ephemeral messages are:
 The actor identity (used for `sender` on messages) is resolved in order:
 
 1. `--actor` flag on the command
-2. `BD_ACTOR` environment variable
-3. `BEADS_ACTOR` environment variable
+2. `BEADS_ACTOR` environment variable
+3. `BD_ACTOR` environment variable (deprecated alias)
 4. `git config user.name`
 5. `$USER` environment variable
 6. `"unknown"`
@@ -110,6 +110,14 @@ Scripts in `.beads/hooks/` run after certain events:
 | `on_close` | After `bd close` |
 
 Hooks receive event data as JSON on stdin. This enables orchestrator integration (e.g., notifying services of new messages) without beads knowing about the orchestrator.
+
+Creates with initial labels preserve the legacy hook sequence: `on_create` receives the issue snapshot before labels, followed by one or more `on_update` events with cumulative label snapshots. The labels are already persisted before those hooks run, so hook scripts that need the create-time sequence should rely on the JSON payload instead of re-reading the issue from the store during the hook.
+
+Batch creates with initial dependencies emit `on_update` for each persisted
+dependency after the create-time hooks. Each payload carries a cumulative
+dependency snapshot in request order, matching the event shape produced by
+explicit post-create dependency additions; dependencies skipped because their
+target was not persisted do not produce hooks.
 
 ## See Also
 

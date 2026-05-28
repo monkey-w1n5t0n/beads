@@ -768,16 +768,16 @@ func getSwarmStatus(ctx context.Context, s SwarmStorage, epic *types.Issue) (*Sw
 
 	// Sort each category by ID for consistent output
 	sort.Slice(status.Completed, func(i, j int) bool {
-		return status.Completed[i].ID < status.Completed[j].ID
+		return utils.NaturalCompareIDs(status.Completed[i].ID, status.Completed[j].ID) < 0
 	})
 	sort.Slice(status.Active, func(i, j int) bool {
-		return status.Active[i].ID < status.Active[j].ID
+		return utils.NaturalCompareIDs(status.Active[i].ID, status.Active[j].ID) < 0
 	})
 	sort.Slice(status.Ready, func(i, j int) bool {
-		return status.Ready[i].ID < status.Ready[j].ID
+		return utils.NaturalCompareIDs(status.Ready[i].ID, status.Ready[j].ID) < 0
 	})
 	sort.Slice(status.Blocked, func(i, j int) bool {
-		return status.Blocked[i].ID < status.Blocked[j].ID
+		return utils.NaturalCompareIDs(status.Blocked[i].ID, status.Blocked[j].ID) < 0
 	})
 
 	// Compute counts and progress
@@ -890,9 +890,9 @@ If given a single issue (not an epic), it will be auto-wrapped:
 - Then creates the swarm molecule for that epic
 
 Examples:
-  bd swarm create gt-epic-123                          # Create swarm for epic
-  bd swarm create gt-epic-123 --coordinator=witness/   # With specific coordinator
-  bd swarm create gt-task-456                          # Auto-wrap single issue`,
+  bd swarm create bd-epic-123                          # Create swarm for epic
+  bd swarm create bd-epic-123 --coordinator=observer/   # With specific coordinator
+  bd swarm create bd-task-456                          # Auto-wrap single issue`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("swarm create")
@@ -1037,6 +1037,8 @@ Examples:
 			FatalErrorRespectJSON("failed to link swarm to epic: %v", err)
 		}
 
+		commandDidWrite.Store(true)
+
 		if jsonOutput {
 			outputJSON(map[string]interface{}{
 				"swarm_id":    swarmMol.ID,
@@ -1175,7 +1177,7 @@ Examples:
 
 func init() {
 	swarmValidateCmd.Flags().Bool("verbose", false, "Include detailed issue graph in output")
-	swarmCreateCmd.Flags().String("coordinator", "", "Coordinator address (e.g., gastown/witness)")
+	swarmCreateCmd.Flags().String("coordinator", "", "Coordinator address (e.g., my-project/witness)")
 	swarmCreateCmd.Flags().Bool("force", false, "Create new swarm even if one already exists")
 
 	swarmCmd.AddCommand(swarmValidateCmd)

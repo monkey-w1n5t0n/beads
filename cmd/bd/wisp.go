@@ -38,7 +38,7 @@ locally but NOT synced via git.
 WHEN TO USE WISP vs POUR:
   wisp (vapor): Ephemeral work that auto-cleans up
     - Release workflows (one-time execution)
-    - Patrol cycles (deacon, witness, refinery)
+    - Operational loops and recurring cycles
     - Health checks and diagnostics
     - Any operational workflow without audit value
 
@@ -58,7 +58,7 @@ The wisp lifecycle:
 
 Examples:
   bd mol wisp beads-release --var version=1.0  # Release workflow
-  bd mol wisp mol-patrol                       # Ephemeral patrol cycle
+  bd mol wisp mol-my-workflow                  # Ephemeral operational cycle
   bd mol wisp list                             # List all wisps
   bd mol wisp gc                               # Garbage collect old wisps
 
@@ -116,7 +116,7 @@ The resulting wisp is stored in the main database with Ephemeral=true and NOT sy
 Phase transition: Proto (solid) -> Wisp (vapor)
 
 Use wisp for:
-  - Patrol cycles (deacon, witness)
+  - Operational loops and recurring cycles
   - Health checks and monitoring
   - One-shot orchestration runs
   - Routine operations with no audit value
@@ -141,7 +141,7 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 
 	// Wisp create requires direct store access
 	if store == nil {
-		FatalErrorWithHint("no database connection", "check 'bd doctor' and 'bd dolt status' for configuration issues")
+		FatalErrorWithHint("no database connection", diagHint())
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
@@ -243,21 +243,30 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 		)
 	}
 
+	// By default, wisps materialize the same child DAG as pour, just marked
+	// Ephemeral=true so they don't sync via git. Use --root-only to opt out
+	// of fanout (e.g. for patrol wisps whose steps are inlined at prime time
+	// rather than tracked as beads). GH#3872.
 	if dryRun {
-		fmt.Printf("\nDry run: would create wisp with %d issues from proto %s\n\n", len(subgraph.Issues), protoID)
+		if rootOnly {
+			skipped := len(subgraph.Issues) - 1
+			fmt.Printf("\nDry run: would create wisp with 1 issue (root only) from proto %s\n", protoID)
+			if skipped > 0 {
+				fmt.Printf("  Note: %d child step(s) skipped (--root-only)\n", skipped)
+			}
+		} else {
+			fmt.Printf("\nDry run: would create wisp with %d issues from proto %s\n\n", len(subgraph.Issues), protoID)
+		}
 		fmt.Printf("Storage: main database (ephemeral=true, not synced via git)\n\n")
-		for _, issue := range subgraph.Issues {
+		issuesToShow := subgraph.Issues
+		if rootOnly && len(issuesToShow) > 0 {
+			issuesToShow = issuesToShow[:1]
+		}
+		for _, issue := range issuesToShow {
 			newTitle := substituteVariables(issue.Title, vars)
 			fmt.Printf("  - %s (from %s)\n", newTitle, issue.ID)
 		}
 		return
-	}
-
-	// Wisps are vapor (ephemeral) by default — only create the root issue.
-	// Materializing child step issues is the "pour" path (bd pour), not wisps.
-	// Formulas that explicitly set pour=true get children even as wisps.
-	if !rootOnly && subgraph != nil && !subgraph.Pour {
-		rootOnly = true
 	}
 
 	// Spawn as ephemeral in main database (Ephemeral=true, not synced via git)
@@ -572,7 +581,7 @@ func runWispGC(cmd *cobra.Command, args []string) {
 
 	// Wisp gc requires direct store access for deletion
 	if store == nil {
-		FatalErrorWithHint("no database connection", "check 'bd doctor' and 'bd dolt status' for configuration issues")
+		FatalErrorWithHint("no database connection", diagHint())
 	}
 
 	// Convert string slice to []types.IssueType

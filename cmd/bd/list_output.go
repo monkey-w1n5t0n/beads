@@ -4,14 +4,27 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"text/template"
 
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/ui"
 )
 
+// printTruncationHint emits a one-line notice to stderr when the list output
+// was truncated by --limit, so users and agents can't mistake a partial view
+// for a complete one (GH#3212, GH#788).
+func printTruncationHint(truncated bool, effectiveLimit int) {
+	if !truncated || effectiveLimit <= 0 {
+		return
+	}
+	msg := fmt.Sprintf("\nShowing %d issues; more results matched but were hidden by --limit. Use --limit 0 for all, or --limit N to raise the cap.\n", effectiveLimit)
+	fmt.Fprint(os.Stderr, ui.RenderWarn(msg))
+}
+
 // outputDotFormat outputs issues in Graphviz DOT format
-func outputDotFormat(ctx context.Context, store *dolt.DoltStore, issues []*types.Issue) error {
+func outputDotFormat(ctx context.Context, store storage.DoltStorage, issues []*types.Issue) error {
 	fmt.Println("digraph dependencies {")
 	fmt.Println("  rankdir=TB;")
 	fmt.Println("  node [shape=box, style=rounded];")
@@ -88,7 +101,7 @@ func outputDotFormat(ctx context.Context, store *dolt.DoltStore, issues []*types
 }
 
 // outputFormattedList outputs issues in a custom format (preset or Go template)
-func outputFormattedList(ctx context.Context, store *dolt.DoltStore, issues []*types.Issue, formatStr string) error {
+func outputFormattedList(ctx context.Context, store storage.DoltStorage, issues []*types.Issue, formatStr string) error {
 	// Handle special 'dot' format (Graphviz output)
 	if formatStr == "dot" {
 		return outputDotFormat(ctx, store, issues)

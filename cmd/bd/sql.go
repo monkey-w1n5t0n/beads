@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 var sqlCmd = &cobra.Command{
@@ -30,14 +31,22 @@ report the number of rows affected.
 WARNING: Direct database access bypasses the storage layer. Use with caution.`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		if !usesSQLServer() {
+			fmt.Fprintln(os.Stderr, "Error: 'bd sql' is not yet supported in embedded mode")
+			os.Exit(1)
+		}
 		query := args[0]
 		csvOutput, _ := cmd.Flags().GetBool("csv")
 
 		if store == nil {
-			FatalErrorRespectJSON("no database connection available (run 'bd doctor' to diagnose, or 'bd init' to create a new database)")
+			FatalErrorRespectJSON("no database connection available (%s)", diagHint())
 		}
 
-		db := store.UnderlyingDB()
+		accessor, ok := storage.UnwrapStore(store).(storage.RawDBAccessor)
+		if !ok {
+			FatalErrorRespectJSON("storage backend does not support raw DB access")
+		}
+		db := accessor.UnderlyingDB()
 		if db == nil {
 			FatalErrorRespectJSON("underlying database not available")
 		}

@@ -8,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -90,11 +89,13 @@ func runRename(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Renamed %s -> %s\n", ui.RenderWarn(oldID), ui.RenderAccent(newID))
 
+	commandDidWrite.Store(true)
+
 	return nil
 }
 
 // updateReferencesInAllIssues updates text references to the old ID in all issues
-func updateReferencesInAllIssues(ctx context.Context, store *dolt.DoltStore, oldID, newID, actor string) error {
+func updateReferencesInAllIssues(ctx context.Context, store storage.DoltStorage, oldID, newID, actor string) error {
 	// Get all issues
 	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {

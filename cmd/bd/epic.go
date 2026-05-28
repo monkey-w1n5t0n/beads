@@ -121,6 +121,9 @@ var closeEligibleEpicsCmd = &cobra.Command{
 			}
 			closedIDs = append(closedIDs, epicStatus.Epic.ID)
 		}
+		if len(closedIDs) > 0 {
+			commandDidWrite.Store(true)
+		}
 		if jsonOutput {
 			outputJSON(map[string]interface{}{
 				"closed": closedIDs,

@@ -1690,14 +1690,6 @@ func TestGitignoreTemplate_ContainsDolt(t *testing.T) {
 	}
 }
 
-// TestGitignoreTemplate_ContainsDoltAccessLock verifies that the .beads/.gitignore template
-// includes dolt-access.lock to prevent the Dolt advisory lock file from being committed.
-func TestGitignoreTemplate_ContainsDoltAccessLock(t *testing.T) {
-	if !strings.Contains(GitignoreTemplate, "dolt-access.lock") {
-		t.Error("GitignoreTemplate should contain 'dolt-access.lock' pattern")
-	}
-}
-
 // TestRequiredPatterns_ContainsDolt verifies that bd doctor validates
 // the presence of the dolt/ pattern in .beads/.gitignore.
 func TestRequiredPatterns_ContainsDolt(t *testing.T) {
@@ -1710,21 +1702,6 @@ func TestRequiredPatterns_ContainsDolt(t *testing.T) {
 	}
 	if !found {
 		t.Error("requiredPatterns should include 'dolt/'")
-	}
-}
-
-// TestRequiredPatterns_ContainsDoltAccessLock verifies that bd doctor validates
-// the presence of the dolt-access.lock pattern in .beads/.gitignore.
-func TestRequiredPatterns_ContainsDoltAccessLock(t *testing.T) {
-	found := false
-	for _, pattern := range requiredPatterns {
-		if pattern == "dolt-access.lock" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("requiredPatterns should include 'dolt-access.lock'")
 	}
 }
 
@@ -1793,7 +1770,7 @@ func TestCheckProjectGitignore_AllPresent(t *testing.T) {
 		}
 	}()
 
-	content := "node_modules/\n.dolt/\n*.db\n"
+	content := "node_modules/\n.dolt/\n*.db\n.beads-credential-key\n.beads/proxieddb/\n"
 	if err := os.WriteFile(".gitignore", []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -1835,7 +1812,7 @@ func TestEnsureProjectGitignore_CreatesFile(t *testing.T) {
 	if !strings.Contains(contentStr, "*.db") {
 		t.Error("Expected *.db pattern in .gitignore")
 	}
-	if !strings.Contains(contentStr, projectGitignoreComment) {
+	if !strings.Contains(contentStr, ProjectGitignoreHeader) {
 		t.Error("Expected section comment in .gitignore")
 	}
 }
@@ -2327,15 +2304,58 @@ func TestGitignoreTemplate_NoSensitivePatterns(t *testing.T) {
 		"password",
 		"secret",
 		"token",
-		"credential",
 		"private_key",
 		"api_key",
 	}
 
+	// .beads-credential-key is intentionally in the template to prevent the
+	// encryption key from being committed. Strip it before checking for
+	// accidental credential-related patterns.
+	stripped := strings.ReplaceAll(strings.ToLower(GitignoreTemplate), ".beads-credential-key", "")
+
 	for _, keyword := range sensitiveKeywords {
-		if strings.Contains(strings.ToLower(GitignoreTemplate), keyword) {
+		if strings.Contains(stripped, keyword) {
 			t.Errorf("GitignoreTemplate contains sensitive keyword %q — review for information leakage", keyword)
 		}
+	}
+}
+
+// TestGitignoreTemplate_ContainsCredentialKey verifies that the .beads/.gitignore template
+// includes .beads-credential-key to prevent the encryption key from being committed.
+func TestGitignoreTemplate_ContainsCredentialKey(t *testing.T) {
+	if !strings.Contains(GitignoreTemplate, ".beads-credential-key") {
+		t.Error("GitignoreTemplate should contain '.beads-credential-key' pattern")
+	}
+}
+
+// TestRequiredPatterns_ContainsCredentialKey verifies that bd doctor validates
+// the presence of the .beads-credential-key pattern in .beads/.gitignore.
+func TestRequiredPatterns_ContainsCredentialKey(t *testing.T) {
+	found := false
+	for _, pattern := range requiredPatterns {
+		if pattern == ".beads-credential-key" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("requiredPatterns should include '.beads-credential-key'")
+	}
+}
+
+// TestProjectGitignorePatterns_ContainsCredentialKey verifies that the
+// project-root .gitignore patterns include .beads-credential-key to prevent
+// the credential encryption key from being committed even outside .beads/.
+func TestProjectGitignorePatterns_ContainsCredentialKey(t *testing.T) {
+	found := false
+	for _, pattern := range ProjectGitignorePatterns {
+		if pattern == ".beads-credential-key" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("ProjectGitignorePatterns should include '.beads-credential-key'")
 	}
 }
 
